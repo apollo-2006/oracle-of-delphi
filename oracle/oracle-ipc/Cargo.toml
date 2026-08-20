@@ -1,0 +1,20 @@
+[package]
+name = "oracle-ipc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, optional = true }
+
+[features]
+default = ["transport"]
+# The async length-framed transport (UDS on unix, named pipe on windows).
+transport = ["dep:tokio"]
+
+[dev-dependencies]
+tokio = { workspace = true }

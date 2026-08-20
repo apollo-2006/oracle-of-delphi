@@ -1,0 +1,11 @@
+# Python Virtual Environment
+venv/
+
+# Sensitive Information
+credentials.json
+
+# Large LLM Weights
+*.gguf
+
+# Cache
+.cache/

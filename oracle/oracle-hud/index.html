@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Oracle of Delphi</title>
+    <style>
+      :root {
+        --accent: #1fb6ff;      /* Oracle of Delphi system cyan */
+        --apollo: #f5c451;      /* Apollo gold — the sun, prophecy, judgment */
+        --apollo-deep: #e8a33d;
+        --glass: rgba(20, 32, 48, 0.35);
+      }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { width: 100%; height: 100%; overflow: hidden; background: #04070d; }
+      body { font-family: "SF Mono", "JetBrains Mono", monospace; color: #cfe9ff; }
+      #scene { position: fixed; inset: 0; z-index: 0; }
+
+      .panel {
+        position: fixed;
+        z-index: 10;
+        background: var(--glass);
+        backdrop-filter: blur(14px) saturate(140%);
+        -webkit-backdrop-filter: blur(14px) saturate(140%);
+        border: 1px solid rgba(120, 200, 255, 0.18);
+        border-radius: 14px;
+        padding: 14px 18px;
+        box-shadow: 0 8px 40px rgba(0, 140, 255, 0.08);
+      }
+      .panel h2 {
+        font-size: 11px; letter-spacing: 2px; text-transform: uppercase;
+        color: rgba(120, 200, 255, 0.7); margin-bottom: 8px; font-weight: 600;
+      }
+      #diagnostics { top: 24px; left: 24px; min-width: 320px; }
+      #diagnostics #sys { font-size: 13px; line-height: 1.7; }
+      #diagnostics #state { color: var(--accent); font-size: 15px; margin-top: 4px; }
+
+      #transcriptPanel { bottom: 24px; left: 50%; transform: translateX(-50%); min-width: 44vw; text-align: center; }
+      #transcript { font-size: 15px; color: #9fd0ff; min-height: 20px; }
+      #caption { font-size: 18px; color: #eaf6ff; margin-top: 6px; min-height: 24px; }
+      #userInput {
+        width: 100%; margin-top: 12px; padding: 10px 14px;
+        background: rgba(10, 20, 34, 0.6); color: #eaf6ff;
+        border: 1px solid rgba(120, 200, 255, 0.28); border-radius: 10px;
+        font: inherit; font-size: 15px; outline: none;
+      }
+      #userInput:focus { border-color: var(--accent); }
+      #userInput::placeholder { color: rgba(159, 208, 255, 0.5); }
+
+      #actionPanel { top: 24px; right: 24px; width: 340px; max-height: 60vh; overflow: hidden; }
+      #toollog { font-size: 12.5px; line-height: 1.6; }
+      .tool-line { color: #8fe6c0; opacity: 0.9; padding: 2px 0; border-bottom: 1px solid rgba(120,200,255,0.06); }
+
+      #controls { bottom: 24px; right: 24px; }
+      button {
+        background: rgba(255, 80, 90, 0.16); color: #ff9aa2;
+        border: 1px solid rgba(255, 90, 100, 0.4); border-radius: 10px;
+        padding: 10px 18px; font: inherit; cursor: pointer; letter-spacing: 1px;
+      }
+      button:hover { background: rgba(255, 80, 90, 0.28); }
+      #controls { display: flex; gap: 10px; }
+      #mic {
+        background: rgba(60, 240, 143, 0.16); color: #8fe6c0;
+        border-color: rgba(60, 240, 143, 0.4);
+      }
+      #mic:hover { background: rgba(60, 240, 143, 0.28); }
+      #mic.active {
+        background: rgba(60, 240, 143, 0.5); color: #04140c;
+        box-shadow: 0 0 18px rgba(60, 240, 143, 0.5);
+      }
+      #speak {
+        background: rgba(31, 182, 255, 0.16); color: #9fd0ff;
+        border-color: rgba(31, 182, 255, 0.4);
+      }
+      #speak:hover { background: rgba(31, 182, 255, 0.28); }
+      #speak.active {
+        background: rgba(31, 182, 255, 0.42); color: #04140c;
+        box-shadow: 0 0 16px rgba(31, 182, 255, 0.45);
+      }
+
+      /* --- Apollo touches across the HUD --- */
+      .panel h2 { position: relative; }
+      /* A small laurel/sun glyph on each panel header, in Apollo gold. */
+      .panel h2::before {
+        content: "☀"; color: var(--apollo); margin-right: 8px;
+        text-shadow: 0 0 10px rgba(245, 196, 81, 0.6);
+      }
+      #apolloSig {
+        position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%);
+        z-index: 5; font-size: 10px; letter-spacing: 3px;
+        color: rgba(245, 196, 81, 0.55); text-transform: uppercase;
+        pointer-events: none;
+      }
+
+      /* --- The Apollo Decree modal --- */
+      #apolloModal {
+        position: fixed; inset: 0; z-index: 100;
+        display: flex; align-items: center; justify-content: center;
+        background: radial-gradient(ellipse at center, rgba(20, 14, 2, 0.55), rgba(2, 3, 6, 0.86));
+        backdrop-filter: blur(6px);
+        opacity: 0; pointer-events: none; transition: opacity 0.35s ease;
+      }
+      #apolloModal.visible { opacity: 1; pointer-events: auto; }
+      .decree-card {
+        width: min(560px, 92vw); text-align: center; padding: 34px 40px 30px;
+        background: linear-gradient(180deg, rgba(30, 24, 8, 0.62), rgba(14, 16, 22, 0.62));
+        border: 1px solid rgba(245, 196, 81, 0.4);
+        border-radius: 20px;
+        box-shadow: 0 0 60px rgba(245, 196, 81, 0.18), inset 0 0 40px rgba(245, 196, 81, 0.05);
+        backdrop-filter: blur(18px) saturate(150%);
+        transform: translateY(14px) scale(0.98);
+        transition: transform 0.35s cubic-bezier(0.2, 0.8, 0.2, 1);
+      }
+      #apolloModal.visible .decree-card { transform: translateY(0) scale(1); }
+      .decree-emblem { display: flex; justify-content: center; margin-bottom: 6px; }
+      .decree-emblem svg { filter: drop-shadow(0 0 12px rgba(245, 196, 81, 0.45)); }
+      .sun-rays line { stroke: var(--apollo); stroke-width: 1.4; opacity: 0.85;
+        transform-origin: 60px 60px; animation: sunspin 60s linear infinite; }
+      .sun-core { fill: var(--apollo); opacity: 0.25; }
+      .sun-inner { fill: var(--apollo); }
+      .laurel ellipse { fill: rgba(245, 196, 81, 0.75); }
+      .lapse-track { fill: none; stroke: rgba(245, 196, 81, 0.15); stroke-width: 2; }
+      .lapse-ring { fill: none; stroke: var(--apollo); stroke-width: 2.5;
+        stroke-linecap: round; filter: drop-shadow(0 0 4px rgba(245, 196, 81, 0.7)); }
+      @keyframes sunspin { to { transform: rotate(360deg); } }
+      .decree-kicker {
+        font-size: 11px; letter-spacing: 3px; color: var(--apollo);
+        text-shadow: 0 0 12px rgba(245, 196, 81, 0.5); margin-top: 4px;
+      }
+      .decree-title {
+        font-size: 24px; font-weight: 600; margin: 10px 0 8px;
+        color: #fbe7c4; letter-spacing: 0.5px;
+      }
+      .decree-sub { font-size: 13px; color: #d7c8a4; line-height: 1.6; margin-bottom: 18px; }
+      .decree-sev { color: var(--apollo); font-weight: 700; letter-spacing: 1px; }
+      .decree-action {
+        font-size: 15px; color: #fff; background: rgba(0, 0, 0, 0.32);
+        border: 1px solid rgba(245, 196, 81, 0.25); border-radius: 12px;
+        padding: 14px 16px; margin-bottom: 22px; word-break: break-word;
+        font-family: "SF Mono", "JetBrains Mono", monospace;
+      }
+      .decree-buttons { display: flex; gap: 14px; justify-content: center; }
+      .decree-buttons button {
+        flex: 1; max-width: 200px; padding: 13px 10px; border-radius: 12px;
+        font: inherit; font-size: 15px; cursor: pointer; letter-spacing: 1px;
+        transition: transform 0.1s ease, box-shadow 0.2s ease;
+      }
+      .decree-buttons button .key {
+        opacity: 0.55; font-size: 11px; margin-left: 6px;
+        border: 1px solid currentColor; border-radius: 4px; padding: 0 4px;
+      }
+      .decree-buttons button:hover { transform: translateY(-1px); }
+      .sanction {
+        background: linear-gradient(180deg, rgba(245, 196, 81, 0.9), rgba(232, 163, 61, 0.9));
+        color: #2a1c02; border: 1px solid rgba(245, 196, 81, 0.9);
+        box-shadow: 0 0 22px rgba(245, 196, 81, 0.4);
+      }
+      .sanction:hover { box-shadow: 0 0 30px rgba(245, 196, 81, 0.6); }
+      .forbid {
+        background: rgba(120, 20, 26, 0.35); color: #ff9aa2;
+        border: 1px solid rgba(255, 90, 100, 0.45);
+      }
+      .forbid:hover { background: rgba(150, 24, 32, 0.5); }
+
+      /* --- Native-shell titlebar (Tauri only; hidden in the browser) --- */
+      #titlebar { display: none; }
+      body.native #titlebar {
+        display: flex; align-items: center; justify-content: space-between;
+        position: fixed; top: 0; left: 0; right: 0; height: 34px; z-index: 60;
+        padding: 0 8px 0 16px;
+        background: linear-gradient(180deg, rgba(8,11,18,0.72), rgba(8,11,18,0.0));
+        -webkit-user-select: none; user-select: none;
+      }
+      #titlebarName {
+        font-size: 10px; letter-spacing: 4px; font-weight: 600;
+        color: rgba(245, 196, 81, 0.7);
+        text-shadow: 0 0 12px rgba(245, 196, 81, 0.4);
+      }
+      #winctl { display: flex; gap: 4px; }
+      #winctl button {
+        width: 30px; height: 22px; padding: 0; line-height: 1;
+        background: transparent; color: rgba(159, 208, 255, 0.6);
+        border: 1px solid transparent; border-radius: 6px;
+        font-size: 13px; cursor: pointer; letter-spacing: 0;
+      }
+      #winctl button:hover { background: rgba(120, 200, 255, 0.14); color: #eaf6ff; }
+      #winClose:hover { background: rgba(255, 80, 90, 0.28); color: #ff9aa2; }
+      /* Nudge the top panels down so the titlebar doesn't overlap them. */
+      body.native #diagnostics, body.native #actionPanel { top: 44px; }
+    </style>
+  </head>
+  <body>
+    <!-- Native-shell titlebar: only shown inside the Oracle desktop app (Tauri).
+         In a plain browser it stays hidden, so the web build is unchanged. -->
+    <div id="titlebar" data-tauri-drag-region>
+      <span id="titlebarName" data-tauri-drag-region>ORACLE OF DELPHI</span>
+      <div id="winctl">
+        <button id="winMin" title="Dismiss to tray">—</button>
+        <button id="winClose" title="Hide">✕</button>
+      </div>
+    </div>
+
+    <canvas id="scene"></canvas>
+
+    <div class="panel" id="diagnostics">
+      <h2>Auguries</h2>
+      <div id="sys">awaiting the signs…</div>
+      <div id="state">idle</div>
+    </div>
+
+    <div class="panel" id="actionPanel">
+      <h2>The Oracle's Workings</h2>
+      <div id="toollog"></div>
+    </div>
+
+    <div class="panel" id="transcriptPanel">
+      <div id="transcript"></div>
+      <div id="caption"></div>
+      <input
+        id="userInput"
+        type="text"
+        placeholder="Speak to the Oracle, and press Enter…"
+        autocomplete="off"
+      />
+    </div>
+
+    <div class="panel" id="controls">
+      <button id="mic">🎙 Voice</button>
+      <button id="speak">🔊 Voice reply</button>
+      <button id="interrupt">◼ Interrupt</button>
+    </div>
+
+    <div id="apolloSig">☀ under the eye of Apollo ☀</div>
+
+    <!-- Native-shell wiring: reveal the titlebar and bind window controls only
+         when running inside the Oracle desktop app. No-op in a browser. -->
+    <script>
+      (function () {
+        var tauri = window.__TAURI__;
+        if (!tauri) return;
+        document.body.classList.add("native");
+        var appWindow = tauri.window.getCurrentWindow();
+        var min = document.getElementById("winMin");
+        var close = document.getElementById("winClose");
+        if (min) min.addEventListener("click", function () { appWindow.minimize(); });
+        // "Close" hides to tray (core keeps running); real quit is from the tray.
+        if (close) close.addEventListener("click", function () { appWindow.hide(); });
+      })();
+    </script>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

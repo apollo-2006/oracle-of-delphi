@@ -1,0 +1,47 @@
+[package]
+name = "oracle-core"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "oracle-core"
+path = "src/main.rs"
+
+[dependencies]
+oracle-ipc = { path = "../oracle-ipc" }
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+schemars.workspace = true
+rusqlite = { version = "0.31", features = ["bundled"] }
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+futures = "0.3"
+futures-util = "0.3"
+aes-gcm = "0.10"
+rand = "0.8"
+base64 = "0.22"
+sha2 = "0.10"
+tokio-tungstenite = "0.24"
+toml = "0.8"
+notify = "6"
+hdrhistogram = "7"
+rumqttc = "0.24"
+# Embed the built HUD (oracle-hud/dist) into the binary so `oracle-core` serves
+# its own frontend — no separate web server, no Tauri. Debug builds read the
+# folder from disk (hot reload); release builds bake it into the .exe.
+rust-embed = { version = "8", features = ["debug-embed"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tokio-tungstenite = "0.24"
+async-trait = "0.1"
+# For the end-to-end OS-tools test: spin up a real actd server over a socket.
+oracle-actd = { path = "../oracle-actd" }

@@ -1,0 +1,13 @@
+target/
+node_modules/
+dist/
+build/
+*.o
+.venv/
+oracle.db*
+oracle.toml
+
+# Secrets — never commit
+credentials.json
+*.tok
+vault.key

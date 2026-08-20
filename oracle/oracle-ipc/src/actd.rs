@@ -1,0 +1,188 @@
+//! RPC contract between `oracle-core` and the privileged actuator daemon.
+//!
+//! The security model lives here in the type system: every request carries a
+//! declared [`Capability`], and the daemon's policy engine — not the caller —
+//! decides whether to honor it. `serde` `deny_unknown_fields` keeps the wire
+//! format strict.
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// Privilege tiers, enforced inside actd (see architecture §3.4). The model
+/// never sees T3 tools at all; T2 requires spoken confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Capability {
+    /// T0: observe only (window list, process list, RO shell).
+    Observe,
+    /// T1: benign actuation (focus/resize, media keys, T1 shell).
+    BenignAct,
+    /// T2: sensitive (kill process, T2 shell, input injection into arbitrary apps).
+    Sensitive,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ActRequest {
+    ListWindows,
+    ListProcesses,
+    FocusWindow {
+        window_id: u64,
+    },
+    KillProcess {
+        pid: u32,
+    },
+    /// Inject a key sequence into the focused window (T2). Scan-code names.
+    TypeText {
+        text: String,
+    },
+    /// Run a command in the PTY sandbox at the given tier.
+    ShellExec {
+        cmd: String,
+        tier: ShellTier,
+        timeout_ms: u64,
+    },
+    /// Enter/exit lockdown — disables injection + shell until re-armed.
+    SetLockdown {
+        active: bool,
+    },
+    /// Resolve a previously-parked confirmation (from a `needs_confirmation`
+    /// response). Routed straight to the daemon's confirmation handler.
+    Confirm {
+        request_id: Uuid,
+        allow: bool,
+    },
+}
+
+impl ActRequest {
+    /// The capability this request *demands*. The daemon checks its granted
+    /// set against this; a caller cannot under-declare to sneak past policy
+    /// because the daemon recomputes it from the op, ignoring any client hint.
+    pub fn required_capability(&self) -> Capability {
+        match self {
+            ActRequest::ListWindows | ActRequest::ListProcesses => Capability::Observe,
+            ActRequest::FocusWindow { .. } | ActRequest::SetLockdown { .. } => {
+                Capability::BenignAct
+            }
+            ActRequest::ShellExec { tier, .. } => match tier {
+                ShellTier::ReadOnly => Capability::Observe,
+                ShellTier::WorkspaceWrite => Capability::BenignAct,
+                ShellTier::FullUser => Capability::Sensitive,
+            },
+            ActRequest::KillProcess { .. } | ActRequest::TypeText { .. } => Capability::Sensitive,
+            // Confirm is special-cased before the capability check in the daemon;
+            // it carries no capability of its own.
+            ActRequest::Confirm { .. } => Capability::Observe,
+        }
+    }
+
+    /// Whether this op mutates state irreversibly enough to warrant confirmation.
+    pub fn is_irreversible(&self) -> bool {
+        matches!(
+            self,
+            ActRequest::KillProcess { .. }
+                | ActRequest::ShellExec {
+                    tier: ShellTier::FullUser,
+                    ..
+                }
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellTier {
+    ReadOnly,
+    WorkspaceWrite,
+    FullUser,
+}
+
+/// Envelope: every RPC carries a turn id (audit correlation) and a monotonic
+/// nonce (anti-replay across the socket).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActEnvelope {
+    pub turn_id: Uuid,
+    pub nonce: u64,
+    pub request: ActRequest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ActResponse {
+    Ok {
+        data: serde_json::Value,
+    },
+    /// Streamed output chunk (shell). `eof` marks the final chunk.
+    Chunk {
+        stream: StdStream,
+        data: String,
+        eof: bool,
+    },
+    Denied {
+        reason: String,
+    },
+    Error {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StdStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WindowInfo {
+    pub id: u64,
+    pub title: String,
+    pub pid: u32,
+    pub focused: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcInfo {
+    pub pid: u32,
+    pub name: String,
+    pub rss_kb: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_is_derived_from_op_not_trusted() {
+        assert_eq!(
+            ActRequest::KillProcess { pid: 1 }.required_capability(),
+            Capability::Sensitive
+        );
+        assert_eq!(
+            ActRequest::ListWindows.required_capability(),
+            Capability::Observe
+        );
+        assert_eq!(
+            ActRequest::ShellExec {
+                cmd: "ls".into(),
+                tier: ShellTier::ReadOnly,
+                timeout_ms: 1000
+            }
+            .required_capability(),
+            Capability::Observe
+        );
+    }
+
+    #[test]
+    fn tier_ordering_holds() {
+        assert!(Capability::Observe < Capability::Sensitive);
+        assert!(Capability::BenignAct < Capability::Sensitive);
+    }
+
+    #[test]
+    fn irreversible_flags() {
+        assert!(ActRequest::KillProcess { pid: 9 }.is_irreversible());
+        assert!(!ActRequest::ListWindows.is_irreversible());
+    }
+}
