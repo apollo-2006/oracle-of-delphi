@@ -66,6 +66,10 @@ llm_args = [
   "-m", "E:\\oracle-models\\qwen2.5-14b-instruct-q5_k_m-00001-of-00003.gguf",
   "--host", "127.0.0.1", "--port", "8080",
   "-ngl", "999",
+  # --jinja uses the model's own chat template so llama-server actually injects
+  # the tool definitions into the prompt — WITHOUT this, the model never sees its
+  # tools and can't call them (it just apologizes and rambles).
+  "--jinja",
 ]
 
 # --- Actuator daemon ---

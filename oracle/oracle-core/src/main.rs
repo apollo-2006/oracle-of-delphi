@@ -674,7 +674,12 @@ fn spawn_hud_turn(
                             detail: None,
                         });
                     }
-                    AgentEvent::ToolFinished { id, name, ok } => {
+                    AgentEvent::ToolFinished {
+                        id,
+                        name,
+                        ok,
+                        detail,
+                    } => {
                         pub2.send_event(HudEvent::Tool {
                             id,
                             name,
@@ -683,7 +688,7 @@ fn spawn_hud_turn(
                             } else {
                                 oracle_ipc::ToolStatus::Error
                             },
-                            detail: None,
+                            detail,
                         });
                     }
                     AgentEvent::Finished { .. } => {
@@ -777,8 +782,16 @@ async fn repl(cfg: Config) -> anyhow::Result<()> {
                         io::stdout().flush().ok();
                     }
                     AgentEvent::ToolStarted { id, name } => eprint!("\n  [#{id} {name} …]"),
-                    AgentEvent::ToolFinished { id, name, ok } => {
-                        eprint!(" [#{id} {name} {}]", if ok { "ok" } else { "ERR" })
+                    AgentEvent::ToolFinished {
+                        id,
+                        name,
+                        ok,
+                        detail,
+                    } => {
+                        eprint!(" [#{id} {name} {}]", if ok { "ok" } else { "ERR" });
+                        if let Some(d) = detail {
+                            eprint!(" ({d})");
+                        }
                     }
                     AgentEvent::Finished { cancelled } => {
                         println!("{}", if cancelled { "  (interrupted)" } else { "" })

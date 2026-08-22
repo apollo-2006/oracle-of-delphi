@@ -186,12 +186,22 @@ impl Dispatcher {
                 }
             };
             let ok = matches!(outcome, ToolOutcome::Ok(_));
+            let mut detail: Option<String> = None;
             match outcome {
                 ToolOutcome::Ok(v) => {
                     ok_results.insert(id, v.clone());
                     ordered.push((id, name.clone(), ResultView::Ok(v)));
                 }
                 ToolOutcome::Err(e) => {
+                    // Surface WHY it failed — to the HUD action log and core's log —
+                    // instead of a bare "error" the model has to apologize about.
+                    let mut msg = e.reason.clone();
+                    if let Some(h) = &e.hint {
+                        msg.push_str(" — ");
+                        msg.push_str(h);
+                    }
+                    warn!(tool = %name, "tool failed: {msg}");
+                    detail = Some(msg);
                     ordered.push((
                         id,
                         name.clone(),
@@ -200,7 +210,14 @@ impl Dispatcher {
                 }
             }
             completed.insert(id);
-            let _ = out.send(AgentEvent::ToolFinished { id, name, ok }).await;
+            let _ = out
+                .send(AgentEvent::ToolFinished {
+                    id,
+                    name,
+                    ok,
+                    detail,
+                })
+                .await;
 
             if cancel.is_cancelled() {
                 running.abort_all();

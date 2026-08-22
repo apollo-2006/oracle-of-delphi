@@ -71,41 +71,56 @@ impl LlamaServer {
     }
 }
 
-/// Parse one SSE `data:` line body into a delta. Returns `None` for keepalives
-/// and the `[DONE]` sentinel (handled by the caller).
-pub(crate) fn parse_sse_chunk(json: &str) -> Option<LlmDelta> {
+/// One raw event parsed from an SSE chunk. Tool calls arrive as *fragments* when
+/// llama-server streams with `--jinja` (Qwen's template): the name comes in the
+/// first fragment, the arguments dribble in as string pieces across later ones.
+/// We surface fragments raw and let the caller accumulate them into whole calls.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Raw {
+    Text(String),
+    /// A tool-call fragment: `name` is empty on continuation fragments; `args`
+    /// is the raw argument-string piece to concatenate.
+    ToolFragment {
+        index: u32,
+        name: String,
+        args: String,
+    },
+    Finish(StopReason),
+}
+
+/// Parse one SSE `data:` line body into a raw event. `None` for keepalives.
+pub(crate) fn parse_sse_raw(json: &str) -> Option<Raw> {
     let v: Value = serde_json::from_str(json).ok()?;
     let choice = v.get("choices")?.get(0)?;
-    let delta = choice.get("delta")?;
 
-    // Tool call?
-    if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
-        if let Some(tc) = tcs.first() {
-            let id = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
+    if let Some(delta) = choice.get("delta") {
+        // Tool-call fragment?
+        if let Some(tc) = delta
+            .get("tool_calls")
+            .and_then(|t| t.as_array())
+            .and_then(|a| a.first())
+        {
+            let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
             let name = tc
                 .get("function")
                 .and_then(|f| f.get("name"))
                 .and_then(|n| n.as_str())
                 .unwrap_or_default()
                 .to_string();
+            // Arguments stream as a JSON *string* to be concatenated.
             let args = tc
                 .get("function")
                 .and_then(|f| f.get("arguments"))
-                .cloned()
-                .and_then(|a| match a {
-                    // llama-server may send arguments as a JSON string.
-                    Value::String(s) => serde_json::from_str(&s).ok(),
-                    other => Some(other),
-                })
-                .unwrap_or(Value::Object(Default::default()));
-            return Some(LlmDelta::ToolCall { id, name, args });
+                .and_then(|a| a.as_str())
+                .unwrap_or_default()
+                .to_string();
+            return Some(Raw::ToolFragment { index, name, args });
         }
-    }
-
-    // Plain text content?
-    if let Some(t) = delta.get("content").and_then(|c| c.as_str()) {
-        if !t.is_empty() {
-            return Some(LlmDelta::Text(t.to_string()));
+        // Plain text content?
+        if let Some(t) = delta.get("content").and_then(|c| c.as_str()) {
+            if !t.is_empty() {
+                return Some(Raw::Text(t.to_string()));
+            }
         }
     }
 
@@ -116,11 +131,31 @@ pub(crate) fn parse_sse_chunk(json: &str) -> Option<LlmDelta> {
             "length" => StopReason::Length,
             _ => StopReason::Stop,
         };
-        return Some(LlmDelta::Done {
-            stop_reason: reason,
-        });
+        return Some(Raw::Finish(reason));
     }
     None
+}
+
+/// Flush accumulated tool-call fragments into whole `LlmDelta::ToolCall`s.
+fn flush_tools(
+    accum: &mut std::collections::BTreeMap<u32, (String, String)>,
+    pending: &mut std::collections::VecDeque<LlmDelta>,
+) {
+    for (index, (name, args_str)) in std::mem::take(accum) {
+        if name.is_empty() {
+            continue; // never a real call without a name
+        }
+        let args = if args_str.trim().is_empty() {
+            Value::Object(Default::default())
+        } else {
+            serde_json::from_str(&args_str).unwrap_or_else(|_| Value::Object(Default::default()))
+        };
+        pending.push_back(LlmDelta::ToolCall {
+            id: index,
+            name,
+            args,
+        });
+    }
 }
 
 #[async_trait]
@@ -141,43 +176,76 @@ impl Llm for LlamaServer {
             .error_for_status()?;
 
         let byte_stream = Box::pin(resp.bytes_stream());
-        // Turn the byte stream into line-buffered SSE deltas, honoring cancel.
+        // Turn the byte stream into line-buffered deltas. Tool-call fragments are
+        // accumulated in `accum` (index -> (name, args-string)) and only emitted
+        // as whole `LlmDelta::ToolCall`s when the turn finishes — so a streamed
+        // call ("gmail.search" + dribbled arguments) becomes one complete call,
+        // not a pile of nameless fragments. `pending` is the emit queue.
+        use std::collections::{BTreeMap, VecDeque};
+        let state = (
+            byte_stream,
+            String::new(),
+            cancel,
+            false, // done
+            BTreeMap::<u32, (String, String)>::new(),
+            VecDeque::<LlmDelta>::new(),
+        );
         let s = stream::unfold(
-            (byte_stream, String::new(), cancel, false),
-            move |(mut bytes, mut buf, cancel, mut finished)| async move {
+            state,
+            move |(mut bytes, mut buf, cancel, mut done, mut accum, mut pending)| async move {
                 loop {
-                    if finished {
+                    // Always drain anything already queued first.
+                    if let Some(d) = pending.pop_front() {
+                        return Some((d, (bytes, buf, cancel, done, accum, pending)));
+                    }
+                    if done {
                         return None;
                     }
                     if cancel.is_cancelled() {
-                        finished = true;
+                        done = true;
                         return Some((
                             LlmDelta::Done {
                                 stop_reason: StopReason::Cancelled,
                             },
-                            (bytes, buf, cancel, finished),
+                            (bytes, buf, cancel, done, accum, pending),
                         ));
                     }
-                    // Emit any complete SSE event already in the buffer.
+                    // Consume one complete SSE line from the buffer if present.
                     if let Some(pos) = buf.find('\n') {
                         let line = buf[..pos].trim().to_string();
                         buf.drain(..=pos);
                         if let Some(data) = line.strip_prefix("data:") {
                             let data = data.trim();
                             if data == "[DONE]" {
-                                finished = true;
-                                return Some((
-                                    LlmDelta::Done {
-                                        stop_reason: StopReason::Stop,
-                                    },
-                                    (bytes, buf, cancel, finished),
-                                ));
+                                flush_tools(&mut accum, &mut pending);
+                                pending.push_back(LlmDelta::Done {
+                                    stop_reason: StopReason::Stop,
+                                });
+                                done = true;
+                                continue; // drain pending on the next lap
                             }
-                            if let Some(delta) = parse_sse_chunk(data) {
-                                if matches!(delta, LlmDelta::Done { .. }) {
-                                    finished = true;
+                            match parse_sse_raw(data) {
+                                Some(Raw::Text(t)) => {
+                                    return Some((
+                                        LlmDelta::Text(t),
+                                        (bytes, buf, cancel, done, accum, pending),
+                                    ));
                                 }
-                                return Some((delta, (bytes, buf, cancel, finished)));
+                                Some(Raw::ToolFragment { index, name, args }) => {
+                                    let e = accum.entry(index).or_default();
+                                    if !name.is_empty() {
+                                        e.0 = name;
+                                    }
+                                    e.1.push_str(&args);
+                                }
+                                Some(Raw::Finish(reason)) => {
+                                    flush_tools(&mut accum, &mut pending);
+                                    pending.push_back(LlmDelta::Done {
+                                        stop_reason: reason,
+                                    });
+                                    done = true;
+                                }
+                                None => {}
                             }
                         }
                         continue;
@@ -188,13 +256,11 @@ impl Llm for LlamaServer {
                             buf.push_str(&String::from_utf8_lossy(&chunk));
                         }
                         Some(Err(_)) | None => {
-                            finished = true;
-                            return Some((
-                                LlmDelta::Done {
-                                    stop_reason: StopReason::Stop,
-                                },
-                                (bytes, buf, cancel, finished),
-                            ));
+                            flush_tools(&mut accum, &mut pending);
+                            pending.push_back(LlmDelta::Done {
+                                stop_reason: StopReason::Stop,
+                            });
+                            done = true;
                         }
                     }
                 }
@@ -212,31 +278,64 @@ mod tests {
     #[test]
     fn parses_text_delta() {
         let j = r#"{"choices":[{"delta":{"content":"Hello"}}]}"#;
-        assert_eq!(parse_sse_chunk(j), Some(LlmDelta::Text("Hello".into())));
+        assert_eq!(parse_sse_raw(j), Some(Raw::Text("Hello".into())));
     }
 
     #[test]
-    fn parses_tool_call_with_string_arguments() {
-        let j = r#"{"choices":[{"delta":{"tool_calls":[{"index":2,"function":{"name":"cal.free","arguments":"{\"date\":\"2026-08-18\"}"}}]}}]}"#;
-        match parse_sse_chunk(j).unwrap() {
-            LlmDelta::ToolCall { id, name, args } => {
-                assert_eq!(id, 2);
-                assert_eq!(name, "cal.free");
-                assert_eq!(args["date"], "2026-08-18");
-            }
-            other => panic!("expected tool call, got {other:?}"),
-        }
+    fn parses_tool_fragment() {
+        let j = r#"{"choices":[{"delta":{"tool_calls":[{"index":2,"function":{"name":"cal.free","arguments":"{\"date\":"}}]}}]}"#;
+        assert_eq!(
+            parse_sse_raw(j),
+            Some(Raw::ToolFragment {
+                index: 2,
+                name: "cal.free".into(),
+                args: "{\"date\":".into(),
+            })
+        );
     }
 
     #[test]
     fn parses_finish_reason() {
         let j = r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#;
-        assert_eq!(
-            parse_sse_chunk(j),
-            Some(LlmDelta::Done {
-                stop_reason: StopReason::ToolCalls
-            })
-        );
+        assert_eq!(parse_sse_raw(j), Some(Raw::Finish(StopReason::ToolCalls)));
+    }
+
+    /// The real bug: a streamed tool call arrives as fragments (name first, then
+    /// argument pieces). Accumulation must reassemble ONE complete call — not a
+    /// pile of nameless ones — which is what broke `--jinja` tool use.
+    #[test]
+    fn accumulates_streamed_tool_call_fragments() {
+        use std::collections::{BTreeMap, VecDeque};
+        // Simulate llama-server's `--jinja` streaming: name in the first frag,
+        // arguments dribbled across the rest.
+        let frags = [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"gmail.search","arguments":""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"","arguments":"{\"query\":\"is:"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"","arguments":"unread\"}"}}]}}]}"#,
+        ];
+        let mut accum: BTreeMap<u32, (String, String)> = BTreeMap::new();
+        for f in frags {
+            if let Some(Raw::ToolFragment { index, name, args }) = parse_sse_raw(f) {
+                let e = accum.entry(index).or_default();
+                if !name.is_empty() {
+                    e.0 = name;
+                }
+                e.1.push_str(&args);
+            } else {
+                panic!("expected a tool fragment for {f}");
+            }
+        }
+        let mut pending: VecDeque<LlmDelta> = VecDeque::new();
+        flush_tools(&mut accum, &mut pending);
+        assert_eq!(pending.len(), 1, "fragments must collapse to ONE call");
+        match pending.pop_front().unwrap() {
+            LlmDelta::ToolCall { id, name, args } => {
+                assert_eq!(id, 0);
+                assert_eq!(name, "gmail.search");
+                assert_eq!(args["query"], "is:unread");
+            }
+            other => panic!("expected one whole tool call, got {other:?}"),
+        }
     }
 
     #[test]

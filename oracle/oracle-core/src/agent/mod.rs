@@ -25,19 +25,17 @@ pub enum AgentEvent {
     /// A speakable clause (already chunk-friendly text) → TTS + HUD caption.
     Say(String),
     /// A tool started/finished — drives the HUD action tree.
-    ToolStarted {
-        id: u32,
-        name: String,
-    },
+    ToolStarted { id: u32, name: String },
     ToolFinished {
         id: u32,
         name: String,
         ok: bool,
+        /// On failure, the human-readable reason (so the HUD/logs show WHY a
+        /// tool errored instead of a bare "error").
+        detail: Option<String>,
     },
     /// The turn ended. `cancelled` distinguishes barge-in from natural finish.
-    Finished {
-        cancelled: bool,
-    },
+    Finished { cancelled: bool },
 }
 
 pub struct AgentConfig {
