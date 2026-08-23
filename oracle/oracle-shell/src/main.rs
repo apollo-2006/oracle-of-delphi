@@ -52,7 +52,25 @@ fn main() -> wry::Result<()> {
 
     // 3) The WebView pointed at the HUD core serves. Core may still be starting,
     //    and the HUD retries its own WebSocket, so loading immediately is fine.
-    let _webview = WebViewBuilder::new(&window).with_url(HUD_URL).build()?;
+    //
+    //    Microphone: an embedded WebView2 denies mic access by default and — with
+    //    no browser chrome — can't show a permission prompt, so the HUD's voice
+    //    recognition silently gets nothing. `--use-fake-ui-for-media-stream`
+    //    auto-accepts the media-permission request against the REAL microphone
+    //    (no prompt, real device), which is what a local voice assistant wants.
+    //    We keep wry's own default args (mini-menu / SmartScreen suppression) and
+    //    add ours; `--autoplay-policy` lets TTS start without a user gesture.
+    let webview_builder = WebViewBuilder::new(&window).with_url(HUD_URL);
+    #[cfg(windows)]
+    let webview_builder = {
+        use wry::WebViewBuilderExtWindows;
+        webview_builder.with_additional_browser_args(
+            "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
+             --autoplay-policy=no-user-gesture-required \
+             --use-fake-ui-for-media-stream",
+        )
+    };
+    let _webview = webview_builder.build()?;
 
     // 4) Global summon hotkey: Ctrl+Alt+O.
     let hotkey_manager = GlobalHotKeyManager::new().expect("hotkey manager");

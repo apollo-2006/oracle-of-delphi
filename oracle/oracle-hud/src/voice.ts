@@ -89,6 +89,8 @@ export class VoiceLoop {
   private wantWake = false;
   private active = false;
   private activeTimer: ReturnType<typeof setTimeout> | null = null;
+  private micWatchdog: ReturnType<typeof setTimeout> | null = null;
+  private micOpened = false;
   private cb: VoiceCallbacks;
 
   constructor(cb: VoiceCallbacks) {
@@ -141,7 +143,7 @@ export class VoiceLoop {
       this.ensureRunning();
       this.cb.onStatus?.("listening — speak now");
       if (autoRevertMs) {
-        // A bare wake ("Pythia") opens a short command window, then falls back
+        // A bare wake ("Delphi") opens a short command window, then falls back
         // to wake-only so we're not forwarding ambient chatter forever.
         this.activeTimer = setTimeout(() => this.setActive(false), autoRevertMs);
       }
@@ -161,9 +163,26 @@ export class VoiceLoop {
     r.lang = "en-US";
     r.onstart = () => {
       console.log("[voice] recognition started", { wake: this.wantWake, active: this.active });
+      // Watchdog: if the mic never actually opens (onaudiostart) shortly after
+      // start, the OS/WebView denied it — tell the user something actionable
+      // instead of leaving them wondering why nothing happens.
+      this.micOpened = false;
+      if (this.micWatchdog) clearTimeout(this.micWatchdog);
+      this.micWatchdog = setTimeout(() => {
+        if (!this.micOpened) {
+          this.cb.onStatus?.(
+            "mic isn't opening — check Windows Settings ▸ Privacy ▸ Microphone (allow desktop apps)",
+          );
+        }
+      }, 4500);
     };
     r.onaudiostart = () => {
       console.log("[voice] audio capture started (mic is live)");
+      this.micOpened = true;
+      if (this.micWatchdog) {
+        clearTimeout(this.micWatchdog);
+        this.micWatchdog = null;
+      }
     };
     r.onspeechstart = () => {
       console.log("[voice] speech detected");
@@ -208,10 +227,19 @@ export class VoiceLoop {
         this.cb.onStatus?.(`voice error: ${err}`);
       }
       if (err === "not-allowed" || err === "service-not-allowed") {
-        // Permission was denied — stop trying so we don't loop.
+        // Permission was denied — stop the current stream but KEEP the wake
+        // intent, so a later user gesture (or the shell granting mic access on
+        // the next launch) can re-arm it instead of it being dead for the
+        // session. Surface a clear, actionable message.
         this.running = false;
         this.active = false;
-        this.wantWake = false;
+        if (this.micWatchdog) {
+          clearTimeout(this.micWatchdog);
+          this.micWatchdog = null;
+        }
+        this.cb.onStatus?.(
+          "mic blocked — allow microphone for this app in Windows Settings, then click 🎙 Voice",
+        );
       }
     };
     this.recog = r;
@@ -240,7 +268,7 @@ export class VoiceLoop {
       // wake-only mode (don't leave the mic hot on the room afterward).
       this.cb.onUtterance(command);
     } else {
-      // Bare "Pythia" — open a brief command window for the next sentence.
+      // Bare "Delphi" — open a brief command window for the next sentence.
       this.setActive(true, 9000);
     }
   }
@@ -249,6 +277,10 @@ export class VoiceLoop {
   private maybeStop(): void {
     if (this.wantWake || this.active) return;
     this.running = false;
+    if (this.micWatchdog) {
+      clearTimeout(this.micWatchdog);
+      this.micWatchdog = null;
+    }
     this.recog?.stop();
     this.recog = null;
   }
@@ -260,6 +292,10 @@ export class VoiceLoop {
     if (this.activeTimer) {
       clearTimeout(this.activeTimer);
       this.activeTimer = null;
+    }
+    if (this.micWatchdog) {
+      clearTimeout(this.micWatchdog);
+      this.micWatchdog = null;
     }
     this.running = false;
     this.recog?.stop();
