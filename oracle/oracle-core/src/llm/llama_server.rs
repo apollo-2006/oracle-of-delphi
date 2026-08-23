@@ -44,6 +44,15 @@ impl LlamaServer {
             "messages": messages,
             "max_tokens": req.max_tokens,
             "temperature": req.temperature,
+            // Constrain sampling to Qwen2.5's recommended window. Without these,
+            // llama-server's permissive defaults let the long tail through — the
+            // cause of the occasional foreign-language preamble before an English
+            // answer. top_k/min_p/repeat_penalty are llama.cpp extensions the
+            // OpenAI-compatible endpoint accepts alongside the standard fields.
+            "top_p": req.top_p,
+            "top_k": req.top_k,
+            "min_p": req.min_p,
+            "repeat_penalty": req.repeat_penalty,
             "stream": true,
         });
         // Attach tools only when present; this switches the server into
@@ -350,8 +359,18 @@ mod tests {
             tools: Value::Array(vec![]),
             max_tokens: 128,
             temperature: 0.5,
+            top_p: LlmRequest::DEFAULT_TOP_P,
+            top_k: LlmRequest::DEFAULT_TOP_K,
+            min_p: LlmRequest::DEFAULT_MIN_P,
+            repeat_penalty: LlmRequest::DEFAULT_REPEAT_PENALTY,
         });
         assert!(body.get("tools").is_none());
+        // Sampling window is present and constrained (f32→f64 widening means we
+        // compare approximately, not for exact equality).
+        assert!((body["top_p"].as_f64().unwrap() - 0.8).abs() < 1e-4);
+        assert_eq!(body["top_k"], 20);
+        assert!((body["min_p"].as_f64().unwrap() - 0.05).abs() < 1e-4);
+        assert!((body["repeat_penalty"].as_f64().unwrap() - 1.05).abs() < 1e-4);
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["content"], "hi");
     }

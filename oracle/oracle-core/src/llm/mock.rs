@@ -164,6 +164,10 @@ mod tests {
             tools: Value::Array(vec![]),
             max_tokens: 256,
             temperature: 0.7,
+            top_p: LlmRequest::DEFAULT_TOP_P,
+            top_k: LlmRequest::DEFAULT_TOP_K,
+            min_p: LlmRequest::DEFAULT_MIN_P,
+            repeat_penalty: LlmRequest::DEFAULT_REPEAT_PENALTY,
         }
     }
 

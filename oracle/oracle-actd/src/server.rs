@@ -70,7 +70,26 @@ pub async fn serve<P: Platform + 'static>(
 ) -> anyhow::Result<()> {
     use oracle_ipc::transport::windows as winpipe;
     let pipe = winpipe::full_pipe_name(pipe_name);
-    let mut server = winpipe::create_first(&pipe)?;
+    // Bind the first pipe instance, retrying while a just-killed orphan releases
+    // its handle. "Access is denied (os error 5)" here means another instance
+    // still owns the name; core reaps orphans before launching us, so a short
+    // retry rides out the brief window where the handle hasn't dropped yet.
+    let mut server = {
+        let mut attempt = 0u32;
+        loop {
+            match winpipe::create_first(&pipe) {
+                Ok(s) => break s,
+                Err(e) if e.raw_os_error() == Some(5) && attempt < 25 => {
+                    if attempt == 0 {
+                        warn!(pipe = %pipe, "pipe busy (access denied); waiting for a stale actd to release it");
+                    }
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    };
     info!(pipe = %pipe, "actd listening (named pipe)");
 
     loop {

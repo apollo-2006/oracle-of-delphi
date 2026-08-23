@@ -10,6 +10,25 @@ $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = Resolve-Path (Join-Path $here "..")   # repo root
 
+# 0) Rebuild the HUD so oracle-core embeds the latest UI (rust-embed bakes
+#    oracle-hud\dist into the binary at compile time). If npm isn't installed we
+#    fall back to the prebuilt dist shipped in the repo — the UI still updates,
+#    it just isn't rebuilt from source here.
+$hud = Join-Path $root "oracle-hud"
+$npm = Get-Command npm -ErrorAction SilentlyContinue
+if ($npm) {
+  Write-Host "[oracle] building the HUD (npm run build)..." -ForegroundColor Yellow
+  Push-Location $hud
+  try {
+    if (-not (Test-Path (Join-Path $hud "node_modules"))) { npm install }
+    npm run build
+  } finally { Pop-Location }
+} elseif (Test-Path (Join-Path $hud "dist\index.html")) {
+  Write-Host "[oracle] npm not found — using the prebuilt HUD in oracle-hud\dist." -ForegroundColor DarkYellow
+} else {
+  throw "No npm and no prebuilt oracle-hud\dist — install Node.js or restore the dist folder."
+}
+
 Write-Host "[oracle] building backend (oracle-core + oracle-actd)..." -ForegroundColor Yellow
 Push-Location $root
 try { cargo build --release -p oracle-core -p oracle-actd } finally { Pop-Location }

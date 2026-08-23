@@ -106,12 +106,21 @@ class Hud {
     this.voice = new VoiceLoop({
       onUtterance: (text) => {
         this.conn.send({ type: "user_text", text });
-        setText("transcript", "you: " + text);
+        setText("transcript", text);
         setText("caption", "");
       },
-      onPartial: (text) => setText("transcript", "you: " + text + " …"),
+      onPartial: (text) => setText("transcript", text + " …"),
       onBargeIn: () => this.conn.send({ type: "interrupt" }),
       onStatus: (msg) => setText("transcript", "🎙 " + msg),
+      onWake: (command) => {
+        // Wake word heard — raise the window (core relays to the shell) and
+        // show we're attending. A bare "Delphi" leaves the mic open briefly for
+        // the follow-up; "Delphi, do X" already forwarded X as the utterance.
+        this.conn.send({ type: "summon" });
+        setState("listening");
+        setText("transcript", "");
+        setText("caption", command ? "" : "Yes? I'm listening…");
+      },
     });
 
     // The Apollo decree modal: the user's verdict on irreversible actions goes
@@ -134,7 +143,7 @@ class Hud {
         const text = input.value.trim();
         this.conn.send({ type: "user_text", text });
         // Echo locally so the user sees their message immediately.
-        setText("transcript", "you: " + text);
+        setText("transcript", text);
         setText("caption", "");
         input.value = "";
       }
@@ -151,6 +160,37 @@ class Hud {
         mic.classList.toggle("active", on);
         mic.textContent = on ? "🎙 Listening…" : "🎙 Voice";
       });
+    }
+
+    // Wake-word listener ("Delphi"). Armed by default when voice is supported so
+    // the Oracle answers to its name hands-free; the chip lets the user silence
+    // it. Browsers may block starting the mic without a gesture, so we also arm
+    // on the first interaction as a fallback.
+    const wake = document.getElementById("wake") as HTMLButtonElement | null;
+    if (wake) {
+      if (!this.voice.supported) {
+        wake.disabled = true;
+        wake.hidden = true;
+      } else {
+        const reflect = (on: boolean) => {
+          wake.classList.toggle("on", on);
+          wake.textContent = on ? "◉ Delphi" : "○ Wake off";
+          wake.title = on
+            ? 'Listening for "Delphi" — click to disable'
+            : 'Say "Delphi" to summon — click to enable';
+        };
+        reflect(this.voice.enableWake(true));
+        wake.addEventListener("click", () => reflect(this.voice.enableWake(!this.voice.isWakeOn)));
+        // Fallback arm: if autostart was blocked (no user gesture yet), the
+        // first click/keypress re-arms it.
+        const rearm = () => {
+          if (this.voice.isWakeOn) reflect(this.voice.enableWake(true));
+          window.removeEventListener("pointerdown", rearm);
+          window.removeEventListener("keydown", rearm);
+        };
+        window.addEventListener("pointerdown", rearm);
+        window.addEventListener("keydown", rearm);
+      }
     }
 
     // Spoken-reply toggle. On by default; lets the user silence TTS.
@@ -187,30 +227,35 @@ class Hud {
     switch (ev.type) {
       case "state":
         this.core.setState(stateFromString(ev.state));
-        setText("state", ev.state);
-        // When a turn returns to idle, speak the accumulated reply (if the mic
-        // is on — voice in implies voice out).
+        setState(ev.state);
+        // When a turn returns to idle, speak the accumulated reply (if voice-out
+        // is on).
         if (ev.state === "idle" && this.pendingReply.trim().length > 0) {
           if (this.voiceOut) this.voice.speak(this.pendingReply);
           this.pendingReply = "";
         }
         break;
       case "transcript":
-        setText("transcript", "you: " + ev.text + (ev.stable ? "" : " …"));
+        setText("transcript", ev.text + (ev.stable ? "" : " …"));
         break;
       case "caption":
         // Caption streams the growing reply; keep the latest for TTS.
         this.pendingReply = ev.text;
-        setText("caption", ev.text ? "pythia: " + ev.text : "");
+        setText("caption", ev.text);
         break;
       case "tool":
-        appendToolLog(`#${ev.id} ${ev.name} — ${ev.status}${ev.detail ? " (" + ev.detail + ")" : ""}`);
+        appendToolLog(ev.id, ev.name, ev.status, ev.detail);
         break;
       case "sys":
         setText(
           "sys",
           `GPU ${ev.gpu_util.toFixed(0)}% ${ev.gpu_temp_c.toFixed(0)}°C · VRAM ${ev.vram_mb}MB · ${ev.tok_per_s.toFixed(0)} tok/s · RTF ${ev.asr_rtf.toFixed(2)}`,
         );
+        break;
+      case "status":
+        // Core-composed status line for the System panel (model · backend ·
+        // actd · throughput).
+        setText("sys", ev.text);
         break;
       case "confirm":
         this.apollo.show({
@@ -261,14 +306,42 @@ function setText(id: string, text: string): void {
   if (el) el.textContent = text;
 }
 
-function appendToolLog(line: string): void {
+// Drive the state chip: text + a data-state attribute that colors it (and the
+// ambient vignette) via CSS.
+function setState(state: string): void {
+  const el = document.getElementById("state");
+  if (el) {
+    el.textContent = state;
+    el.dataset.state = state;
+  }
+  document.body.dataset.state = state;
+}
+
+// A styled activity row: `#id name`, a colored status pill, and (on failure)
+// the error detail on its own line.
+function appendToolLog(id: number, name: string, status: string, detail?: string): void {
   const el = document.getElementById("toollog");
   if (!el) return;
-  const div = document.createElement("div");
-  div.className = "tool-line";
-  div.textContent = line;
-  el.prepend(div);
-  while (el.childElementCount > 12) el.lastElementChild?.remove();
+  const row = document.createElement("div");
+  row.className = "tool-line";
+
+  const nameEl = document.createElement("span");
+  nameEl.className = "t-name";
+  nameEl.textContent = `#${id} ${name}`;
+
+  const pill = document.createElement("span");
+  pill.className = `t-pill ${status}`;
+  pill.textContent = status;
+
+  row.append(nameEl, pill);
+  if (detail) {
+    const d = document.createElement("div");
+    d.className = "t-detail";
+    d.textContent = detail;
+    row.append(d);
+  }
+  el.prepend(row);
+  while (el.childElementCount > 10) el.lastElementChild?.remove();
 }
 
 // Bootstrap. When core serves the HUD itself, derive the WebSocket URL from the

@@ -104,6 +104,12 @@ pub enum HudEvent {
         tok_per_s: f32,
         asr_rtf: f32,
     },
+    /// A ready-to-render status line for the System panel (model, backend
+    /// health, throughput). Composed by core so the HUD stays a dumb display —
+    /// this replaces the never-populated numeric `Sys` telemetry.
+    Status {
+        text: String,
+    },
     /// A pending irreversible action awaiting the user's decree. The HUD raises
     /// the Apollo confirmation modal and replies with `HudCommand::Confirm`.
     Confirm {
@@ -140,6 +146,10 @@ pub enum HudCommand {
     UserText {
         text: String,
     },
+    /// The wake word ("Pythia") was heard while the window may be dismissed.
+    /// Core raises a summon flag the native shell polls, bringing the window
+    /// back to the foreground hands-free.
+    Summon,
 }
 
 #[cfg(test)]

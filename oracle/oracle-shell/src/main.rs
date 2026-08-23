@@ -86,6 +86,12 @@ fn main() -> wry::Result<()> {
         // Wake ~10x/sec to service the hotkey/tray channels.
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(100));
 
+        // Wake word: core raises a summon flag when it hears "Pythia"; bring the
+        // window forward (hands-free) and consume the flag.
+        if take_summon_flag() {
+            summon_window(&window);
+        }
+
         // Global hotkey → toggle the window.
         if let Ok(ev) = hotkey_rx.try_recv() {
             if ev.state == HotKeyState::Pressed && ev.id == summon_id {
@@ -122,6 +128,34 @@ fn main() -> wry::Result<()> {
             window.set_visible(false);
         }
     });
+}
+
+/// The rendezvous flag core writes when the wake word fires. Must match
+/// oracle-core's `summon_flag_path()` exactly: `%LOCALAPPDATA%\oracle\summon.flag`
+/// on Windows, the temp dir elsewhere.
+fn summon_flag_path() -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
+        std::path::Path::new(&base).join("oracle").join("summon.flag")
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::temp_dir().join("oracle-summon.flag")
+    }
+}
+
+/// If the summon flag exists, delete it and report true (so we summon once per
+/// wake, not continuously). A missing flag is the common case and costs one
+/// cheap stat per tick.
+fn take_summon_flag() -> bool {
+    let path = summon_flag_path();
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+        true
+    } else {
+        false
+    }
 }
 
 /// Show + focus the window.

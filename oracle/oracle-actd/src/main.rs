@@ -32,24 +32,69 @@ async fn main() -> anyhow::Result<()> {
         // `--grant-sensitive` enables reversible sensitive ops (e.g. input
         // injection) for the session. Irreversible ops still require confirmation.
         let grant_sensitive = args.iter().any(|a| a == "--grant-sensitive");
-        return serve_mode(&args[2], grant_sensitive).await;
+        // `--log-dir <path>` says where to keep the audit journal. Core passes
+        // its runtime dir here so the log lands beside actd.log rather than in
+        // whatever (possibly read-only) directory we happened to inherit.
+        let log_dir = arg_after(&args, "--log-dir");
+        return serve_mode(&args[2], grant_sensitive, log_dir.as_deref()).await;
     }
     self_check();
     Ok(())
 }
 
+/// Value following `flag` in the argument list, if present.
+fn arg_after(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+}
+
+/// Open the audit-journal writer, trying (in order) the caller-supplied log dir,
+/// the OS temp dir, and finally an in-memory sink. Opening the audit log must
+/// NEVER stop the daemon from serving — a daemon that can't write its journal is
+/// degraded, not dead. (Historically a failed open here `?`-propagated and the
+/// whole daemon exited before binding its pipe, so core could never connect.)
+fn open_audit_writer(log_dir: Option<&str>) -> Box<dyn std::io::Write + Send> {
+    use std::path::PathBuf;
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(d) = log_dir {
+        candidates.push(PathBuf::from(d).join("actd-audit.jsonl"));
+    }
+    candidates.push(std::env::temp_dir().join("oracle-actd-audit.jsonl"));
+
+    for path in candidates {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            tracing::info!(path = %path.display(), "audit journal open");
+            return Box::new(file);
+        }
+        tracing::warn!(path = %path.display(), "could not open audit journal here; trying next");
+    }
+    tracing::warn!("no writable audit location; auditing to a null sink (daemon still serving)");
+    Box::new(std::io::sink())
+}
+
 #[cfg(unix)]
-async fn serve_mode(socket: &str, grant_sensitive: bool) -> anyhow::Result<()> {
-    // Audit journal to a real append-only file next to the socket.
-    let log_path = std::path::Path::new(socket)
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("actd-audit.jsonl");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
-    let audit = AuditJournal::new(Box::new(file));
+async fn serve_mode(
+    socket: &str,
+    grant_sensitive: bool,
+    log_dir: Option<&str>,
+) -> anyhow::Result<()> {
+    // Audit journal to a writable location: the caller's log dir, else the
+    // socket's own directory, else temp — never fatal (see open_audit_writer).
+    let dir = log_dir.map(|s| s.to_string()).or_else(|| {
+        std::path::Path::new(socket)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+    });
+    let audit = AuditJournal::new(open_audit_writer(dir.as_deref()));
 
     #[cfg(target_os = "linux")]
     let platform = {
@@ -87,23 +132,17 @@ async fn serve_mode(socket: &str, grant_sensitive: bool) -> anyhow::Result<()> {
 }
 
 #[cfg(windows)]
-async fn serve_mode(pipe: &str, grant_sensitive: bool) -> anyhow::Result<()> {
-    // Audit journal next to the config/runtime area.
-    let log_path = std::path::Path::new(pipe)
-        .parent()
-        .map(|p| p.join("actd-audit.jsonl"))
-        .unwrap_or_else(|| std::path::PathBuf::from("actd-audit.jsonl"));
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .or_else(|_| {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("actd-audit.jsonl")
-        })?;
-    let audit = AuditJournal::new(Box::new(file));
+async fn serve_mode(
+    pipe: &str,
+    grant_sensitive: bool,
+    log_dir: Option<&str>,
+) -> anyhow::Result<()> {
+    // Audit journal to a writable location. The pipe path (`\\.\pipe\...`) has no
+    // real parent directory, so we rely on the caller's --log-dir, then temp,
+    // then a null sink. Crucially this NEVER fails the launch — an unwritable log
+    // location used to make the daemon exit before binding its pipe, which looked
+    // exactly like "actd not connected".
+    let audit = AuditJournal::new(open_audit_writer(log_dir));
 
     // The real Win32 platform (window/process/input) on Windows.
     let platform = oracle_actd::pal::windows::WindowsPlatform::new();
@@ -128,7 +167,11 @@ async fn serve_mode(pipe: &str, grant_sensitive: bool) -> anyhow::Result<()> {
 }
 
 #[cfg(not(any(unix, windows)))]
-async fn serve_mode(_socket: &str, _grant_sensitive: bool) -> anyhow::Result<()> {
+async fn serve_mode(
+    _socket: &str,
+    _grant_sensitive: bool,
+    _log_dir: Option<&str>,
+) -> anyhow::Result<()> {
     anyhow::bail!("serve mode requires a unix or windows target");
 }
 

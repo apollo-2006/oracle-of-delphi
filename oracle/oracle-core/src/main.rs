@@ -210,11 +210,33 @@ async fn connect_actd(
                         "actd not connected ({e}); OS-control tools disabled. Start `oracle-actd --serve {}`",
                         cfg.actd.socket
                     );
+                    // Surface WHY: the daemon logs its own startup errors to
+                    // actd.log. If it crashed on launch, the reason is there —
+                    // echo the tail so it isn't a silent black box.
+                    let log = PathBuf::from(&cfg.general.runtime_dir).join("actd.log");
+                    if let Some(tail) = tail_of(&log, 20) {
+                        if !tail.trim().is_empty() {
+                            println!(
+                                "[oracle] actd did not come up. Last lines of {}:\n{}",
+                                log.display(),
+                                tail
+                            );
+                        }
+                    }
                 }
             }
         }
     }
     None
+}
+
+/// Read the last `n` lines of a text file, if it exists. Used to surface actd's
+/// own startup errors when core can't connect to it.
+fn tail_of(path: &std::path::Path, n: usize) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    Some(lines[start..].join("\n"))
 }
 
 /// True if something is already serving the HUD bind address — i.e. an Oracle
@@ -262,7 +284,17 @@ fn start_supervisor(cfg: &Config) -> Supervisor {
     }
 
     if cfg.supervise.autostart_actd {
+        // Clear any stray/orphaned actd first. A previous instance that outlived
+        // a hard-killed core still owns the named pipe, so a fresh one gets
+        // "Access is denied (os error 5)" and flaps forever. Reap orphans so the
+        // one we launch binds the pipe cleanly.
+        kill_stray_actd();
+
         let mut args = vec!["--serve".to_string(), cfg.actd.socket.clone()];
+        // Tell actd where to keep its audit journal — the runtime dir, which is
+        // always writable — so it never dies trying to log in a read-only CWD.
+        args.push("--log-dir".into());
+        args.push(cfg.general.runtime_dir.clone());
         if cfg.actd.grant_sensitive {
             args.push("--grant-sensitive".into());
         }
@@ -278,6 +310,55 @@ fn start_supervisor(cfg: &Config) -> Supervisor {
         tracing::info!("supervisor managing the LLM server and/or actd daemon");
     }
     sup
+}
+
+/// Reap any orphaned `oracle-actd` still holding the named pipe, so the fresh
+/// one we're about to launch doesn't hit "Access is denied (os error 5)". A
+/// short pause lets Windows release the pipe handle. No-op off Windows (the UDS
+/// is just re-bound).
+#[cfg(windows)]
+fn kill_stray_actd() {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let _ = std::process::Command::new("taskkill")
+        .args(["/IM", "oracle-actd.exe", "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+}
+
+#[cfg(not(windows))]
+fn kill_stray_actd() {}
+
+/// The path of the summon flag file — a rendezvous point between core and the
+/// native shell. Core writes it when the wake word fires; the shell polls for
+/// it and, when it appears, brings its window forward and deletes it. Kept at a
+/// fixed, config-independent location so both processes agree without the shell
+/// having to parse core's TOML: `%LOCALAPPDATA%\oracle\summon.flag` on Windows,
+/// and the system temp dir elsewhere.
+fn summon_flag_path() -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
+        std::path::Path::new(&base)
+            .join("oracle")
+            .join("summon.flag")
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::temp_dir().join("oracle-summon.flag")
+    }
+}
+
+/// Touch the summon flag so the native shell raises its window on the next poll.
+fn raise_summon_flag() {
+    let path = summon_flag_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = std::fs::write(&path, b"1") {
+        tracing::warn!("could not write summon flag {}: {e}", path.display());
+    }
 }
 
 /// Locate the `oracle-actd` binary: an explicit config path, else the sibling of
@@ -519,6 +600,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
 
     // actd may have just been launched by the supervisor; retry briefly if so.
     let actd = connect_actd(&cfg, cfg.supervise.autostart_actd).await;
+    let actd_up = actd.is_some();
     let shared = Arc::new(
         Shared::open(&cfg.memory.db_path)?
             .with_google(load_google(&cfg))
@@ -562,6 +644,34 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         state: "idle".into(),
     });
 
+    // Live System-panel status: model, backend health, and the throughput of the
+    // most recent turn. `last_tok_per_s` is updated at the end of each turn; the
+    // loop repaints every few seconds so the panel is never a dead placeholder.
+    let last_tok_per_s = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    {
+        let publisher = publisher.clone();
+        let tok = last_tok_per_s.clone();
+        let model = cfg.llm.model.clone();
+        let backend = cfg.llm.backend.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
+            loop {
+                tick.tick().await;
+                let tps = tok.load(std::sync::atomic::Ordering::Relaxed);
+                let rate = if tps > 0 {
+                    format!("{tps} tok/s")
+                } else {
+                    "ready".to_string()
+                };
+                let text = format!(
+                    "{model} · {backend} · actd {} · {rate}",
+                    if actd_up { "linked" } else { "offline" }
+                );
+                publisher.send_event(HudEvent::Status { text });
+            }
+        });
+    }
+
     // Handle inbound HUD commands until shutdown. A typed message starts a
     // conversation turn whose events stream back to the HUD; Interrupt cancels
     // the active turn (barge-in).
@@ -588,12 +698,24 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
                         }
                         let cancel = CancellationToken::new();
                         active_turn = Some(cancel.clone());
-                        spawn_hud_turn(agent.clone(), publisher.clone(), text, cancel);
+                        spawn_hud_turn(
+                            agent.clone(),
+                            publisher.clone(),
+                            text,
+                            cancel,
+                            last_tok_per_s.clone(),
+                        );
                     }
                     Some(HudCommand::Confirm { request_id, allow }) => {
                         // The user passed sentence in the Apollo modal.
                         info!(%request_id, allow, "confirmation decree");
                         confirmer.resolve(request_id, allow);
+                    }
+                    Some(HudCommand::Summon) => {
+                        // Wake word heard: raise a flag the native shell polls so
+                        // it can bring the (possibly dismissed) window forward.
+                        info!("summon requested (wake word)");
+                        raise_summon_flag();
                     }
                     Some(_) => {}
                     None => {}
@@ -625,6 +747,7 @@ fn spawn_hud_turn(
     publisher: oracle_core::gateway::server::HudPublisher,
     text: String,
     cancel: CancellationToken,
+    last_tok_per_s: Arc<std::sync::atomic::AtomicU32>,
 ) {
     tokio::spawn(async move {
         let turn = uuid::Uuid::new_v4();
@@ -642,15 +765,18 @@ fn spawn_hud_turn(
         let run = agent.run_turn(text, tx, cancel);
 
         let pub2 = publisher.clone();
+        let tok_counter = last_tok_per_s.clone();
         let forward = async move {
             let mut reply = String::new();
             let mut spoke = false;
             let mut saw_finished = false;
+            let mut first_token_at: Option<std::time::Instant> = None;
             while let Some(ev) = rx.recv().await {
                 match ev {
                     AgentEvent::Say(s) => {
                         if !spoke {
                             spoke = true;
+                            first_token_at = Some(std::time::Instant::now());
                             pub2.send_event(HudEvent::State {
                                 turn,
                                 state: "speaking".into(),
@@ -698,6 +824,17 @@ fn spawn_hud_turn(
                             state: "idle".into(),
                         });
                     }
+                }
+            }
+            // Estimate throughput for the System panel: characters/4 ≈ tokens,
+            // over the generation window (first spoken token → now). A rough but
+            // honest local reading; only updated when we actually generated text.
+            if let Some(start) = first_token_at {
+                let secs = start.elapsed().as_secs_f32();
+                let approx_tokens = (reply.chars().count() as f32) / 4.0;
+                if secs > 0.1 && approx_tokens > 0.0 {
+                    let tps = (approx_tokens / secs).round() as u32;
+                    tok_counter.store(tps, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             saw_finished

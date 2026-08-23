@@ -51,6 +51,26 @@ pub struct LlmRequest {
     pub tools: Value,
     pub max_tokens: u32,
     pub temperature: f32,
+    /// Nucleus sampling cutoff. Qwen2.5 wants a tighter 0.8 than llama-server's
+    /// permissive 0.95 default — the wide tail is what lets a stray foreign-
+    /// language token slip in before the model settles into its answer.
+    pub top_p: f32,
+    /// Top-k cutoff (Qwen2.5 recommends 20).
+    pub top_k: u32,
+    /// Minimum-probability floor relative to the top token; a second guard on
+    /// the long tail.
+    pub min_p: f32,
+    /// Repetition penalty (Qwen2.5 recommends ~1.05).
+    pub repeat_penalty: f32,
+}
+
+/// Qwen2.5-Instruct's recommended sampling. Centralized so every construction
+/// site (and the defaults) stay consistent.
+impl LlmRequest {
+    pub const DEFAULT_TOP_P: f32 = 0.8;
+    pub const DEFAULT_TOP_K: u32 = 20;
+    pub const DEFAULT_MIN_P: f32 = 0.05;
+    pub const DEFAULT_REPEAT_PENALTY: f32 = 1.05;
 }
 
 #[derive(Debug, Clone, PartialEq)]

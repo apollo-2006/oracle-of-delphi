@@ -51,13 +51,44 @@ export interface VoiceCallbacks {
   onPartial?: (text: string) => void;
   /** Lifecycle/diagnostic messages (listening, errors) for the HUD + console. */
   onStatus?: (msg: string) => void;
+  /**
+   * The wake word ("Delphi") was heard. `command` is any speech that followed
+   * it in the same breath ("Delphi, what's my schedule" → "what's my
+   * schedule"), or "" for a bare summon. Fired even while dismissed, so the
+   * HUD can raise the window and then listen for / act on the command.
+   */
+  onWake?: (command: string) => void;
 }
 
-/** Manages speech recognition (mic) + synthesis (speaker). */
+// Matches "Delphi" and the ways browser ASR commonly renders it (delphie,
+// delfi, delphy, "dell fee"…). The "del" + f/ph + vowel skeleton keeps everyday
+// words ("delta", "delve", "deli") from tripping it.
+const WAKE_RE = /\bdel\s?(ph|f)[iy]e?\b/i;
+
+/** Split an utterance on the wake word: does it contain it, and what follows? */
+export function matchWake(text: string): { hit: boolean; command: string } {
+  const m = WAKE_RE.exec(text);
+  if (!m) return { hit: false, command: "" };
+  // Everything after the wake word is the command; strip leading punctuation.
+  const tail = text.slice(m.index + m[0].length).replace(/^[\s,.;:!?—-]+/, "");
+  return { hit: true, command: tail.trim() };
+}
+
+/**
+ * Manages speech recognition (mic) + synthesis (speaker).
+ *
+ * Two listening intents share ONE recognition stream (a second stream would
+ * fight for the mic): `wantWake` keeps it always-on scanning for the wake word,
+ * while `active` (the mic button, or a wake-triggered window) forwards every
+ * utterance as a command. Recognition runs whenever either is set.
+ */
 export class VoiceLoop {
   private recog: SpeechRecognitionLike | null = null;
-  private listening = false;
+  private running = false;
   private speaking = false;
+  private wantWake = false;
+  private active = false;
+  private activeTimer: ReturnType<typeof setTimeout> | null = null;
   private cb: VoiceCallbacks;
 
   constructor(cb: VoiceCallbacks) {
@@ -68,17 +99,60 @@ export class VoiceLoop {
     return getRecognitionCtor() !== null && "speechSynthesis" in window;
   }
 
-  /** Toggle continuous listening. Returns the new state. */
-  toggle(): boolean {
-    if (this.listening) {
-      this.stop();
-    } else {
-      this.start();
-    }
-    return this.listening;
+  /** Whether recognized speech is currently being forwarded as commands. */
+  get isListening(): boolean {
+    return this.active;
   }
 
-  start(): void {
+  /** Whether the always-on wake-word listener is armed. */
+  get isWakeOn(): boolean {
+    return this.wantWake;
+  }
+
+  /** Toggle active (forward-everything) listening — the mic button. */
+  toggle(): boolean {
+    if (this.active) {
+      this.setActive(false);
+    } else {
+      this.setActive(true);
+    }
+    return this.active;
+  }
+
+  /** Arm or disarm the always-on wake-word listener. Returns the new state. */
+  enableWake(on: boolean): boolean {
+    this.wantWake = on;
+    if (on) {
+      this.ensureRunning();
+    } else {
+      this.maybeStop();
+    }
+    return this.wantWake;
+  }
+
+  /** Enter/leave active listening, keeping the shared stream in the right mode. */
+  private setActive(on: boolean, autoRevertMs?: number): void {
+    if (this.activeTimer) {
+      clearTimeout(this.activeTimer);
+      this.activeTimer = null;
+    }
+    this.active = on;
+    if (on) {
+      this.ensureRunning();
+      this.cb.onStatus?.("listening — speak now");
+      if (autoRevertMs) {
+        // A bare wake ("Pythia") opens a short command window, then falls back
+        // to wake-only so we're not forwarding ambient chatter forever.
+        this.activeTimer = setTimeout(() => this.setActive(false), autoRevertMs);
+      }
+    } else {
+      this.maybeStop();
+    }
+  }
+
+  /** Start the recognition stream if it isn't already running. */
+  private ensureRunning(): void {
+    if (this.running) return;
     const Ctor = getRecognitionCtor();
     if (!Ctor) return;
     const r = new Ctor();
@@ -86,8 +160,7 @@ export class VoiceLoop {
     r.interimResults = true;
     r.lang = "en-US";
     r.onstart = () => {
-      console.log("[voice] recognition started");
-      this.cb.onStatus?.("listening — speak now");
+      console.log("[voice] recognition started", { wake: this.wantWake, active: this.active });
     };
     r.onaudiostart = () => {
       console.log("[voice] audio capture started (mic is live)");
@@ -104,19 +177,21 @@ export class VoiceLoop {
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const res = e.results[i];
         const text = res[0].transcript.trim();
-        console.log("[voice] result", { final: res.isFinal, text });
+        console.log("[voice] result", { final: res.isFinal, text, active: this.active });
         if (res.isFinal) {
-          if (text.length > 0) this.cb.onUtterance(text);
-        } else {
+          if (text.length > 0) this.handleFinal(text);
+        } else if (this.active) {
+          // Only paint partials while actively listening — the wake stream
+          // shouldn't splash ambient speech across the transcript.
           this.cb.onPartial?.(text);
         }
       }
     };
     r.onend = () => {
-      console.log("[voice] recognition ended", { stillListening: this.listening });
-      // Auto-restart while the user has listening enabled (continuous mode
+      console.log("[voice] recognition ended", { running: this.running });
+      // Auto-restart while either intent still wants the mic (continuous mode
       // stops on silence in some browsers).
-      if (this.listening) {
+      if (this.running) {
         try {
           r.start();
         } catch {
@@ -134,11 +209,13 @@ export class VoiceLoop {
       }
       if (err === "not-allowed" || err === "service-not-allowed") {
         // Permission was denied — stop trying so we don't loop.
-        this.listening = false;
+        this.running = false;
+        this.active = false;
+        this.wantWake = false;
       }
     };
     this.recog = r;
-    this.listening = true;
+    this.running = true;
     try {
       r.start();
     } catch (e) {
@@ -147,8 +224,44 @@ export class VoiceLoop {
     }
   }
 
+  /** Route a final utterance by mode: command when active, wake-scan otherwise. */
+  private handleFinal(text: string): void {
+    if (this.active) {
+      this.cb.onUtterance(text);
+      return;
+    }
+    if (!this.wantWake) return;
+    const { hit, command } = matchWake(text);
+    if (!hit) return;
+    console.log("[voice] wake word", { command });
+    this.cb.onWake?.(command);
+    if (command.length > 0) {
+      // "Pythia, do X" — a complete request in one breath. Send it, stay in
+      // wake-only mode (don't leave the mic hot on the room afterward).
+      this.cb.onUtterance(command);
+    } else {
+      // Bare "Pythia" — open a brief command window for the next sentence.
+      this.setActive(true, 9000);
+    }
+  }
+
+  /** Stop the shared stream only if neither intent needs it any more. */
+  private maybeStop(): void {
+    if (this.wantWake || this.active) return;
+    this.running = false;
+    this.recog?.stop();
+    this.recog = null;
+  }
+
+  /** Stop everything — used on teardown. */
   stop(): void {
-    this.listening = false;
+    this.wantWake = false;
+    this.active = false;
+    if (this.activeTimer) {
+      clearTimeout(this.activeTimer);
+      this.activeTimer = null;
+    }
+    this.running = false;
     this.recog?.stop();
     this.recog = null;
   }
@@ -174,9 +287,5 @@ export class VoiceLoop {
       window.speechSynthesis.cancel();
     }
     this.speaking = false;
-  }
-
-  get isListening(): boolean {
-    return this.listening;
   }
 }
