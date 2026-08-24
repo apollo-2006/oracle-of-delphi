@@ -166,6 +166,22 @@ impl<P: Platform> Daemon<P> {
                 self.policy.lock().unwrap().set_lockdown(active);
                 Ok(json!({ "lockdown": active }))
             }
+            ActRequest::OpenTarget { target } => self
+                .platform
+                .open_target(&target)
+                .map(|_| json!({ "opened": target })),
+            ActRequest::MediaKey { key } => self
+                .platform
+                .media_key(key)
+                .map(|_| json!({ "media_key": format!("{key:?}") })),
+            ActRequest::WindowOp { window_id, action } => self
+                .platform
+                .window_op(window_id, action)
+                .map(|_| json!({ "window_op": format!("{action:?}") })),
+            ActRequest::LockScreen => self
+                .platform
+                .lock_screen()
+                .map(|_| json!({ "locked": true })),
             // Confirm is intercepted before execute() is ever reached.
             ActRequest::Confirm { .. } => Ok(json!({ "ignored": "confirm" })),
         };
@@ -192,6 +208,10 @@ fn op_name(req: &ActRequest) -> &'static str {
         ActRequest::FocusWindow { .. } => "focus_window",
         ActRequest::KillProcess { .. } => "kill_process",
         ActRequest::TypeText { .. } => "type_text",
+        ActRequest::OpenTarget { .. } => "open_target",
+        ActRequest::MediaKey { .. } => "media_key",
+        ActRequest::WindowOp { .. } => "window_op",
+        ActRequest::LockScreen => "lock_screen",
         ActRequest::ShellExec { .. } => "shell_exec",
         ActRequest::SetLockdown { .. } => "set_lockdown",
         ActRequest::Confirm { .. } => "confirm",
@@ -223,6 +243,29 @@ mod tests {
     fn observe_op_executes() {
         let d = daemon();
         let r = d.handle(env(1, ActRequest::ListWindows));
+        assert!(matches!(r, ActResponse::Ok { .. }));
+    }
+
+    #[test]
+    fn open_target_and_media_key_are_benign_and_execute() {
+        // Both are BenignAct → granted by default, no confirmation needed.
+        let d = daemon();
+        let r = d.handle(env(
+            1,
+            ActRequest::OpenTarget {
+                target: "https://example.com".into(),
+            },
+        ));
+        match r {
+            ActResponse::Ok { data } => assert_eq!(data["opened"], "https://example.com"),
+            other => panic!("expected ok, got {other:?}"),
+        }
+        let r = d.handle(env(
+            2,
+            ActRequest::MediaKey {
+                key: oracle_ipc::actd::MediaKey::PlayPause,
+            },
+        ));
         assert!(matches!(r, ActResponse::Ok { .. }));
     }
 

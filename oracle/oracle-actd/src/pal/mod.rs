@@ -42,4 +42,12 @@ pub trait Platform: Send + Sync {
     /// target so the policy layer can double-check the denylist post-focus.
     fn focused_process_name(&self) -> Result<String, PalError>;
     fn type_text(&self, text: &str) -> Result<(), PalError>;
+    /// Open an application, URL, file, or folder via the OS "open" verb.
+    fn open_target(&self, target: &str) -> Result<(), PalError>;
+    /// Tap a hardware media/volume key.
+    fn media_key(&self, key: oracle_ipc::actd::MediaKey) -> Result<(), PalError>;
+    /// Minimize/maximize/restore/close a window.
+    fn window_op(&self, id: u64, op: oracle_ipc::actd::WindowOp) -> Result<(), PalError>;
+    /// Lock the workstation.
+    fn lock_screen(&self) -> Result<(), PalError>;
 }

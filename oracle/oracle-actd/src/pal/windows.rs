@@ -10,8 +10,7 @@
 //! in the higher layer can distinguish self-injected from physical input.
 
 use super::{PalError, Platform};
-use oracle_ipc::actd::{ProcInfo, WindowInfo};
-
+use oracle_ipc::actd::{MediaKey, ProcInfo, WindowInfo, WindowOp};
 use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -20,10 +19,21 @@ use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCE
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
 };
+use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
-    SetForegroundWindow,
+    PostMessageW, SetForegroundWindow, ShowWindow, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE,
+    SW_SHOWNORMAL, WM_CLOSE,
 };
+
+// Virtual-key codes for the media/volume hardware keys (winuser.h).
+const VK_VOLUME_MUTE: u16 = 0xAD;
+const VK_VOLUME_DOWN: u16 = 0xAE;
+const VK_VOLUME_UP: u16 = 0xAF;
+const VK_MEDIA_NEXT_TRACK: u16 = 0xB0;
+const VK_MEDIA_PREV_TRACK: u16 = 0xB1;
+const VK_MEDIA_STOP: u16 = 0xB2;
+const VK_MEDIA_PLAY_PAUSE: u16 = 0xB3;
 
 /// Magic tag stamped into synthetic input's dwExtraInfo so our own events are
 /// recognizable to the physical-input watcher.
@@ -185,4 +195,120 @@ impl Platform for WindowsPlatform {
         }
         Ok(())
     }
+
+    fn open_target(&self, target: &str) -> Result<(), PalError> {
+        // The universal "open" verb: launches apps on PATH, opens URLs in the
+        // default browser, and opens files/folders with their default handler.
+        let verb = wide("open");
+        let file = wide(target);
+        let ret = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                verb.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL as i32,
+            )
+        };
+        // ShellExecuteW returns a value > 32 on success (legacy HINSTANCE ABI).
+        if (ret as isize) <= 32 {
+            return Err(PalError::Backend(format!(
+                "ShellExecute could not open '{target}' (code {})",
+                ret as isize
+            )));
+        }
+        Ok(())
+    }
+
+    fn window_op(&self, id: u64, op: WindowOp) -> Result<(), PalError> {
+        let hwnd = id as usize as HWND;
+        unsafe {
+            match op {
+                WindowOp::Minimize => {
+                    ShowWindow(hwnd, SW_MINIMIZE);
+                }
+                WindowOp::Maximize => {
+                    ShowWindow(hwnd, SW_MAXIMIZE);
+                }
+                WindowOp::Restore => {
+                    ShowWindow(hwnd, SW_RESTORE);
+                }
+                WindowOp::Close => {
+                    // WM_CLOSE asks the window to close (apps can still prompt to
+                    // save) — gentler than terminating the process.
+                    if PostMessageW(hwnd, WM_CLOSE, 0, 0) == 0 {
+                        return Err(PalError::Backend("PostMessage(WM_CLOSE) failed".into()));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn lock_screen(&self) -> Result<(), PalError> {
+        // rundll32 invokes user32!LockWorkStation without a Win32 binding.
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new("rundll32.exe")
+            .args(["user32.dll,LockWorkStation"])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| PalError::Backend(format!("lock: {e}")))
+    }
+
+    fn media_key(&self, key: MediaKey) -> Result<(), PalError> {
+        // Volume steps are small (~2% each); tap several times for a noticeable
+        // change. Transport keys fire once.
+        let (vk, times) = match key {
+            MediaKey::PlayPause => (VK_MEDIA_PLAY_PAUSE, 1),
+            MediaKey::Next => (VK_MEDIA_NEXT_TRACK, 1),
+            MediaKey::Previous => (VK_MEDIA_PREV_TRACK, 1),
+            MediaKey::Stop => (VK_MEDIA_STOP, 1),
+            MediaKey::VolumeUp => (VK_VOLUME_UP, 4),
+            MediaKey::VolumeDown => (VK_VOLUME_DOWN, 4),
+            MediaKey::Mute => (VK_VOLUME_MUTE, 1),
+        };
+        tap_vk(vk, times)
+    }
+}
+
+/// A NUL-terminated UTF-16 buffer for the wide Win32 APIs.
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Press and release a virtual key `times` times via SendInput.
+fn tap_vk(vk: u16, times: u32) -> Result<(), PalError> {
+    let mut inputs: Vec<INPUT> = Vec::with_capacity((times * 2) as usize);
+    for _ in 0..times {
+        for &keyup in &[0u32, KEYEVENTF_KEYUP] {
+            let mut input: INPUT = unsafe { std::mem::zeroed() };
+            input.r#type = INPUT_KEYBOARD;
+            input.Anonymous.ki = KEYBDINPUT {
+                wVk: vk,
+                wScan: 0,
+                dwFlags: keyup,
+                time: 0,
+                dwExtraInfo: Oracle_INPUT_TAG,
+            };
+            inputs.push(input);
+        }
+    }
+    if inputs.is_empty() {
+        return Ok(());
+    }
+    let sent = unsafe {
+        SendInput(
+            inputs.len() as u32,
+            inputs.as_ptr(),
+            std::mem::size_of::<INPUT>() as i32,
+        )
+    };
+    if (sent as usize) != inputs.len() {
+        return Err(PalError::Backend(
+            "SendInput (media key) was blocked".into(),
+        ));
+    }
+    Ok(())
 }

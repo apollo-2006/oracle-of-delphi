@@ -118,6 +118,26 @@ pub enum HudEvent {
         text: String,
         wav_b64: Option<String>,
     },
+    /// Capability announcement (reply to `HudCommand::Hello`) so the HUD picks
+    /// its input path: server-side Whisper vs the browser's speech engine.
+    Config {
+        /// Local speech recognition (Whisper) is active — the HUD should capture
+        /// audio and send it for transcription.
+        stt: bool,
+        /// Server-side neural TTS is active (informational).
+        tts: bool,
+        /// The always-on wake-word listener is active (drives the wake chip).
+        #[serde(default)]
+        wake: bool,
+    },
+    /// A live (non-final) transcript line from the always-on listener, shown as
+    /// a subtle "what I'm hearing" hint. Not a committed user message.
+    Interim {
+        text: String,
+    },
+    /// Cut off whatever the Oracle is currently saying (barge-in). The HUD stops
+    /// the neural-voice clip and any browser speech immediately.
+    StopAudio,
     /// A pending irreversible action awaiting the user's decree. The HUD raises
     /// the Apollo confirmation modal and replies with `HudCommand::Confirm`.
     Confirm {
@@ -154,7 +174,20 @@ pub enum HudCommand {
     UserText {
         text: String,
     },
-    /// The wake word ("Pythia") was heard while the window may be dismissed.
+    /// A captured microphone utterance (base64 16 kHz mono WAV). Core transcribes
+    /// it with the local recognizer (Whisper) and runs the transcript as a turn.
+    Audio {
+        wav_b64: String,
+    },
+    /// The HUD announcing itself on (re)connect. Core replies with a
+    /// `HudEvent::Config` so the HUD knows whether server-side STT is active.
+    Hello,
+    /// Pause/resume the always-on wake-word listener (the wake chip). Pausing
+    /// stops the streaming recognizer and releases the microphone.
+    SetWake {
+        active: bool,
+    },
+    /// The wake word ("Delphi") was heard while the window may be dismissed.
     /// Core raises a summon flag the native shell polls, bringing the window
     /// back to the foreground hands-free.
     Summon,

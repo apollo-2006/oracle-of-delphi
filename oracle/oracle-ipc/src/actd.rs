@@ -21,6 +21,29 @@ pub enum Capability {
     Sensitive,
 }
 
+/// A hardware media/volume key to tap. Maps to virtual-key presses on Windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaKey {
+    PlayPause,
+    Next,
+    Previous,
+    Stop,
+    VolumeUp,
+    VolumeDown,
+    Mute,
+}
+
+/// What to do to a window (via Win32 ShowWindow / WM_CLOSE).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowOp {
+    Minimize,
+    Maximize,
+    Restore,
+    Close,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ActRequest {
@@ -36,6 +59,23 @@ pub enum ActRequest {
     TypeText {
         text: String,
     },
+    /// Open an application, URL, file, or folder through the OS "open" verb
+    /// (Windows ShellExecute / Linux xdg-open). Benign and reversible.
+    OpenTarget {
+        target: String,
+    },
+    /// Tap a hardware media/volume key (play-pause, next/prev, volume up/down,
+    /// mute). Benign and reversible.
+    MediaKey {
+        key: MediaKey,
+    },
+    /// Minimize/maximize/restore/close a window by id. Benign and reversible.
+    WindowOp {
+        window_id: u64,
+        action: WindowOp,
+    },
+    /// Lock the workstation (Win+L). Benign — unlocks with the user's password.
+    LockScreen,
     /// Run a command in the PTY sandbox at the given tier.
     ShellExec {
         cmd: String,
@@ -61,9 +101,12 @@ impl ActRequest {
     pub fn required_capability(&self) -> Capability {
         match self {
             ActRequest::ListWindows | ActRequest::ListProcesses => Capability::Observe,
-            ActRequest::FocusWindow { .. } | ActRequest::SetLockdown { .. } => {
-                Capability::BenignAct
-            }
+            ActRequest::FocusWindow { .. }
+            | ActRequest::SetLockdown { .. }
+            | ActRequest::OpenTarget { .. }
+            | ActRequest::MediaKey { .. }
+            | ActRequest::WindowOp { .. }
+            | ActRequest::LockScreen => Capability::BenignAct,
             ActRequest::ShellExec { tier, .. } => match tier {
                 ShellTier::ReadOnly => Capability::Observe,
                 ShellTier::WorkspaceWrite => Capability::BenignAct,

@@ -23,7 +23,7 @@ use global_hotkey::{
     GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
 };
 use tao::{
-    dpi::LogicalSize,
+    dpi::{LogicalSize, PhysicalPosition},
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder},
     window::{Icon, WindowBuilder},
@@ -45,7 +45,8 @@ fn main() -> wry::Result<()> {
     let window = WindowBuilder::new()
         .with_title("Oracle of Delphi")
         .with_inner_size(LogicalSize::new(1280.0, 800.0))
-        .with_min_inner_size(LogicalSize::new(900.0, 600.0))
+        // Low min so the compact corner mode can shrink the window right down.
+        .with_min_inner_size(LogicalSize::new(360.0, 460.0))
         .with_window_icon(load_window_icon())
         .build(&event_loop)
         .expect("failed to create the Oracle window");
@@ -104,13 +105,14 @@ fn main() -> wry::Result<()> {
         // Wake ~10x/sec to service the hotkey/tray channels.
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(100));
 
-        // Wake word: core raises a summon flag when it hears "Pythia"; bring the
-        // window forward (hands-free) and consume the flag.
+        // Wake word: core raises a summon flag when it hears "Delphi". Bring the
+        // window forward as a small corner panel — a glance, not a takeover of
+        // whatever the user was doing.
         if take_summon_flag() {
-            summon_window(&window);
+            summon_compact(&window);
         }
 
-        // Global hotkey → toggle the window.
+        // Global hotkey → toggle the FULL window (the deliberate "open it" path).
         if let Ok(ev) = hotkey_rx.try_recv() {
             if ev.state == HotKeyState::Pressed && ev.id == summon_id {
                 toggle(&window);
@@ -120,7 +122,7 @@ fn main() -> wry::Result<()> {
         // Tray menu clicks.
         if let Ok(ev) = menu_rx.try_recv() {
             if ev.id == show_id {
-                summon_window(&window);
+                summon_full(&window);
             } else if ev.id == quit_id {
                 shutdown(&mut core);
                 *control_flow = ControlFlow::Exit;
@@ -176,19 +178,55 @@ fn take_summon_flag() -> bool {
     }
 }
 
-/// Show + focus the window.
-fn summon_window(window: &tao::window::Window) {
+/// Show the full-size window, roughly centered on the current monitor.
+fn summon_full(window: &tao::window::Window) {
     window.set_visible(true);
     window.set_minimized(false);
+    window.set_inner_size(LogicalSize::new(1280.0, 800.0));
+    if let Some(mon) = window.current_monitor() {
+        let scale = window.scale_factor();
+        let (mw, mh) = (mon.size().width as i32, mon.size().height as i32);
+        let (mx, my) = (mon.position().x, mon.position().y);
+        let w = (1280.0 * scale) as i32;
+        let h = (800.0 * scale) as i32;
+        window.set_outer_position(PhysicalPosition::new(
+            mx + (mw - w) / 2,
+            my + (mh - h) / 2,
+        ));
+    }
     window.set_focus();
 }
 
-/// Toggle: dismiss if it's the visible foreground, otherwise summon it.
+/// Show a small panel tucked into the bottom-right corner — for a quick
+/// wake-word question that shouldn't cover what the user is working on.
+fn summon_compact(window: &tao::window::Window) {
+    const W: f64 = 400.0;
+    const H: f64 = 560.0;
+    window.set_visible(true);
+    window.set_minimized(false);
+    window.set_inner_size(LogicalSize::new(W, H));
+    if let Some(mon) = window.current_monitor() {
+        let scale = window.scale_factor();
+        let (mw, mh) = (mon.size().width as i32, mon.size().height as i32);
+        let (mx, my) = (mon.position().x, mon.position().y);
+        let w = (W * scale) as i32;
+        let h = (H * scale) as i32;
+        let right = (18.0 * scale) as i32;
+        let bottom = (72.0 * scale) as i32; // clear the taskbar
+        window.set_outer_position(PhysicalPosition::new(
+            mx + mw - w - right,
+            my + mh - h - bottom,
+        ));
+    }
+    window.set_focus();
+}
+
+/// Toggle: dismiss if it's the visible foreground, otherwise summon it full.
 fn toggle(window: &tao::window::Window) {
     if window.is_visible() && window.is_focused() {
         window.set_visible(false);
     } else {
-        summon_window(window);
+        summon_full(window);
     }
 }
 

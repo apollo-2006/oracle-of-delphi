@@ -1,0 +1,1 @@
+cargo:rustc-env=MIME_TYPES_GENERATED_PATH=E:\oracle-models\oracle\target\release\build\mime_guess-f801812ee0921b85\out\mime_types_generated.rs

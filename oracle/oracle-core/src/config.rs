@@ -194,6 +194,59 @@ pub struct VoiceConfig {
     /// the program's stdin. The default matches Piper's CLI.
     #[serde(default = "default_tts_args")]
     pub tts_args: Vec<String>,
+
+    /// A persistent, OpenAI-compatible TTS HTTP endpoint (e.g. Kokoro-FastAPI's
+    /// `/v1/audio/speech`). When set it takes precedence over `tts_program`: the
+    /// model stays loaded in the server, so replies come back warm AND fast.
+    /// Empty ⇒ use the command backend / browser fallback.
+    #[serde(default)]
+    pub tts_http_url: String,
+    /// The voice name to request from the HTTP server (e.g. Kokoro's "af_heart",
+    /// "af_bella", "bf_emma").
+    #[serde(default = "default_tts_voice")]
+    pub tts_voice: String,
+    /// The model name to request from the HTTP server.
+    #[serde(default = "default_tts_model")]
+    pub tts_model: String,
+    /// Optional: a TTS server to launch and keep alive (hidden), so one click
+    /// brings the voice up too. E.g. a Kokoro server's exe/`python`/`docker`.
+    /// Empty ⇒ you start the server yourself.
+    #[serde(default)]
+    pub tts_server_program: String,
+    /// Arguments for `tts_server_program`.
+    #[serde(default)]
+    pub tts_server_args: Vec<String>,
+
+    /// Master switch for local speech recognition (Whisper). When on, the HUD's
+    /// microphone captures audio and sends it here to be transcribed by
+    /// `stt_program`, replacing the browser's speech recognition.
+    #[serde(default)]
+    pub stt_enabled: bool,
+    /// STT program: a full path to whisper.cpp's `whisper-cli.exe` (or any
+    /// transcriber on PATH). Empty ⇒ STT disabled.
+    #[serde(default)]
+    pub stt_program: String,
+    /// Arguments for the STT program. The literal token `{in}` is replaced with
+    /// the path to the captured 16 kHz mono WAV; the transcript is read from the
+    /// program's stdout. The default matches whisper.cpp's CLI (base English
+    /// model, no timestamps, quiet).
+    #[serde(default = "default_stt_args")]
+    pub stt_args: Vec<String>,
+
+    /// Always-on wake word. When enabled, core runs `wake_program` (whisper.cpp's
+    /// streaming recognizer, `whisper-stream.exe`), reads its live transcript,
+    /// shows it in the HUD, and starts a turn whenever it hears "Delphi". The
+    /// streaming recognizer captures the microphone natively (no WebView2).
+    #[serde(default)]
+    pub wake_enabled: bool,
+    /// Path to the streaming recognizer (`whisper-stream.exe`). Empty ⇒ no wake.
+    #[serde(default)]
+    pub wake_program: String,
+    /// Arguments for the streaming recognizer. Use the ABSOLUTE model path (core
+    /// runs it from a different directory). No `{...}` placeholders — it captures
+    /// the mic itself and prints transcripts to stdout.
+    #[serde(default = "default_wake_args")]
+    pub wake_args: Vec<String>,
 }
 
 fn default_tts_args() -> Vec<String> {
@@ -205,12 +258,60 @@ fn default_tts_args() -> Vec<String> {
     ]
 }
 
+fn default_tts_voice() -> String {
+    "af_heart".into() // Kokoro's warm default
+}
+fn default_tts_model() -> String {
+    "kokoro".into()
+}
+
+fn default_stt_args() -> Vec<String> {
+    vec![
+        "-m".into(),
+        "ggml-base.en.bin".into(),
+        "-f".into(),
+        "{in}".into(),
+        "-nt".into(), // no timestamps in the output
+        "-np".into(), // no progress prints
+    ]
+}
+
+fn default_wake_args() -> Vec<String> {
+    // NOTE: no `-nt`. whisper-stream with timestamps prints one clean, newline-
+    // terminated line per utterance (`[t0 --> t1]  text`), which core parses;
+    // `-nt` makes it redraw a single line with carriage returns that don't split
+    // into lines. Leave timestamps ON.
+    vec![
+        "-m".into(),
+        "ggml-base.en.bin".into(),
+        "-t".into(),
+        "6".into(),
+        "--step".into(),
+        "0".into(), // 0 = VAD-driven segmentation (transcribe on speech pauses)
+        "--length".into(),
+        "5000".into(),
+        "-vth".into(),
+        "0.6".into(), // voice-activity threshold
+    ]
+}
+
 impl Default for VoiceConfig {
     fn default() -> Self {
         VoiceConfig {
             tts_enabled: false,
             tts_program: String::new(),
             tts_args: default_tts_args(),
+            tts_http_url: String::new(),
+            tts_voice: default_tts_voice(),
+            tts_model: default_tts_model(),
+            tts_server_program: String::new(),
+            tts_server_args: Vec::new(),
+            stt_enabled: false,
+            stt_program: String::new(),
+            stt_args: default_stt_args(),
+            wake_enabled: false,
+            wake_program: String::new(),
+            wake_args: default_wake_args(),
         }
     }
 }

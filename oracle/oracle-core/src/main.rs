@@ -306,6 +306,22 @@ fn start_supervisor(cfg: &Config) -> Supervisor {
         });
     }
 
+    // Optional: keep a local TTS server (Kokoro) alive so the warm voice is
+    // ready without launching it by hand.
+    if !cfg.voice.tts_server_program.trim().is_empty() {
+        println!(
+            "[oracle] launching TTS server: {} {}",
+            cfg.voice.tts_server_program,
+            cfg.voice.tts_server_args.join(" ")
+        );
+        sup.supervise(ChildSpec {
+            name: "tts".into(),
+            program: cfg.voice.tts_server_program.clone(),
+            args: cfg.voice.tts_server_args.clone(),
+            log_path: rt.join("tts.log"),
+        });
+    }
+
     if !sup.is_empty() {
         tracing::info!("supervisor managing the LLM server and/or actd daemon");
     }
@@ -651,11 +667,19 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // most recent turn. `last_tok_per_s` is updated at the end of each turn; the
     // loop repaints every few seconds so the panel is never a dead placeholder.
     let last_tok_per_s = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    // Input capabilities the HUD needs to pick its mic path (Whisper vs browser).
+    let stt_on = cfg.voice.stt_enabled && !cfg.voice.stt_program.trim().is_empty();
+    let tts_on = cfg.voice.tts_enabled
+        && (!cfg.voice.tts_http_url.trim().is_empty() || !cfg.voice.tts_program.trim().is_empty());
+    let wake_on = cfg.voice.wake_enabled && !cfg.voice.wake_program.trim().is_empty();
+    // Runtime on/off for the always-on wake listener (toggled by the wake chip).
+    let (wake_tx, wake_rx) = tokio::sync::watch::channel(wake_on);
     {
         let publisher = publisher.clone();
         let tok = last_tok_per_s.clone();
         let model = cfg.llm.model.clone();
         let backend = cfg.llm.backend.clone();
+        let wake_rx = wake_tx.subscribe();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
             loop {
@@ -671,17 +695,71 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
                     if actd_up { "linked" } else { "offline" }
                 );
                 publisher.send_event(HudEvent::Status { text });
+                // Re-announce capabilities so a HUD that connected at any moment
+                // (or missed the handshake) always converges to the right paths.
+                publisher.send_event(HudEvent::Config {
+                    stt: stt_on,
+                    tts: tts_on,
+                    wake: *wake_rx.borrow(),
+                });
             }
         });
     }
+
+    // Always-on wake word: run whisper-stream, show its transcript live, and
+    // inject a turn when "Delphi" is heard. Captures the mic natively (no
+    // WebView2), so it's independent of the HUD's push-to-talk path.
+    let wake_cancel = CancellationToken::new();
+    if !cfg.voice.wake_program.trim().is_empty() {
+        spawn_wake_listener(
+            voice_cfg.clone(),
+            publisher.clone(),
+            gateway.command_sender(),
+            wake_rx,
+            wake_cancel.clone(),
+        );
+    }
+    let mut current_wake = wake_on;
+
+    // Announce capabilities up front (also re-sent on the status tick and on a
+    // HUD Hello) so the HUD converges to the right mic path.
+    publisher.send_event(HudEvent::Config {
+        stt: stt_on,
+        tts: tts_on,
+        wake: current_wake,
+    });
 
     // Handle inbound HUD commands until shutdown. A typed message starts a
     // conversation turn whose events stream back to the HUD; Interrupt cancels
     // the active turn (barge-in).
     let mut active_turn: Option<CancellationToken> = None;
+    // Rolling conversation history so Pythia remembers the exchange across turns
+    // (user asks "read my email", she asks "unread or all?", the user says
+    // "unread" — she now has the context to know what that means). Completed
+    // turns report their (user, assistant) pair back over this channel; the
+    // history is capped so context stays bounded.
+    let mut history: Vec<oracle_core::llm::ChatMessage> = Vec::new();
+    let (reply_tx, mut reply_rx) = mpsc::channel::<(String, String)>(8);
+    const MAX_HISTORY_MSGS: usize = 24;
     loop {
         tokio::select! {
             _ = shutdown_listener.wait() => break,
+            // A finished turn hands back its (user_text, assistant_reply) so both
+            // land in history for the next turn to see.
+            Some((user_text, reply)) = reply_rx.recv() => {
+                history.push(oracle_core::llm::ChatMessage {
+                    role: oracle_core::llm::Role::User,
+                    content: user_text,
+                });
+                history.push(oracle_core::llm::ChatMessage {
+                    role: oracle_core::llm::Role::Assistant,
+                    content: reply,
+                });
+                if history.len() > MAX_HISTORY_MSGS {
+                    let drop = history.len() - MAX_HISTORY_MSGS;
+                    history.drain(0..drop);
+                }
+            }
             cmd = gateway.next_command() => {
                 match cmd {
                     Some(HudCommand::Interrupt) => {
@@ -695,7 +773,8 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
                         });
                     }
                     Some(HudCommand::UserText { text }) => {
-                        // Cancel any in-flight turn, then start a new one.
+                        // Cancel any in-flight turn, then start a new one — with
+                        // the running history so far as context.
                         if let Some(tok) = active_turn.take() {
                             tok.cancel();
                         }
@@ -705,15 +784,77 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
                             agent.clone(),
                             publisher.clone(),
                             text,
+                            history.clone(),
                             cancel,
                             last_tok_per_s.clone(),
                             voice_cfg.clone(),
+                            reply_tx.clone(),
                         );
                     }
                     Some(HudCommand::Confirm { request_id, allow }) => {
                         // The user passed sentence in the Apollo modal.
                         info!(%request_id, allow, "confirmation decree");
                         confirmer.resolve(request_id, allow);
+                    }
+                    Some(HudCommand::Audio { wav_b64 }) => {
+                        // A captured utterance: transcribe locally, then run the
+                        // transcript exactly like a typed message.
+                        publisher.send_event(HudEvent::State {
+                            turn: uuid::Uuid::nil(),
+                            state: "thinking".into(),
+                        });
+                        match transcribe_async(voice_cfg.clone(), wav_b64).await {
+                            Some(text) if !text.trim().is_empty() => {
+                                if let Some(tok) = active_turn.take() {
+                                    tok.cancel();
+                                }
+                                let cancel = CancellationToken::new();
+                                active_turn = Some(cancel.clone());
+                                spawn_hud_turn(
+                                    agent.clone(),
+                                    publisher.clone(),
+                                    text.trim().to_string(),
+                                    history.clone(),
+                                    cancel,
+                                    last_tok_per_s.clone(),
+                                    voice_cfg.clone(),
+                                    reply_tx.clone(),
+                                );
+                            }
+                            _ => {
+                                // Audio arrived but nothing came back. Either the
+                                // clip was silent or the recognizer failed — tell
+                                // the user so it isn't a silent dead end.
+                                let msg = if stt_on {
+                                    "I didn't catch that — try again, or check the Whisper model path."
+                                } else {
+                                    "voice recognition isn't set up — set [voice] stt_program in oracle.toml."
+                                };
+                                publisher.send_event(HudEvent::Caption { text: msg.into() });
+                                publisher.send_event(HudEvent::State {
+                                    turn: uuid::Uuid::nil(),
+                                    state: "idle".into(),
+                                });
+                            }
+                        }
+                    }
+                    Some(HudCommand::Hello) => {
+                        // The HUD (re)connected — (re)announce capabilities.
+                        publisher.send_event(HudEvent::Config {
+                            stt: stt_on,
+                            tts: tts_on,
+                            wake: current_wake,
+                        });
+                    }
+                    Some(HudCommand::SetWake { active }) => {
+                        // Wake chip toggled: start/stop the streaming recognizer.
+                        current_wake = active && wake_on;
+                        let _ = wake_tx.send(current_wake);
+                        publisher.send_event(HudEvent::Config {
+                            stt: stt_on,
+                            tts: tts_on,
+                            wake: current_wake,
+                        });
                     }
                     Some(HudCommand::Summon) => {
                         // Wake word heard: raise a flag the native shell polls so
@@ -729,6 +870,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     }
 
     // Graceful drain: persist session and exit.
+    wake_cancel.cancel(); // stop the wake listener + its whisper-stream child
     let snap = SessionSnapshot {
         turn_count: 0,
         rolling_summary: String::new(),
@@ -746,16 +888,21 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
 /// Run one HUD-driven conversation turn on its own task, mapping the agent's
 /// events onto HUD events so the browser shows the transcript, tool activity,
 /// and the streaming reply.
+#[allow(clippy::too_many_arguments)]
 fn spawn_hud_turn(
     agent: Arc<Agent>,
     publisher: oracle_core::gateway::server::HudPublisher,
     text: String,
+    history: Vec<oracle_core::llm::ChatMessage>,
     cancel: CancellationToken,
     last_tok_per_s: Arc<std::sync::atomic::AtomicU32>,
     voice: Arc<oracle_core::config::VoiceConfig>,
+    reply_tx: mpsc::Sender<(String, String)>,
 ) {
     tokio::spawn(async move {
         let turn = uuid::Uuid::new_v4();
+        // Keep a copy of the user's message to report back for history.
+        let user_text = text.clone();
         // Echo the user's message and enter the "thinking" state.
         publisher.send_event(HudEvent::Transcript {
             text: text.clone(),
@@ -767,7 +914,7 @@ fn spawn_hud_turn(
         });
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
-        let run = agent.run_turn(text, tx, cancel);
+        let run = agent.run_turn_with_history(history, text, tx, cancel);
 
         let pub2 = publisher.clone();
         let tok_counter = last_tok_per_s.clone();
@@ -775,6 +922,7 @@ fn spawn_hud_turn(
             let mut reply = String::new();
             let mut spoke = false;
             let mut saw_finished = false;
+            let mut was_cancelled = false;
             let mut first_token_at: Option<std::time::Instant> = None;
             while let Some(ev) = rx.recv().await {
                 match ev {
@@ -822,8 +970,9 @@ fn spawn_hud_turn(
                             detail,
                         });
                     }
-                    AgentEvent::Finished { .. } => {
+                    AgentEvent::Finished { cancelled } => {
                         saw_finished = true;
+                        was_cancelled = cancelled;
                         pub2.send_event(HudEvent::State {
                             turn,
                             state: "idle".into(),
@@ -842,7 +991,7 @@ fn spawn_hud_turn(
                     tok_counter.store(tps, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            (saw_finished, reply)
+            (saw_finished, was_cancelled, reply)
         };
 
         // Guard the whole turn with a timeout so a hung LLM/tool can't leave the
@@ -854,28 +1003,35 @@ fn spawn_hud_turn(
         })
         .await;
 
-        let (problem, reply): (Option<String>, String) = match outcome {
-            Ok((Ok(_), (true, reply))) => (None, reply), // normal completion
-            Ok((Ok(_), (false, reply))) => {
-                (Some("the oracle gave no answer.".to_string()), reply)
+        let (problem, reply, cancelled): (Option<String>, String, bool) = match outcome {
+            Ok((Ok(_), (true, cancelled, reply))) => (None, reply, cancelled), // completed
+            Ok((Ok(_), (false, cancelled, reply))) => {
+                (Some("the oracle gave no answer.".to_string()), reply, cancelled)
             }
-            Ok((Err(e), (_, reply))) => (Some(format!("the oracle could not answer: {e}")), reply),
+            Ok((Err(e), (_, cancelled, reply))) => {
+                (Some(format!("the oracle could not answer: {e}")), reply, cancelled)
+            }
             Err(_) => (
                 Some(
                     "the oracle did not answer in time — is the LLM server running on the configured backend?"
                         .to_string(),
                 ),
                 String::new(),
+                false,
             ),
         };
 
-        // Speak the outcome. On success we voice the reply (synthesized with the
-        // local neural voice if configured, else the HUD's browser fallback); on
-        // failure we voice the error message so a listening user hears it too.
-        let to_speak = match &problem {
-            None if !reply.trim().is_empty() => Some(reply.clone()),
-            Some(msg) => Some(msg.clone()),
-            None => None,
+        // Speak the outcome — but NOT if the turn was barged-in/cancelled (she
+        // shouldn't finish speaking an answer the user just interrupted). On
+        // failure we voice the error so a listening user hears it too.
+        let to_speak = if cancelled {
+            None
+        } else {
+            match &problem {
+                None if !reply.trim().is_empty() => Some(reply.clone()),
+                Some(msg) => Some(msg.clone()),
+                None => None,
+            }
         };
         if let Some(spoken) = to_speak {
             let wav_b64 = synth_tts_async(voice.clone(), spoken.clone())
@@ -887,15 +1043,21 @@ fn spawn_hud_turn(
             });
         }
 
-        if let Some(msg) = problem {
+        if let Some(msg) = &problem {
             tracing::warn!("turn did not complete cleanly: {msg}");
-            publisher.send_event(HudEvent::Caption { text: msg });
+            publisher.send_event(HudEvent::Caption { text: msg.clone() });
         }
         // Always settle back to idle at the very end.
         publisher.send_event(HudEvent::State {
             turn,
             state: "idle".into(),
         });
+
+        // Record this exchange in the conversation history (only clean turns
+        // with a real reply — errors and cancellations aren't worth remembering).
+        if problem.is_none() && !cancelled && !reply.trim().is_empty() {
+            let _ = reply_tx.send((user_text, reply)).await;
+        }
     });
 }
 
@@ -913,13 +1075,56 @@ async fn synth_tts_async(
     voice: Arc<oracle_core::config::VoiceConfig>,
     text: String,
 ) -> Option<Vec<u8>> {
-    if !voice.tts_enabled || voice.tts_program.trim().is_empty() {
+    if !voice.tts_enabled {
         return None;
     }
-    tokio::task::spawn_blocking(move || synth_tts_blocking(&voice, &text))
+    // Prefer the persistent HTTP server (Kokoro) — warm and fast because the
+    // model stays loaded. Fall back to a per-call command engine (Piper).
+    if !voice.tts_http_url.trim().is_empty() {
+        return synth_http(&voice, &text).await;
+    }
+    if !voice.tts_program.trim().is_empty() {
+        return tokio::task::spawn_blocking(move || synth_tts_blocking(&voice, &text))
+            .await
+            .ok()
+            .flatten();
+    }
+    None
+}
+
+/// Synthesize via an OpenAI-compatible TTS HTTP endpoint (Kokoro-FastAPI etc.).
+/// Returns the audio bytes (WAV) or None on any failure, so the HUD can fall
+/// back to browser speech.
+async fn synth_http(voice: &oracle_core::config::VoiceConfig, text: &str) -> Option<Vec<u8>> {
+    let input = text.replace(['\n', '\r'], " ");
+    let body = serde_json::json!({
+        "model": voice.tts_model,
+        "input": input,
+        "voice": voice.tts_voice,
+        "response_format": "wav",
+    });
+    let client = reqwest::Client::new();
+    let resp = match client
+        .post(&voice.tts_http_url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
         .await
-        .ok()
-        .flatten()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("TTS HTTP request to {} failed: {e}", voice.tts_http_url);
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::warn!("TTS HTTP {} from {}", resp.status(), voice.tts_http_url);
+        return None;
+    }
+    match resp.bytes().await {
+        Ok(b) if !b.is_empty() => Some(b.to_vec()),
+        _ => None,
+    }
 }
 
 /// The blocking half: run the TTS program, feeding text on stdin and reading the
@@ -977,6 +1182,349 @@ fn synth_tts_blocking(voice: &oracle_core::config::VoiceConfig, text: &str) -> O
     let bytes = std::fs::read(&out).ok();
     let _ = std::fs::remove_file(&out);
     bytes.filter(|b| !b.is_empty())
+}
+
+/// Transcribe a base64 WAV utterance with the configured local recognizer, off
+/// the async runtime. Returns None when STT is disabled/unset, the audio is
+/// unreadable, or nothing intelligible came back.
+async fn transcribe_async(
+    voice: Arc<oracle_core::config::VoiceConfig>,
+    wav_b64: String,
+) -> Option<String> {
+    if !voice.stt_enabled || voice.stt_program.trim().is_empty() {
+        return None;
+    }
+    tokio::task::spawn_blocking(move || transcribe_blocking(&voice, &wav_b64))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// The blocking half: decode the WAV to a temp file, run the recognizer with
+/// `{in}` pointing at it, and read the transcript from stdout. Hidden on Windows.
+fn transcribe_blocking(voice: &oracle_core::config::VoiceConfig, wav_b64: &str) -> Option<String> {
+    use base64::Engine as _;
+    use std::process::{Command, Stdio};
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(wav_b64)
+        .ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let input = std::env::temp_dir().join(format!("oracle-stt-{}.wav", uuid::Uuid::new_v4()));
+    if std::fs::write(&input, &bytes).is_err() {
+        return None;
+    }
+    let in_str = input.to_string_lossy().to_string();
+    let args: Vec<String> = voice
+        .stt_args
+        .iter()
+        .map(|a| a.replace("{in}", &in_str))
+        .collect();
+
+    let mut cmd = Command::new(&voice.stt_program);
+    cmd.args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+
+    let output = cmd.output();
+    let _ = std::fs::remove_file(&input);
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            tracing::warn!("STT program exited with {}", o.status);
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!("STT program '{}' failed to launch: {e}", voice.stt_program);
+            return None;
+        }
+    };
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // whisper.cpp emits markers like "[BLANK_AUDIO]" or "(silence)" for empty
+    // input; treat those (and anything empty) as "nothing said".
+    let lower = text.to_lowercase();
+    if text.is_empty()
+        || lower.contains("[blank_audio]")
+        || lower.contains("(silence)")
+        || lower == "[ silence ]"
+    {
+        return None;
+    }
+    Some(text)
+}
+
+/// Match the wake word ("Delphi") in a transcript line. Returns the command that
+/// follows it (empty string for a bare summon), or None if the wake word isn't
+/// present. Tolerant of how speech-to-text renders the name.
+fn match_wake(text: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+    for w in [
+        "delphi", "delphie", "delphy", "delphey", "delfie", "delfi", "del phi", "del fi",
+    ] {
+        if let Some(pos) = lower.find(w) {
+            let after = &lower[pos + w.len()..];
+            let cmd = after
+                .trim_start_matches(|c: char| c.is_whitespace() || ",.;:!?—-".contains(c))
+                .trim()
+                .to_string();
+            return Some(cmd);
+        }
+    }
+    None
+}
+
+/// Remove ANSI escape sequences (`\x1b[ ... <letter>`) and stray control
+/// characters from a line, leaving printable text.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // Skip a CSI sequence: ESC '[' ... final byte in @..~.
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for d in chars.by_ref() {
+                    if ('@'..='~').contains(&d) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        // Drop other control chars except normal whitespace.
+        if (c.is_control()) && c != '\t' {
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Turn one raw recognizer output line into clean speech text, or None if it's
+/// log noise. whisper-stream (with timestamps) prints `[t0 --> t1]  the words`;
+/// we strip the timestamp and keep the words. Genuine init/banner lines are
+/// dropped. Crucially, a timestamped transcript line is NOT treated as noise
+/// just because it starts with '[' — that bug silently ate every utterance.
+fn clean_transcript_line(line: &str) -> Option<String> {
+    // Strip ANSI escape sequences (whisper-stream redraws with `\x1b[2K` etc.)
+    // and other control chars, then trim.
+    let stripped = strip_ansi(line);
+    let l = stripped.trim();
+    if l.is_empty() {
+        return None;
+    }
+    let low = l.to_lowercase();
+    // Real recognizer logs → ignore.
+    if low.contains("whisper_")
+        || low.contains("ggml")
+        || low.contains("main:")
+        || low.contains("system_info")
+        || low.contains("n_threads")
+        || low.contains("start speaking")
+        || low.contains("model loaded")
+        || low.contains("sampling")
+        || l.starts_with("###")
+    {
+        return None;
+    }
+    // Timestamped transcript: "[00:00:00.000 --> 00:00:02.000]   text".
+    if l.starts_with('[') && l.contains("-->") {
+        if let Some(idx) = l.find(']') {
+            let text = l[idx + 1..].trim();
+            return (!text.is_empty()).then(|| text.to_string());
+        }
+    }
+    // A bracketed status without "-->" (e.g. "[Start speaking]") → ignore.
+    if l.starts_with('[') {
+        return None;
+    }
+    Some(l.to_string())
+}
+
+/// Mutable state the wake listener threads across transcript lines.
+struct WakeState {
+    last_fired: std::time::Instant,
+    last_text: String,
+    /// When set (and not yet elapsed), the next utterance is treated as a command
+    /// even without the wake word — opened by a bare "Delphi".
+    expecting_until: Option<std::time::Instant>,
+}
+
+/// Process one recognizer line: show it live, and drive the wake word — barge in
+/// on whatever she's saying, run "Delphi, <command>" directly, and for a bare
+/// "Delphi" acknowledge and open a short window for the follow-up command.
+async fn handle_wake_line(
+    line: &str,
+    publisher: &oracle_core::gateway::server::HudPublisher,
+    cmd_tx: &tokio::sync::mpsc::Sender<HudCommand>,
+    voice: &Arc<oracle_core::config::VoiceConfig>,
+    st: &mut WakeState,
+) {
+    use std::time::{Duration, Instant};
+    let Some(text) = clean_transcript_line(line) else {
+        return;
+    };
+    publisher.send_event(HudEvent::Interim { text: text.clone() });
+
+    // If a bare "Delphi" just opened a command window, this whole utterance is
+    // the command — no wake word required.
+    if let Some(until) = st.expecting_until {
+        st.expecting_until = None;
+        if Instant::now() < until && !text.trim().is_empty() {
+            barge_in(publisher, cmd_tx).await;
+            let _ = cmd_tx.send(HudCommand::UserText { text }).await;
+            return;
+        }
+    }
+
+    let Some(command) = match_wake(&text) else {
+        return;
+    };
+    // Debounce only identical repeats (whisper-stream's rolling window can echo
+    // the same line) — distinct commands fire back-to-back.
+    if st.last_text == text && st.last_fired.elapsed() < Duration::from_secs(2) {
+        return;
+    }
+    st.last_text = text.clone();
+    st.last_fired = Instant::now();
+
+    // Heard her name → barge in on any current speech/turn, then act.
+    barge_in(publisher, cmd_tx).await;
+    if command.is_empty() {
+        // Bare "Delphi": acknowledge and open the command window.
+        st.expecting_until = Some(Instant::now() + Duration::from_secs(8));
+        publisher.send_event(HudEvent::State {
+            turn: uuid::Uuid::nil(),
+            state: "listening".into(),
+        });
+        let wav = synth_tts_async(voice.clone(), "Yes?".into())
+            .await
+            .map(encode_wav_b64);
+        publisher.send_event(HudEvent::Speak {
+            text: "Yes?".into(),
+            wav_b64: wav,
+        });
+    } else {
+        let _ = cmd_tx.send(HudCommand::UserText { text: command }).await;
+    }
+}
+
+/// Barge-in: stop her current speech in the HUD and cancel any active turn.
+async fn barge_in(
+    publisher: &oracle_core::gateway::server::HudPublisher,
+    cmd_tx: &tokio::sync::mpsc::Sender<HudCommand>,
+) {
+    publisher.send_event(HudEvent::StopAudio);
+    let _ = cmd_tx.send(HudCommand::Interrupt).await;
+    let _ = cmd_tx.send(HudCommand::Summon).await;
+}
+
+/// Run the streaming recognizer while `active`, forwarding its transcript to the
+/// HUD (live "what I'm hearing") and injecting a turn when it hears "Delphi".
+fn spawn_wake_listener(
+    voice: Arc<oracle_core::config::VoiceConfig>,
+    publisher: oracle_core::gateway::server::HudPublisher,
+    cmd_tx: tokio::sync::mpsc::Sender<HudCommand>,
+    mut active_rx: tokio::sync::watch::Receiver<bool>,
+    shutdown: CancellationToken,
+) {
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    tokio::spawn(async move {
+        loop {
+            // Idle until the wake listener is switched on.
+            while !*active_rx.borrow() {
+                tokio::select! {
+                    _ = active_rx.changed() => {}
+                    _ = shutdown.cancelled() => return,
+                }
+            }
+
+            let mut cmd = tokio::process::Command::new(&voice.wake_program);
+            // Pipe BOTH streams — different whisper builds print the transcript
+            // to stdout or stderr, so we read (and parse) both.
+            cmd.args(&voice.wake_args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            }
+
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("wake: could not launch {}: {e}", voice.wake_program);
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                        _ = shutdown.cancelled() => return,
+                    }
+                    continue;
+                }
+            };
+            tracing::info!("wake listener started ({})", voice.wake_program);
+            let mut out_lines = child.stdout.take().map(|s| BufReader::new(s).lines());
+            let mut err_lines = child.stderr.take().map(|s| BufReader::new(s).lines());
+            let mut st = WakeState {
+                last_fired: std::time::Instant::now() - Duration::from_secs(10),
+                last_text: String::new(),
+                expecting_until: None,
+            };
+            let (mut out_done, mut err_done) = (out_lines.is_none(), err_lines.is_none());
+
+            loop {
+                if out_done && err_done {
+                    break; // recognizer closed both streams → respawn
+                }
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        let _ = child.start_kill();
+                        return;
+                    }
+                    _ = active_rx.changed() => {
+                        if !*active_rx.borrow() {
+                            let _ = child.start_kill();
+                            let _ = child.wait().await;
+                            break;
+                        }
+                    }
+                    l = async { out_lines.as_mut().unwrap().next_line().await }, if !out_done => {
+                        match l {
+                            Ok(Some(line)) => {
+                                handle_wake_line(&line, &publisher, &cmd_tx, &voice, &mut st).await
+                            }
+                            _ => out_done = true,
+                        }
+                    }
+                    l = async { err_lines.as_mut().unwrap().next_line().await }, if !err_done => {
+                        match l {
+                            Ok(Some(line)) => {
+                                handle_wake_line(&line, &publisher, &cmd_tx, &voice, &mut st).await
+                            }
+                            _ => err_done = true,
+                        }
+                    }
+                }
+            }
+
+            // Brief pause before respawning (unless we're shutting down).
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                _ = shutdown.cancelled() => return,
+            }
+        }
+    });
 }
 
 /// Interactive REPL that streams the agent loop with live latency recording.
@@ -1070,4 +1618,48 @@ fn doctor() -> anyhow::Result<()> {
     }
     println!("{}", r.report().render());
     Ok(())
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::{clean_transcript_line, match_wake};
+
+    #[test]
+    fn detects_wake_and_extracts_command() {
+        assert_eq!(
+            match_wake("Delphi, turn up the volume").as_deref(),
+            Some("turn up the volume")
+        );
+        assert_eq!(
+            match_wake("hey delphi open spotify").as_deref(),
+            Some("open spotify")
+        );
+        assert_eq!(match_wake("delphi").as_deref(), Some("")); // bare summon
+    }
+
+    #[test]
+    fn ignores_non_wake_speech() {
+        assert!(match_wake("what time is the meeting").is_none());
+        assert!(match_wake("play the next song").is_none());
+    }
+
+    #[test]
+    fn strips_timestamps_and_filters_logs() {
+        // Log/banner lines are dropped.
+        assert!(clean_transcript_line("whisper_init_state: loading model").is_none());
+        assert!(clean_transcript_line("[Start speaking]").is_none());
+        assert!(clean_transcript_line("ggml_backend: using CPU").is_none());
+        // A timestamped transcript line keeps the words (this is the bug fix:
+        // it must NOT be dropped just for starting with '[').
+        assert_eq!(
+            clean_transcript_line("[00:00:00.000 --> 00:00:02.000]   Delphi open spotify")
+                .as_deref(),
+            Some("Delphi open spotify")
+        );
+        // And a plain line passes through.
+        assert_eq!(
+            clean_transcript_line("turn up the volume").as_deref(),
+            Some("turn up the volume")
+        );
+    }
 }

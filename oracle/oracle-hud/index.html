@@ -176,20 +176,37 @@
       }
       #transcriptPanel {
         position: static; /* inside the flex column */
-        padding: 20px 24px; max-height: 40vh; overflow-y: auto;
-        display: none; /* revealed once there's a query or a reply */
+        padding: 14px 16px; max-height: 44vh; overflow-y: auto;
+        display: none; /* revealed once there's a message */
       }
-      #transcriptPanel:has(#transcript:not(:empty)),
-      #transcriptPanel:has(#caption:not(:empty)) { display: block; }
-      #transcript {
-        font-size: 13px; letter-spacing: 0.2px; color: var(--ink-dim);
-        margin-bottom: 10px; min-height: 0; font-weight: 500;
+      #transcriptPanel:has(.msg),
+      #transcriptPanel:has(#livehint:not(:empty)) { display: block; }
+      #chatlog { display: flex; flex-direction: column; gap: 9px; }
+      .msg {
+        max-width: 88%; padding: 9px 13px; border-radius: 13px;
+        font-size: 15px; line-height: 1.5; overflow-wrap: anywhere;
+        animation: msgIn 0.18s ease;
       }
-      #transcript:empty { display: none; }
-      #caption {
-        font-size: 16px; line-height: 1.6; color: var(--ink); min-height: 0;
+      @keyframes msgIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+      .msg .who {
+        display: block; font-size: 9.5px; letter-spacing: 1.5px;
+        text-transform: uppercase; color: var(--ink-faint); margin-bottom: 3px;
       }
-      #caption:empty { display: none; }
+      .msg.user {
+        align-self: flex-end; color: var(--ink);
+        background: var(--accent-soft); border: 1px solid rgba(53, 201, 255, 0.22);
+        border-bottom-right-radius: 4px;
+      }
+      .msg.pythia {
+        align-self: flex-start; color: var(--ink);
+        background: rgba(12, 20, 32, 0.6); border: 1px solid var(--hair);
+        border-bottom-left-radius: 4px;
+      }
+      #livehint {
+        margin-top: 8px; font-size: 13px; color: var(--ink-faint);
+        letter-spacing: 0.2px;
+      }
+      #livehint:empty { display: none; }
 
       .inputbar {
         display: flex; align-items: center; gap: 10px;
@@ -237,6 +254,30 @@
       #actionPanel, #transcriptPanel { scrollbar-width: thin; scrollbar-color: rgba(140,190,240,0.2) transparent; }
       #transcriptPanel::-webkit-scrollbar { width: 6px; }
       #transcriptPanel::-webkit-scrollbar-thumb { background: rgba(140,190,240,0.2); border-radius: 3px; }
+
+      /* ---------- Compact corner mode (wake-word summon) ---------- */
+      /* When the shell shrinks the window into the corner, drop the side panels
+         and let the conversation fill the small pane. */
+      @media (max-width: 720px) {
+        #diagnostics, #actionPanel { display: none; }
+        #topbar { height: 44px; padding: 0 12px; }
+        .brand-sub { display: none; }
+        .brand-name { font-size: 10px; letter-spacing: 1.5px; }
+        .brand-mark { font-size: 16px; }
+        #state { display: none; } /* state is conveyed by the core's color */
+        .wake-chip { font-size: 10px; padding: 6px 9px; letter-spacing: 1px; }
+        /* Anchor to both edges (no centered fixed width) so it always fits. */
+        #console { bottom: 12px; left: 12px; right: 12px; width: auto; transform: none; gap: 8px; }
+        #transcriptPanel { max-height: 62vh; padding: 12px; }
+        .msg { max-width: 94%; }
+        /* Stack the input over its controls so 3 buttons never overflow a
+           narrow pane. */
+        .inputbar { flex-direction: column; align-items: stretch; padding: 8px; gap: 8px; }
+        #userInput { font-size: 14px; padding: 9px 10px; }
+        #controls { justify-content: space-between; gap: 6px; }
+        #controls button { flex: 1; justify-content: center; padding: 9px 6px; font-size: 11px; gap: 4px; }
+        #apolloSig { display: none; }
+      }
 
       /* ================= Apollo Decree modal (unchanged contract) ============ */
       #apolloModal {
@@ -366,8 +407,8 @@
 
     <section id="console">
       <div class="panel" id="transcriptPanel">
-        <div id="transcript"></div>
-        <div id="caption"></div>
+        <div id="chatlog"></div>
+        <div id="livehint"></div>
       </div>
       <div class="inputbar">
         <input

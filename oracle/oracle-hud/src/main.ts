@@ -13,6 +13,7 @@ import { HudConnection } from "./connection.js";
 import { AgentEvent, stateFromString } from "./protocol.js";
 import { VoiceLoop } from "./voice.js";
 import { ApolloModal } from "./apolloModal.js";
+import { Recorder } from "./recorder.js";
 
 // --- Combined post FX: chromatic aberration + scanlines + vignette in ONE pass
 const CombinedFXShader = {
@@ -69,6 +70,21 @@ class Hud {
   // The currently-playing neural-voice clip, tracked so barge-in / mute can cut
   // it off mid-sentence.
   private currentAudio: HTMLAudioElement | null = null;
+  // The assistant bubble currently being streamed into (null between turns).
+  private currentReplyEl: HTMLElement | null = null;
+  // Activity-panel bookkeeping: turnSeq namespaces per-turn tool ids (which
+  // reset each turn) so STARTED/DONE for the same tool land on ONE row;
+  // toolSeq is the session-monotonic number shown to the user.
+  private turnSeq = 0;
+  private toolSeq = 0;
+  private toolRows = new Map<string, HTMLElement>();
+  // Whisper capture (used for the mic when server-side STT is active).
+  private recorder = new Recorder();
+  private sttEnabled = false;
+  private configSeen = false;
+  // Wake-word chip state (server-side Whisper listener).
+  private wakeChip: HTMLButtonElement | null = null;
+  private wakeActive = false;
   // Speak replies aloud. On by default — this is a voice assistant — and
   // independent of whether the mic is currently listening (so typed questions
   // are answered out loud too). Toggle with the 🔊 button.
@@ -107,24 +123,24 @@ class Hud {
     // talking over a reply is a barge-in (cancel TTS + interrupt the turn).
     this.voice = new VoiceLoop({
       onUtterance: (text) => {
+        // Core echoes the message back as a transcript event, which is what
+        // appends the user bubble — so we don't add one here (avoids doubles).
         this.conn.send({ type: "user_text", text });
-        setText("transcript", text);
-        setText("caption", "");
+        setHint("");
       },
-      onPartial: (text) => setText("transcript", text + " …"),
+      onPartial: (text) => setHint("🎙 " + text + " …"),
       onBargeIn: () => {
         this.stopAudio();
         this.conn.send({ type: "interrupt" });
       },
-      onStatus: (msg) => setText("transcript", "🎙 " + msg),
+      onStatus: (msg) => setHint("🎙 " + msg),
       onWake: (command) => {
         // Wake word heard — raise the window (core relays to the shell) and
         // show we're attending. A bare "Delphi" leaves the mic open briefly for
         // the follow-up; "Delphi, do X" already forwarded X as the utterance.
         this.conn.send({ type: "summon" });
         setState("listening");
-        setText("transcript", "");
-        setText("caption", command ? "" : "Yes? I'm listening…");
+        setHint(command ? "" : "Yes? I'm listening…");
       },
     });
 
@@ -149,10 +165,10 @@ class Hud {
     input?.addEventListener("keydown", (e: KeyboardEvent) => {
       if (e.key === "Enter" && input.value.trim().length > 0) {
         const text = input.value.trim();
+        // Core echoes it back as a transcript event → that appends the user
+        // bubble, so we just send and clear the box.
         this.conn.send({ type: "user_text", text });
-        // Echo locally so the user sees their message immediately.
-        setText("transcript", text);
-        setText("caption", "");
+        setHint("");
         input.value = "";
       }
     });
@@ -164,41 +180,52 @@ class Hud {
         mic.title = "Voice needs a Chromium-based browser (Web Speech API)";
       }
       mic.addEventListener("click", () => {
+        if (this.sttEnabled) {
+          void this.toggleRecording(mic);
+          return;
+        }
+        // Not in Whisper mode. Say why, so a missing config is visible rather
+        // than silently falling back to the flaky browser recognizer.
+        if (!this.configSeen) {
+          setHint("no capabilities from core yet — is this build's core running?");
+        } else {
+          setHint("Whisper off (set [voice] stt_enabled + stt_program) — using browser mic");
+        }
         const on = this.voice.toggle();
         mic.classList.toggle("active", on);
         mic.textContent = on ? "🎙 Listening…" : "🎙 Voice";
       });
     }
 
-    // Wake-word listener ("Delphi"). Armed by default when voice is supported so
-    // the Oracle answers to its name hands-free; the chip lets the user silence
-    // it. Browsers may block starting the mic without a gesture, so we also arm
-    // on the first interaction as a fallback.
+    // Wake-word chip ("Delphi"). Two backends share it: with Whisper on, it
+    // toggles the server-side streaming listener; otherwise it arms the browser
+    // wake loop. The mode is decided by the config event from core.
     const wake = document.getElementById("wake") as HTMLButtonElement | null;
     if (wake) {
-      if (!this.voice.supported) {
-        wake.disabled = true;
-        wake.hidden = true;
-      } else {
-        const reflect = (on: boolean) => {
-          wake.classList.toggle("on", on);
-          wake.textContent = on ? "◉ Delphi" : "○ Wake off";
-          wake.title = on
-            ? 'Listening for "Delphi" — click to disable'
-            : 'Say "Delphi" to summon — click to enable';
-        };
-        reflect(this.voice.enableWake(true));
-        wake.addEventListener("click", () => reflect(this.voice.enableWake(!this.voice.isWakeOn)));
-        // Fallback arm: if autostart was blocked (no user gesture yet), the
-        // first click/keypress re-arms it.
+      this.wakeChip = wake;
+      wake.addEventListener("click", () => {
+        if (this.sttEnabled) {
+          this.wakeActive = !this.wakeActive;
+          this.conn.send({ type: "set_wake", active: this.wakeActive });
+          this.refreshWakeChip();
+        } else if (this.voice.supported) {
+          this.voice.enableWake(!this.voice.isWakeOn);
+          this.refreshWakeChip();
+        }
+      });
+      // Until config says otherwise, arm the browser wake loop as before.
+      if (this.voice.supported) {
+        this.voice.enableWake(true);
         const rearm = () => {
-          if (this.voice.isWakeOn) reflect(this.voice.enableWake(true));
+          if (!this.sttEnabled && this.voice.isWakeOn) this.voice.enableWake(true);
+          this.refreshWakeChip();
           window.removeEventListener("pointerdown", rearm);
           window.removeEventListener("keydown", rearm);
         };
         window.addEventListener("pointerdown", rearm);
         window.addEventListener("keydown", rearm);
       }
+      this.refreshWakeChip();
     }
 
     // Spoken-reply toggle. On by default; lets the user silence TTS.
@@ -238,18 +265,51 @@ class Hud {
         setState(ev.state);
         break;
       case "transcript":
-        setText("transcript", ev.text + (ev.stable ? "" : " …"));
+        // A finished user message → append a user bubble and start a fresh
+        // assistant bubble for the reply that follows. (Interim partials come
+        // from the local voice loop via the hint line, not from here.)
+        if (ev.stable) {
+          pushMessage("user", ev.text);
+          this.currentReplyEl = null;
+          this.turnSeq++; // new turn → new namespace for tool ids
+          setHint("");
+        }
         break;
       case "caption":
-        // Caption streams the growing reply (visual only; speech comes via the
-        // "speak" event so core controls the neural voice).
-        setText("caption", ev.text);
+        // Caption streams the growing reply into the live assistant bubble
+        // (visual only; speech comes via the "speak" event).
+        this.currentReplyEl = streamReply(this.currentReplyEl, ev.text);
         break;
       case "speak":
         this.handleSpeak(ev.text, ev.wav_b64 ?? undefined);
         break;
+      case "config":
+        // Core told us which input path is live. With Whisper on, it owns voice
+        // input: silence the browser wake listener (mic contention) and turn the
+        // mic button into push-to-talk.
+        console.log("[hud] config received:", ev);
+        this.configSeen = true;
+        this.sttEnabled = ev.stt;
+        this.wakeActive = ev.wake ?? false;
+        if (ev.stt) {
+          // Whisper owns the mic — stop the browser wake loop (contention). The
+          // wake chip now reflects/controls the server-side listener.
+          this.voice.enableWake(false);
+          const mic = document.getElementById("mic");
+          if (mic) mic.textContent = "🎙 Voice";
+        }
+        this.refreshWakeChip();
+        break;
+      case "interim":
+        // Live "what I'm hearing" from the always-on wake listener.
+        setHint("🎙 " + ev.text);
+        break;
+      case "stop_audio":
+        // Barge-in from the wake word — cut off her current speech.
+        this.stopSpeech();
+        break;
       case "tool":
-        appendToolLog(ev.id, ev.name, ev.status, ev.detail);
+        this.upsertTool(ev.id, ev.name, ev.status, ev.detail);
         break;
       case "sys":
         setText(
@@ -317,6 +377,110 @@ class Hud {
     }
   }
 
+  // Reflect the wake chip from whichever backend is active: the server-side
+  // Whisper listener (STT mode) or the browser wake loop.
+  private refreshWakeChip(): void {
+    const wake = this.wakeChip;
+    if (!wake) return;
+    const on = this.sttEnabled ? this.wakeActive : this.voice.isWakeOn;
+    wake.disabled = false;
+    wake.hidden = false;
+    wake.classList.toggle("on", on);
+    wake.textContent = on ? "◉ Delphi" : "○ Wake off";
+    wake.title = on
+      ? 'Listening for "Delphi" — click to stop'
+      : 'Say "Delphi" to summon — click to start';
+  }
+
+  // Push-to-talk for Whisper: first click starts capturing, second click stops
+  // and ships the audio to core to transcribe. State lives in the recorder.
+  private async toggleRecording(mic: HTMLButtonElement): Promise<void> {
+    if (this.recorder.recording) {
+      mic.classList.remove("active");
+      mic.textContent = "🎙 Voice";
+      setHint("transcribing…");
+      let wav: string | null = null;
+      try {
+        wav = await this.recorder.stop();
+      } catch (e) {
+        console.warn("[recorder] stop failed", e);
+      }
+      if (wav) {
+        this.conn.send({ type: "audio", wav_b64: wav });
+      } else {
+        setHint("");
+      }
+    } else {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        setHint("mic API unavailable in this webview (no getUserMedia)");
+        console.warn("[recorder] navigator.mediaDevices.getUserMedia is undefined");
+        return;
+      }
+      try {
+        this.stopSpeech(); // don't capture her own voice back
+        await this.recorder.start();
+        mic.classList.add("active");
+        mic.textContent = "● Recording";
+        setState("listening");
+        setHint("listening — click again to send");
+      } catch (e) {
+        // Surface the specific reason so we know if it's a permission denial
+        // (NotAllowedError), no device (NotFoundError), etc.
+        const name = (e as { name?: string; message?: string })?.name ?? "";
+        const msg = (e as { message?: string })?.message ?? String(e);
+        console.warn("[recorder] start failed", e);
+        setHint(`mic blocked: ${name || msg} — WebView2 denied the microphone`);
+      }
+    }
+  }
+
+  // Activity panel: one row per tool invocation. The first event (STARTED)
+  // creates the row with a session-monotonic number; later events (DONE/ERROR)
+  // update the same row's pill in place, rather than adding a second row.
+  private upsertTool(id: number, name: string, status: string, detail?: string): void {
+    const log = document.getElementById("toollog");
+    if (!log) return;
+    const key = `${this.turnSeq}:${id}`;
+    let row = this.toolRows.get(key);
+    if (!row) {
+      const num = ++this.toolSeq;
+      row = document.createElement("div");
+      row.className = "tool-line";
+      row.dataset.key = key;
+      const nameEl = document.createElement("span");
+      nameEl.className = "t-name";
+      nameEl.textContent = `#${num} ${name}`;
+      const pill = document.createElement("span");
+      pill.className = `t-pill ${status}`;
+      pill.textContent = status;
+      row.append(nameEl, pill);
+      this.toolRows.set(key, row);
+      log.prepend(row);
+      // Cap visible rows; forget the keys of any we evict.
+      while (log.childElementCount > 10) {
+        const last = log.lastElementChild as HTMLElement | null;
+        if (!last) break;
+        if (last.dataset.key) this.toolRows.delete(last.dataset.key);
+        last.remove();
+      }
+    } else {
+      const pill = row.querySelector(".t-pill");
+      if (pill) {
+        pill.className = `t-pill ${status}`;
+        pill.textContent = status;
+      }
+    }
+    if (detail) {
+      let d = row.querySelector(".t-detail") as HTMLElement | null;
+      if (!d) {
+        d = document.createElement("div");
+        d.className = "t-detail";
+        row.append(d);
+      }
+      d.textContent = detail;
+    }
+  }
+
   private adaptQuality(frameMs: number): void {
     this.frameTimes.push(frameMs);
     if (this.frameTimes.length < 90) return;
@@ -356,6 +520,50 @@ function setText(id: string, text: string): void {
   if (el) el.textContent = text;
 }
 
+// --- Chat log -------------------------------------------------------------
+
+// A transient one-line hint under the log (voice partials, mic status).
+function setHint(text: string): void {
+  const el = document.getElementById("livehint");
+  if (el) el.textContent = text;
+}
+
+function chatScrollToBottom(): void {
+  const p = document.getElementById("transcriptPanel");
+  if (p) p.scrollTop = p.scrollHeight;
+}
+
+// Append a message bubble to the scrollable log and return its element. The log
+// is capped so a long session doesn't grow the DOM without bound.
+function pushMessage(role: "user" | "pythia", text: string): HTMLElement {
+  const log = document.getElementById("chatlog");
+  const el = document.createElement("div");
+  el.className = `msg ${role}`;
+  const who = document.createElement("span");
+  who.className = "who";
+  who.textContent = role === "user" ? "you" : "pythia";
+  const body = document.createElement("span");
+  body.className = "body";
+  body.textContent = text;
+  el.append(who, body);
+  if (log) {
+    log.appendChild(el);
+    while (log.childElementCount > 60) log.firstElementChild?.remove();
+  }
+  chatScrollToBottom();
+  return el;
+}
+
+// Stream the growing reply into the live assistant bubble, creating it on the
+// first chunk.
+function streamReply(current: HTMLElement | null, text: string): HTMLElement {
+  const el = current ?? pushMessage("pythia", "");
+  const body = el.querySelector(".body");
+  if (body) body.textContent = text;
+  chatScrollToBottom();
+  return el;
+}
+
 // Drive the state chip: text + a data-state attribute that colors it (and the
 // ambient vignette) via CSS.
 function setState(state: string): void {
@@ -367,32 +575,6 @@ function setState(state: string): void {
   document.body.dataset.state = state;
 }
 
-// A styled activity row: `#id name`, a colored status pill, and (on failure)
-// the error detail on its own line.
-function appendToolLog(id: number, name: string, status: string, detail?: string): void {
-  const el = document.getElementById("toollog");
-  if (!el) return;
-  const row = document.createElement("div");
-  row.className = "tool-line";
-
-  const nameEl = document.createElement("span");
-  nameEl.className = "t-name";
-  nameEl.textContent = `#${id} ${name}`;
-
-  const pill = document.createElement("span");
-  pill.className = `t-pill ${status}`;
-  pill.textContent = status;
-
-  row.append(nameEl, pill);
-  if (detail) {
-    const d = document.createElement("div");
-    d.className = "t-detail";
-    d.textContent = detail;
-    row.append(d);
-  }
-  el.prepend(row);
-  while (el.childElementCount > 10) el.lastElementChild?.remove();
-}
 
 // Bootstrap. When core serves the HUD itself, derive the WebSocket URL from the
 // page's own origin so it works on whatever host/port core bound — no hardcoded

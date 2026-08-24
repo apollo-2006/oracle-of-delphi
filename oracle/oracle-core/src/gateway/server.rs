@@ -73,6 +73,13 @@ impl HudGateway {
         }
     }
 
+    /// A cloneable inbound-command sender, so background producers (e.g. the
+    /// wake-word listener) can inject commands into the same loop that services
+    /// the HUD — a heard "Delphi, …" becomes an ordinary `UserText` turn.
+    pub fn command_sender(&self) -> mpsc::Sender<HudCommand> {
+        self.cmd_tx.clone()
+    }
+
     /// Spawn the accept loop. Returns the bound address (useful when binding to
     /// port 0 in tests). The server runs until the returned task is dropped or
     /// the process exits.

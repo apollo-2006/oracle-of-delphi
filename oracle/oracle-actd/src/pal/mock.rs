@@ -2,7 +2,7 @@
 //! daemon's policy + RPC + audit paths are fully testable on any OS.
 
 use super::{PalError, Platform};
-use oracle_ipc::actd::{ProcInfo, WindowInfo};
+use oracle_ipc::actd::{MediaKey, ProcInfo, WindowInfo};
 use std::sync::Mutex;
 
 pub struct MockPlatform {
@@ -13,6 +13,8 @@ struct Inner {
     windows: Vec<WindowInfo>,
     processes: Vec<ProcInfo>,
     typed: String,
+    opened: Vec<String>,
+    media: Vec<MediaKey>,
 }
 
 impl Default for MockPlatform {
@@ -57,6 +59,8 @@ impl Default for MockPlatform {
                     },
                 ],
                 typed: String::new(),
+                opened: Vec::new(),
+                media: Vec::new(),
             }),
         }
     }
@@ -69,6 +73,14 @@ impl MockPlatform {
     /// Test helper: what has been typed so far.
     pub fn typed_text(&self) -> String {
         self.inner.lock().unwrap().typed.clone()
+    }
+    /// Test helper: targets opened so far.
+    pub fn opened_targets(&self) -> Vec<String> {
+        self.inner.lock().unwrap().opened.clone()
+    }
+    /// Test helper: media keys tapped so far.
+    pub fn media_keys(&self) -> Vec<MediaKey> {
+        self.inner.lock().unwrap().media.clone()
     }
 }
 
@@ -122,6 +134,32 @@ impl Platform for MockPlatform {
 
     fn type_text(&self, text: &str) -> Result<(), PalError> {
         self.inner.lock().unwrap().typed.push_str(text);
+        Ok(())
+    }
+
+    fn open_target(&self, target: &str) -> Result<(), PalError> {
+        if target.trim().is_empty() {
+            return Err(PalError::Backend("empty target".into()));
+        }
+        self.inner.lock().unwrap().opened.push(target.to_string());
+        Ok(())
+    }
+
+    fn media_key(&self, key: MediaKey) -> Result<(), PalError> {
+        self.inner.lock().unwrap().media.push(key);
+        Ok(())
+    }
+
+    fn window_op(&self, id: u64, _op: oracle_ipc::actd::WindowOp) -> Result<(), PalError> {
+        let g = self.inner.lock().unwrap();
+        if g.windows.iter().any(|w| w.id == id) {
+            Ok(())
+        } else {
+            Err(PalError::NoWindow(id))
+        }
+    }
+
+    fn lock_screen(&self) -> Result<(), PalError> {
         Ok(())
     }
 }

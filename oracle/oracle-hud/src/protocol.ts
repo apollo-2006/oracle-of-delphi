@@ -63,6 +63,9 @@ export type AgentEvent =
   | { type: "sys"; gpu_util: number; gpu_temp_c: number; vram_mb: number; tok_per_s: number; asr_rtf: number }
   | { type: "status"; text: string }
   | { type: "speak"; text: string; wav_b64?: string | null }
+  | { type: "config"; stt: boolean; tts: boolean; wake?: boolean }
+  | { type: "interim"; text: string }
+  | { type: "stop_audio" }
   | { type: "confirm"; request_id: string; prompt: string; severity: string };
 
 export type ToolStatus = "started" | "progress" | "done" | "error";

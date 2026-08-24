@@ -23,6 +23,7 @@ export class HudConnection {
   connect(): void {
     const ws = new WebSocket(this.url);
     ws.binaryType = "arraybuffer";
+    ws.onopen = () => this.send({ type: "hello" }); // ask core for capabilities
     ws.onmessage = (ev) => this.onMessage(ev);
     ws.onclose = () => this.scheduleReconnect();
     ws.onerror = () => ws.close();

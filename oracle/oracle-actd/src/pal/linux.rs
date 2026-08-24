@@ -80,6 +80,37 @@ impl Platform for LinuxPlatform {
             "input injection requires /dev/uinput access".into(),
         ))
     }
+
+    fn open_target(&self, target: &str) -> Result<(), PalError> {
+        // xdg-open is the desktop-standard "open" verb (apps, URLs, files).
+        std::process::Command::new("xdg-open")
+            .arg(target)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| PalError::Backend(format!("xdg-open: {e}")))
+    }
+
+    fn media_key(&self, _key: oracle_ipc::actd::MediaKey) -> Result<(), PalError> {
+        // Production wires playerctl / uinput; the reference build reports it.
+        Err(PalError::Backend(
+            "media keys require playerctl or /dev/uinput on Linux".into(),
+        ))
+    }
+
+    fn window_op(&self, _id: u64, _op: oracle_ipc::actd::WindowOp) -> Result<(), PalError> {
+        Err(PalError::Backend(
+            "window control requires the X11/Wayland backend".into(),
+        ))
+    }
+
+    fn lock_screen(&self) -> Result<(), PalError> {
+        // Best-effort: loginctl lock-session on systemd desktops.
+        std::process::Command::new("loginctl")
+            .arg("lock-session")
+            .status()
+            .map(|_| ())
+            .map_err(|e| PalError::Backend(format!("loginctl: {e}")))
+    }
 }
 
 /// Parse RSS (in kB) from /proc/<pid>/statm (second field = resident pages).

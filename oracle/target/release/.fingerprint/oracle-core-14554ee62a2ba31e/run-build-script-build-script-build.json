@@ -1,0 +1,1 @@
+{"rustc":3720210673988096810,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[12068626047596963879,"build_script_build",false,1703191675173968212]],"local":[{"RerunIfChanged":{"output":"release\\build\\oracle-core-14554ee62a2ba31e\\output","paths":["../oracle-hud/dist"]}}],"rustflags":[],"config":0,"compile_kind":0}

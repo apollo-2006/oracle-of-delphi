@@ -1,11 +1,51 @@
-# Python Virtual Environment
-venv/
-
-# Sensitive Information
+# =========================
+# Secrets & Local Config
+# =========================
 credentials.json
-
-# Large LLM Weights
-*.gguf
-
-# Cache
+.env
 .cache/
+
+# =========================
+# AI Models & Large Files
+# =========================
+# Catches Whisper and other raw binaries
+*.bin
+# Catches standard GGUF models
+*.gguf
+# Catches Qwen and chunked model files
+qwen2.5*
+*-of-*
+
+# =========================
+# Rust (Backend)
+# =========================
+/target/
+**/*.rs.bk
+# Note: Cargo.lock is intentionally NOT ignored for binary projects/workspaces
+
+# =========================
+# Python (Virtual Env & Cache)
+# =========================
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# =========================
+# Node.js & Vite (HUD/Frontend)
+# =========================
+node_modules/
+dist/
+dist-ssr/
+npm-debug.log*
+yarn-error.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# =========================
+# IDEs & OS Files
+# =========================
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -11,7 +11,7 @@
 //! irreversible; a human passes sentence first.
 
 use super::{ToolCtx, ToolError, ToolErrorKind, ToolOutcome, TypedTool};
-use oracle_ipc::actd::{ActRequest, ActResponse, ShellTier};
+use oracle_ipc::actd::{ActRequest, ActResponse, MediaKey, ShellTier, WindowOp};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
@@ -227,12 +227,309 @@ impl TypedTool for KillProcess {
     }
 }
 
+// --- Launch / open / search (benign act) --------------------------------
+
+#[derive(Deserialize, JsonSchema)]
+pub struct LaunchArgs {
+    /// The application to launch — a name Windows can resolve (e.g. "notepad",
+    /// "spotify", "chrome") or a full path to an .exe.
+    pub name: String,
+}
+pub struct LaunchApp;
+#[async_trait::async_trait]
+impl TypedTool for LaunchApp {
+    type Args = LaunchArgs;
+    const NAME: &'static str = "os.launch_app";
+    const DESCRIPTION: &'static str =
+        "Launch an application by name (e.g. 'spotify', 'notepad', 'chrome') or full path.";
+    const SIDE_EFFECT: super::SideEffect = super::SideEffect::Reversible;
+    async fn run(&self, a: LaunchArgs, ctx: &ToolCtx) -> ToolOutcome {
+        let action = format!("launch {}", a.name);
+        call_actd(ctx, ActRequest::OpenTarget { target: a.name }, &action).await
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct OpenUrlArgs {
+    /// The URL to open in the default browser (include the scheme, e.g. https://).
+    pub url: String,
+}
+pub struct OpenUrl;
+#[async_trait::async_trait]
+impl TypedTool for OpenUrl {
+    type Args = OpenUrlArgs;
+    const NAME: &'static str = "os.open_url";
+    const DESCRIPTION: &'static str = "Open a URL in the user's default browser.";
+    const SIDE_EFFECT: super::SideEffect = super::SideEffect::Reversible;
+    async fn run(&self, a: OpenUrlArgs, ctx: &ToolCtx) -> ToolOutcome {
+        let action = format!("open {}", a.url);
+        call_actd(ctx, ActRequest::OpenTarget { target: a.url }, &action).await
+    }
+    fn validate(a: &OpenUrlArgs) -> Result<(), ToolError> {
+        if !(a.url.starts_with("http://") || a.url.starts_with("https://")) {
+            return Err(ToolError::invalid(
+                "url",
+                "missing http(s) scheme",
+                "include https:// at the front",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct WebSearchArgs {
+    /// What to search the web for.
+    pub query: String,
+}
+pub struct WebSearch;
+#[async_trait::async_trait]
+impl TypedTool for WebSearch {
+    type Args = WebSearchArgs;
+    const NAME: &'static str = "os.web_search";
+    const DESCRIPTION: &'static str =
+        "Search the web for a query by opening the results in the user's default browser.";
+    const SIDE_EFFECT: super::SideEffect = super::SideEffect::Reversible;
+    async fn run(&self, a: WebSearchArgs, ctx: &ToolCtx) -> ToolOutcome {
+        let url = format!("https://www.google.com/search?q={}", url_encode(&a.query));
+        let action = format!("web-search '{}'", a.query);
+        call_actd(ctx, ActRequest::OpenTarget { target: url }, &action).await
+    }
+}
+
+/// Minimal query-string percent-encoding: keep unreserved characters, encode
+/// everything else (spaces become %20). Enough for a search URL.
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+// --- Media / volume (benign act) ----------------------------------------
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MediaArgs {
+    /// One of: play_pause, next, previous, stop, volume_up, volume_down, mute.
+    pub action: String,
+}
+pub struct Media;
+#[async_trait::async_trait]
+impl TypedTool for Media {
+    type Args = MediaArgs;
+    const NAME: &'static str = "os.media";
+    const DESCRIPTION: &'static str =
+        "Control media & volume: play_pause, next, previous, stop, volume_up, volume_down, mute. \
+         play_pause TOGGLES playback — to pause or to resume, call it exactly once (calling twice \
+         undoes itself). State can't be read back, so report the action, not the resulting state.";
+    const SIDE_EFFECT: super::SideEffect = super::SideEffect::Reversible;
+    async fn run(&self, a: MediaArgs, ctx: &ToolCtx) -> ToolOutcome {
+        let Some(key) = parse_media_key(&a.action) else {
+            return ToolOutcome::Err(ToolError::invalid(
+                "action",
+                &format!("unknown media action '{}'", a.action),
+                "use play_pause, next, previous, stop, volume_up, volume_down, or mute",
+            ));
+        };
+        let action = format!("media key {}", a.action);
+        call_actd(ctx, ActRequest::MediaKey { key }, &action).await
+    }
+}
+
+/// Map a forgiving set of spoken/typed synonyms to a [`MediaKey`].
+fn parse_media_key(s: &str) -> Option<MediaKey> {
+    match s.trim().to_lowercase().replace([' ', '-'], "_").as_str() {
+        "play_pause" | "playpause" | "play" | "pause" | "toggle" => Some(MediaKey::PlayPause),
+        "next" | "next_track" | "skip" | "forward" => Some(MediaKey::Next),
+        "previous" | "prev" | "prev_track" | "back" => Some(MediaKey::Previous),
+        "stop" => Some(MediaKey::Stop),
+        "volume_up" | "vol_up" | "louder" | "up" => Some(MediaKey::VolumeUp),
+        "volume_down" | "vol_down" | "quieter" | "down" => Some(MediaKey::VolumeDown),
+        "mute" | "unmute" | "silence" => Some(MediaKey::Mute),
+        _ => None,
+    }
+}
+
+// --- Focus / window control by name (benign act) -------------------------
+
+/// Resolve a window by a case-insensitive title substring: returns its (id,
+/// title) or a ready ToolOutcome error explaining the miss.
+async fn find_window(ctx: &ToolCtx, query: &str) -> Result<(u64, String), ToolOutcome> {
+    let listed = call_actd(ctx, ActRequest::ListWindows, "list windows").await;
+    let data = match listed {
+        ToolOutcome::Ok(d) => d,
+        other => return Err(other),
+    };
+    let q = query.trim().to_lowercase();
+    let Some(windows) = data.get("windows").and_then(|w| w.as_array()) else {
+        return Err(ToolOutcome::Err(ToolError::transient(
+            "actd returned no window list",
+        )));
+    };
+    let Some(hit) = windows.iter().find(|w| {
+        w.get("title")
+            .and_then(|t| t.as_str())
+            .map(|t| t.to_lowercase().contains(&q))
+            .unwrap_or(false)
+    }) else {
+        return Err(ToolOutcome::Err(ToolError::invalid(
+            "query",
+            &format!("no open window matches '{query}'"),
+            "check os.list_windows for exact titles",
+        )));
+    };
+    let Some(id) = hit.get("id").and_then(|v| v.as_u64()) else {
+        return Err(ToolOutcome::Err(ToolError::transient(
+            "matched window had no id",
+        )));
+    };
+    let title = hit
+        .get("title")
+        .and_then(|t| t.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Ok((id, title))
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct FocusAppArgs {
+    /// Part of the window title to bring to the front (case-insensitive), e.g.
+    /// "spotify", "chrome", "code".
+    pub query: String,
+}
+pub struct FocusApp;
+#[async_trait::async_trait]
+impl TypedTool for FocusApp {
+    type Args = FocusAppArgs;
+    const NAME: &'static str = "os.focus_app";
+    const DESCRIPTION: &'static str =
+        "Bring a window to the front by matching part of its title (no need to know window ids).";
+    const SIDE_EFFECT: super::SideEffect = super::SideEffect::Reversible;
+    async fn run(&self, a: FocusAppArgs, ctx: &ToolCtx) -> ToolOutcome {
+        let (id, title) = match find_window(ctx, &a.query).await {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let action = format!("focus '{title}'");
+        call_actd(ctx, ActRequest::FocusWindow { window_id: id }, &action).await
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct WindowArgs {
+    /// Part of the window title to act on (case-insensitive), e.g. "spotify".
+    pub query: String,
+    /// One of: minimize, maximize, restore, close.
+    pub action: String,
+}
+pub struct WindowControl;
+#[async_trait::async_trait]
+impl TypedTool for WindowControl {
+    type Args = WindowArgs;
+    const NAME: &'static str = "os.window";
+    const DESCRIPTION: &'static str =
+        "Minimize, maximize, restore, or close a window by matching its title. action = minimize | maximize | restore | close.";
+    const SIDE_EFFECT: super::SideEffect = super::SideEffect::Reversible;
+    async fn run(&self, a: WindowArgs, ctx: &ToolCtx) -> ToolOutcome {
+        let Some(op) = parse_window_op(&a.action) else {
+            return ToolOutcome::Err(ToolError::invalid(
+                "action",
+                &format!("unknown window action '{}'", a.action),
+                "use minimize, maximize, restore, or close",
+            ));
+        };
+        let (id, title) = match find_window(ctx, &a.query).await {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let action = format!("{} '{title}'", a.action);
+        call_actd(
+            ctx,
+            ActRequest::WindowOp {
+                window_id: id,
+                action: op,
+            },
+            &action,
+        )
+        .await
+    }
+}
+
+fn parse_window_op(s: &str) -> Option<WindowOp> {
+    match s.trim().to_lowercase().as_str() {
+        "minimize" | "minimise" | "min" | "hide" => Some(WindowOp::Minimize),
+        "maximize" | "maximise" | "max" | "fullscreen" => Some(WindowOp::Maximize),
+        "restore" | "unminimize" | "normal" => Some(WindowOp::Restore),
+        "close" | "quit" | "exit" => Some(WindowOp::Close),
+        _ => None,
+    }
+}
+
+pub struct LockScreen;
+#[async_trait::async_trait]
+impl TypedTool for LockScreen {
+    type Args = NoArgs;
+    const NAME: &'static str = "os.lock_screen";
+    const DESCRIPTION: &'static str =
+        "Lock the computer (the user's password is needed to unlock).";
+    const SIDE_EFFECT: super::SideEffect = super::SideEffect::Reversible;
+    async fn run(&self, _a: NoArgs, ctx: &ToolCtx) -> ToolOutcome {
+        call_actd(ctx, ActRequest::LockScreen, "lock the screen").await
+    }
+}
+
 /// Register the OS-control tools.
 pub fn register_all(reg: &mut super::ToolRegistry) {
     reg.register(ListWindows)
         .register(ListProcesses)
         .register(FocusWindow)
+        .register(FocusApp)
+        .register(WindowControl)
+        .register(LockScreen)
+        .register(LaunchApp)
+        .register(OpenUrl)
+        .register(WebSearch)
+        .register(Media)
         .register(Shell)
         .register(TypeText)
         .register(KillProcess);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oracle_ipc::actd::MediaKey;
+
+    #[test]
+    fn media_synonyms_map_to_keys() {
+        assert_eq!(parse_media_key("play"), Some(MediaKey::PlayPause));
+        assert_eq!(parse_media_key("Play Pause"), Some(MediaKey::PlayPause));
+        assert_eq!(parse_media_key("skip"), Some(MediaKey::Next));
+        assert_eq!(parse_media_key("louder"), Some(MediaKey::VolumeUp));
+        assert_eq!(parse_media_key("quieter"), Some(MediaKey::VolumeDown));
+        assert_eq!(parse_media_key("mute"), Some(MediaKey::Mute));
+        assert_eq!(parse_media_key("frobnicate"), None);
+    }
+
+    #[test]
+    fn url_encode_escapes_query() {
+        assert_eq!(url_encode("rust lang"), "rust%20lang");
+        assert_eq!(url_encode("a&b=c"), "a%26b%3Dc");
+        assert_eq!(url_encode("plain-text_1.0~"), "plain-text_1.0~");
+    }
+
+    #[test]
+    fn window_op_synonyms() {
+        assert_eq!(parse_window_op("minimize"), Some(WindowOp::Minimize));
+        assert_eq!(parse_window_op("Max"), Some(WindowOp::Maximize));
+        assert_eq!(parse_window_op("close"), Some(WindowOp::Close));
+        assert_eq!(parse_window_op("restore"), Some(WindowOp::Restore));
+        assert_eq!(parse_window_op("wobble"), None);
+    }
 }
