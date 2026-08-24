@@ -110,6 +110,14 @@ pub enum HudEvent {
     Status {
         text: String,
     },
+    /// Speak a completed reply. When `wav_b64` is present it's a base64 WAV that
+    /// core synthesized with the local neural voice — the HUD plays it. When it's
+    /// absent, the HUD falls back to browser speech on `text`. Either way the HUD
+    /// honors its own mute toggle and barge-in.
+    Speak {
+        text: String,
+        wav_b64: Option<String>,
+    },
     /// A pending irreversible action awaiting the user's decree. The HUD raises
     /// the Apollo confirmation modal and replies with `HudCommand::Confirm`.
     Confirm {

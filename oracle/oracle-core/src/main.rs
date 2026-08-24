@@ -644,6 +644,9 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         state: "idle".into(),
     });
 
+    // Shared voice config for per-turn synthesis.
+    let voice_cfg = Arc::new(cfg.voice.clone());
+
     // Live System-panel status: model, backend health, and the throughput of the
     // most recent turn. `last_tok_per_s` is updated at the end of each turn; the
     // loop repaints every few seconds so the panel is never a dead placeholder.
@@ -704,6 +707,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
                             text,
                             cancel,
                             last_tok_per_s.clone(),
+                            voice_cfg.clone(),
                         );
                     }
                     Some(HudCommand::Confirm { request_id, allow }) => {
@@ -748,6 +752,7 @@ fn spawn_hud_turn(
     text: String,
     cancel: CancellationToken,
     last_tok_per_s: Arc<std::sync::atomic::AtomicU32>,
+    voice: Arc<oracle_core::config::VoiceConfig>,
 ) {
     tokio::spawn(async move {
         let turn = uuid::Uuid::new_v4();
@@ -837,7 +842,7 @@ fn spawn_hud_turn(
                     tok_counter.store(tps, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            saw_finished
+            (saw_finished, reply)
         };
 
         // Guard the whole turn with a timeout so a hung LLM/tool can't leave the
@@ -849,24 +854,129 @@ fn spawn_hud_turn(
         })
         .await;
 
-        let problem: Option<String> = match outcome {
-            Ok((Ok(_), true)) => None, // normal completion
-            Ok((Ok(_), false)) => Some("the oracle gave no answer.".to_string()),
-            Ok((Err(e), _)) => Some(format!("the oracle could not answer: {e}")),
-            Err(_) => Some(
-                "the oracle did not answer in time — is the LLM server running on the configured backend?"
-                    .to_string(),
+        let (problem, reply): (Option<String>, String) = match outcome {
+            Ok((Ok(_), (true, reply))) => (None, reply), // normal completion
+            Ok((Ok(_), (false, reply))) => {
+                (Some("the oracle gave no answer.".to_string()), reply)
+            }
+            Ok((Err(e), (_, reply))) => (Some(format!("the oracle could not answer: {e}")), reply),
+            Err(_) => (
+                Some(
+                    "the oracle did not answer in time — is the LLM server running on the configured backend?"
+                        .to_string(),
+                ),
+                String::new(),
             ),
         };
+
+        // Speak the outcome. On success we voice the reply (synthesized with the
+        // local neural voice if configured, else the HUD's browser fallback); on
+        // failure we voice the error message so a listening user hears it too.
+        let to_speak = match &problem {
+            None if !reply.trim().is_empty() => Some(reply.clone()),
+            Some(msg) => Some(msg.clone()),
+            None => None,
+        };
+        if let Some(spoken) = to_speak {
+            let wav_b64 = synth_tts_async(voice.clone(), spoken.clone())
+                .await
+                .map(encode_wav_b64);
+            publisher.send_event(HudEvent::Speak {
+                text: spoken,
+                wav_b64,
+            });
+        }
+
         if let Some(msg) = problem {
             tracing::warn!("turn did not complete cleanly: {msg}");
             publisher.send_event(HudEvent::Caption { text: msg });
-            publisher.send_event(HudEvent::State {
-                turn,
-                state: "idle".into(),
-            });
         }
+        // Always settle back to idle at the very end.
+        publisher.send_event(HudEvent::State {
+            turn,
+            state: "idle".into(),
+        });
     });
+}
+
+/// Base64-encode synthesized WAV bytes for transport to the HUD.
+fn encode_wav_b64(bytes: Vec<u8>) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Synthesize `text` to WAV bytes with the configured neural voice, off the
+/// async runtime (the synth process is blocking). Returns None when TTS is
+/// disabled/unset or the engine fails — the caller then leaves the HUD to fall
+/// back to browser speech, so the Oracle always talks.
+async fn synth_tts_async(
+    voice: Arc<oracle_core::config::VoiceConfig>,
+    text: String,
+) -> Option<Vec<u8>> {
+    if !voice.tts_enabled || voice.tts_program.trim().is_empty() {
+        return None;
+    }
+    tokio::task::spawn_blocking(move || synth_tts_blocking(&voice, &text))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// The blocking half: run the TTS program, feeding text on stdin and reading the
+/// WAV it writes to a temp path (the `{out}` token in the args). Hidden on
+/// Windows so no console flashes.
+fn synth_tts_blocking(voice: &oracle_core::config::VoiceConfig, text: &str) -> Option<Vec<u8>> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    // One utterance, one line — collapse newlines so per-line synths (Piper)
+    // produce a single WAV rather than several.
+    let line = text.replace(['\n', '\r'], " ");
+    let out = std::env::temp_dir().join(format!("oracle-tts-{}.wav", uuid::Uuid::new_v4()));
+    let out_str = out.to_string_lossy().to_string();
+    let args: Vec<String> = voice
+        .tts_args
+        .iter()
+        .map(|a| a.replace("{out}", &out_str))
+        .collect();
+
+    let mut cmd = Command::new(&voice.tts_program);
+    cmd.args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("TTS program '{}' failed to launch: {e}", voice.tts_program);
+            return None;
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(line.as_bytes());
+        // stdin drops here → EOF, so the synth knows the input is complete.
+    }
+    match child.wait() {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            tracing::warn!("TTS program exited with {status}");
+            let _ = std::fs::remove_file(&out);
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!("waiting on TTS program failed: {e}");
+            return None;
+        }
+    }
+    let bytes = std::fs::read(&out).ok();
+    let _ = std::fs::remove_file(&out);
+    bytes.filter(|b| !b.is_empty())
 }
 
 /// Interactive REPL that streams the agent loop with live latency recording.

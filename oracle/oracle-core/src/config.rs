@@ -30,6 +30,8 @@ pub struct Config {
     pub google: GoogleConfig,
     #[serde(default)]
     pub supervise: SuperviseConfig,
+    #[serde(default)]
+    pub voice: VoiceConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -170,6 +172,47 @@ fn default_true() -> bool {
 }
 fn default_browser() -> String {
     "edge".into()
+}
+
+/// Server-side text-to-speech. When enabled and a program is set, `oracle-core`
+/// synthesizes each spoken reply with a local neural voice (e.g. Piper) and
+/// streams the audio to the HUD to play — replacing the browser's robotic TTS.
+/// When disabled, empty, or the program fails, the HUD falls back to browser
+/// speech, so the Oracle always talks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceConfig {
+    /// Master switch for server-side neural TTS.
+    #[serde(default)]
+    pub tts_enabled: bool,
+    /// TTS program: a full path to `piper.exe` (or any synth on PATH). Empty ⇒
+    /// browser fallback.
+    #[serde(default)]
+    pub tts_program: String,
+    /// Arguments for the TTS program. The literal token `{out}` is replaced with
+    /// a temporary `.wav` path core reads back; the text to speak is written to
+    /// the program's stdin. The default matches Piper's CLI.
+    #[serde(default = "default_tts_args")]
+    pub tts_args: Vec<String>,
+}
+
+fn default_tts_args() -> Vec<String> {
+    vec![
+        "--model".into(),
+        "voice.onnx".into(),
+        "--output_file".into(),
+        "{out}".into(),
+    ]
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        VoiceConfig {
+            tts_enabled: false,
+            tts_program: String::new(),
+            tts_args: default_tts_args(),
+        }
+    }
 }
 
 // --- Defaults -------------------------------------------------------------
@@ -358,6 +401,18 @@ mod tests {
         c.audio.vad_onset_fast = 0.5;
         let err = c.validate().unwrap_err();
         assert!(err.to_string().contains("hysteresis"));
+    }
+
+    #[test]
+    fn voice_defaults_off_with_out_placeholder() {
+        // TTS ships disabled (browser fallback), and the arg template carries the
+        // {out} placeholder core substitutes with the temp WAV path.
+        let v = VoiceConfig::default();
+        assert!(!v.tts_enabled);
+        assert!(v.tts_args.iter().any(|a| a.contains("{out}")));
+        // And it round-trips through the example config.
+        let parsed: Config = toml::from_str(&Config::example_toml()).unwrap();
+        assert!(!parsed.voice.tts_enabled);
     }
 
     #[test]

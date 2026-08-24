@@ -65,8 +65,10 @@ class Hud {
   private resolutionScale = 0.9;
   private frameTimes: number[] = [];
   private voice: VoiceLoop;
-  private pendingReply = "";
   private apollo: ApolloModal;
+  // The currently-playing neural-voice clip, tracked so barge-in / mute can cut
+  // it off mid-sentence.
+  private currentAudio: HTMLAudioElement | null = null;
   // Speak replies aloud. On by default — this is a voice assistant — and
   // independent of whether the mic is currently listening (so typed questions
   // are answered out loud too). Toggle with the 🔊 button.
@@ -110,7 +112,10 @@ class Hud {
         setText("caption", "");
       },
       onPartial: (text) => setText("transcript", text + " …"),
-      onBargeIn: () => this.conn.send({ type: "interrupt" }),
+      onBargeIn: () => {
+        this.stopAudio();
+        this.conn.send({ type: "interrupt" });
+      },
       onStatus: (msg) => setText("transcript", "🎙 " + msg),
       onWake: (command) => {
         // Wake word heard — raise the window (core relays to the shell) and
@@ -135,7 +140,10 @@ class Hud {
 
   private wireControls(): void {
     const interrupt = document.getElementById("interrupt");
-    interrupt?.addEventListener("click", () => this.conn.send({ type: "interrupt" }));
+    interrupt?.addEventListener("click", () => {
+      this.stopSpeech();
+      this.conn.send({ type: "interrupt" });
+    });
 
     const input = document.getElementById("userInput") as HTMLInputElement | null;
     input?.addEventListener("keydown", (e: KeyboardEvent) => {
@@ -201,7 +209,7 @@ class Hud {
         this.voiceOut = !this.voiceOut;
         speak.classList.toggle("active", this.voiceOut);
         speak.textContent = this.voiceOut ? "🔊 Voice reply" : "🔇 Muted";
-        if (!this.voiceOut) this.voice.cancelSpeak();
+        if (!this.voiceOut) this.stopSpeech();
       });
     }
   }
@@ -228,20 +236,17 @@ class Hud {
       case "state":
         this.core.setState(stateFromString(ev.state));
         setState(ev.state);
-        // When a turn returns to idle, speak the accumulated reply (if voice-out
-        // is on).
-        if (ev.state === "idle" && this.pendingReply.trim().length > 0) {
-          if (this.voiceOut) this.voice.speak(this.pendingReply);
-          this.pendingReply = "";
-        }
         break;
       case "transcript":
         setText("transcript", ev.text + (ev.stable ? "" : " …"));
         break;
       case "caption":
-        // Caption streams the growing reply; keep the latest for TTS.
-        this.pendingReply = ev.text;
+        // Caption streams the growing reply (visual only; speech comes via the
+        // "speak" event so core controls the neural voice).
         setText("caption", ev.text);
+        break;
+      case "speak":
+        this.handleSpeak(ev.text, ev.wav_b64 ?? undefined);
         break;
       case "tool":
         appendToolLog(ev.id, ev.name, ev.status, ev.detail);
@@ -264,6 +269,51 @@ class Hud {
           severity: ev.severity,
         });
         break;
+    }
+  }
+
+  // Voice a reply. Prefer the neural WAV core synthesized; fall back to the
+  // browser's speech engine when core sent none. Honors the mute toggle.
+  private handleSpeak(text: string, wavB64?: string): void {
+    if (!this.voiceOut) return; // muted
+    if (wavB64 && wavB64.length > 0) {
+      this.playWav(wavB64);
+    } else if (text.trim().length > 0) {
+      this.voice.speak(text);
+    }
+  }
+
+  // Decode a base64 WAV and play it, replacing any clip already playing.
+  private playWav(b64: string): void {
+    this.stopAudio();
+    try {
+      const bin = atob(b64);
+      const buf = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+      const url = URL.createObjectURL(new Blob([buf], { type: "audio/wav" }));
+      const audio = new Audio(url);
+      audio.onended = () => {
+        URL.revokeObjectURL(url);
+        if (this.currentAudio === audio) this.currentAudio = null;
+      };
+      this.currentAudio = audio;
+      audio.play().catch((e) => console.warn("[audio] play failed", e));
+    } catch (e) {
+      console.warn("[audio] decode failed", e);
+    }
+  }
+
+  // Cut off whatever the Oracle is currently saying — both the neural clip and
+  // any browser speech — for barge-in, Stop, and mute.
+  private stopSpeech(): void {
+    this.stopAudio();
+    this.voice.cancelSpeak();
+  }
+
+  private stopAudio(): void {
+    if (this.currentAudio) {
+      this.currentAudio.pause();
+      this.currentAudio = null;
     }
   }
 
