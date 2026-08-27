@@ -1,0 +1,85 @@
+# Windows-native profile for Oracle of Delphi
+# Place at %APPDATA%\oracle\oracle.toml (or pass --config).
+# Uses a named pipe for the actd link, the E:\oracle-models store, and the
+# specific capture/output devices on this machine.
+
+[general]
+# On Windows, a writable per-user runtime dir. %LOCALAPPDATA%\oracle works well.
+runtime_dir = "C:\\Users\\apollo\\AppData\\Local\\oracle\\run"
+log_level = "info"
+
+[audio]
+sample_rate = 48000
+vad_onset_fast = 0.85
+vad_release = 0.35
+hangover_ms = 200
+tts_voice = "kokoro"
+input_device = "Microphone (Razer Seiren V3 Mini)"
+output_device = "Speakers (3- Fosi Audio K5 Pro)"
+
+[llm]
+# Point at a local llama-server (Vulkan or ROCm build). See docs/WINDOWS.md.
+backend = "http://127.0.0.1:8080"
+model = "qwen2.5-14b-instruct-q5_k_m"
+max_tokens = 1024
+temperature = 0.7
+model_dir = "E:\\oracle-models"
+
+[memory]
+db_path = "C:\\Users\\apollo\\AppData\\Local\\oracle\\oracle.db"
+retrieve_limit = 6
+
+[actd]
+# Named pipe on Windows (bare name; the daemon prefixes \\.\pipe\).
+socket = "oracle-actd"
+grant_sensitive = false
+
+[hud]
+bind = "127.0.0.1:8770"
+token = ""
+enabled = true
+
+[agent]
+step_budget = 12
+
+[google]
+# Path to your Google Desktop-app credentials.json. Set this and run
+# `oracle-core auth --credentials <path> --account <email>` once; run/repl then
+# load the sealed token automatically. Empty = Google disabled.
+credentials_path = "E:\\oracle-models\\credentials.json"
+# Must match the --account you passed to `auth` (your `auth` run used "default").
+account = "default"
+
+[supervise]
+# One-click startup: `oracle-core run` launches these hidden and reaps them when
+# it exits, so you never open a terminal. Logs land in
+# %APPDATA%\oracle\run\{oracle,llm,actd}.log — check those if something won't start.
+
+# --- Local LLM server ---
+# Core launches this hidden on startup. This is your exact working command
+# (split GGUF: point -m at the -00001-of-00003 shard; llama loads all three).
+# Don't ALSO start llama-server by hand while this is true — two servers fight
+# over port 8080 and the second flaps.
+autostart_llm = true
+llm_program = "E:\\oracle-models\\llama.cpp\\build\\bin\\Release\\llama-server.exe"
+llm_args = [
+  "-m", "E:\\oracle-models\\qwen2.5-14b-instruct-q5_k_m-00001-of-00003.gguf",
+  "--host", "127.0.0.1", "--port", "8080",
+  "-ngl", "999",
+  # --jinja uses the model's own chat template so llama-server actually injects
+  # the tool definitions into the prompt — WITHOUT this, the model never sees its
+  # tools and can't call them (it just apologizes and rambles).
+  "--jinja",
+]
+
+# --- Actuator daemon ---
+autostart_actd = true
+# Auto-detected next to oracle-core.exe; set only if actd lives elsewhere.
+actd_program = ""
+
+# --- The face ---
+# Open the HUD in a chromeless app window on startup.
+open_window = true
+# "edge", "chrome", a full path to a Chromium browser, or "default" for your
+# default browser (a normal tab).
+browser = "edge"

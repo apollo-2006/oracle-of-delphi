@@ -1,0 +1,20 @@
+{
+  "name": "oracle-hud",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Holographic WebGL HUD for Oracle of Delphi (architecture §6)",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "vite build",
+    "dev": "vite"
+  },
+  "dependencies": {
+    "three": "^0.169.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.169.0",
+    "typescript": "^5.6.0",
+    "vite": "^5.4.0"
+  }
+}

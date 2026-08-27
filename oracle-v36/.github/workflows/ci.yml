@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    name: Rust (build + test + clippy + fmt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --all
+
+  cpp:
+    name: C++ audio engine (ALSA)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libasound2-dev
+      - name: Configure + build (ALSA on)
+        run: cmake -B oracle-audio/build -S oracle-audio -DOracle_WITH_ALSA=ON && cmake --build oracle-audio/build -j
+      - name: Run tests
+        run: ./oracle-audio/build/oracle-audio-tests
+
+  hud:
+    name: HUD (typecheck + build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install + typecheck + build
+        working-directory: oracle-hud
+        run: npm ci || npm install && npm run typecheck && npm run build
+
+  docker:
+    name: Docker image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t oracle:ci .
+      - name: Smoke test (doctor + write-config)
+        run: |
+          docker run --rm oracle:ci doctor
+          docker run --rm oracle:ci write-config /tmp/j.toml
