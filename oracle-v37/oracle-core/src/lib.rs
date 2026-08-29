@@ -7,6 +7,7 @@
 
 pub mod agent;
 pub mod audio;
+pub mod browser;
 pub mod config;
 pub mod confirm;
 pub mod connectors;
@@ -46,6 +47,9 @@ pub struct Shared {
     /// Where irreversible actions go for the user's decree. Defaults to
     /// [`confirm::DenyConfirmer`] (safe) until an interactive one is attached.
     pub confirmer: Arc<dyn confirm::Confirmer>,
+    /// The managed web browser (Chrome via CDP) — Delphi's eyes/hands on the web.
+    /// Lazily launches Chrome on first use, so it's free to always hold one.
+    pub browser: Arc<browser::BrowserHandle>,
 }
 
 impl Shared {
@@ -60,7 +64,14 @@ impl Shared {
             google: None,
             actd: None,
             confirmer: Arc::new(confirm::DenyConfirmer),
+            browser: Arc::new(browser::BrowserHandle::new(browser::BrowserConfig::default())),
         })
+    }
+
+    /// Override the browser config (from oracle.toml [browser]), builder style.
+    pub fn with_browser(mut self, cfg: browser::BrowserConfig) -> Self {
+        self.browser = Arc::new(browser::BrowserHandle::new(cfg));
+        self
     }
 
     /// Attach an interactive confirmer (builder style).
@@ -97,6 +108,7 @@ pub fn demo_registry() -> tools::ToolRegistry {
     let mut reg = tools::ToolRegistry::new();
     tools::builtin::register_all(&mut reg);
     tools::os_tools::register_all(&mut reg);
+    tools::browser_tools::register_all(&mut reg);
     reg
 }
 

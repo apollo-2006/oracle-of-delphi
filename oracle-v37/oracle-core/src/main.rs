@@ -654,6 +654,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         Shared::open(&cfg.memory.db_path)?
             .with_google(load_google(&cfg))
             .with_actd(actd)
+            .with_browser(cfg.browser.to_browser_config())
             .with_confirmer(confirmer.clone()),
     );
     let llm = build_llm(&cfg);

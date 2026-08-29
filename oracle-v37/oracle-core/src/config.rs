@@ -32,6 +32,46 @@ pub struct Config {
     pub supervise: SuperviseConfig,
     #[serde(default)]
     pub voice: VoiceConfig,
+    #[serde(default)]
+    pub browser: BrowserSettings,
+}
+
+/// `[browser]` — Delphi's Chrome-over-CDP web browser. All optional; defaults
+/// launch a dedicated Chrome profile (the user signs into sites there once,
+/// since Chrome forbids remote-debugging the real default profile).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserSettings {
+    /// Path to chrome.exe. Empty → auto-detect common install locations.
+    #[serde(default)]
+    pub chrome_path: String,
+    /// Dedicated profile dir. Empty → %LOCALAPPDATA%\oracle\chrome.
+    #[serde(default)]
+    pub user_data_dir: String,
+    /// Remote-debugging port (0 → 9222).
+    #[serde(default)]
+    pub port: u16,
+    /// Run Chrome without a visible window.
+    #[serde(default)]
+    pub headless: bool,
+}
+
+impl BrowserSettings {
+    /// Map to the runtime browser config, filling platform defaults.
+    pub fn to_browser_config(&self) -> crate::browser::BrowserConfig {
+        let mut cfg = crate::browser::BrowserConfig::default();
+        if !self.chrome_path.trim().is_empty() {
+            cfg.chrome_path = self.chrome_path.clone();
+        }
+        if !self.user_data_dir.trim().is_empty() {
+            cfg.user_data_dir = self.user_data_dir.clone();
+        }
+        if self.port != 0 {
+            cfg.port = self.port;
+        }
+        cfg.headless = self.headless;
+        cfg
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

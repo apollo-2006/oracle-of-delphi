@@ -11,6 +11,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub mod browser_tools;
 pub mod builtin;
 pub mod os_tools;
 
