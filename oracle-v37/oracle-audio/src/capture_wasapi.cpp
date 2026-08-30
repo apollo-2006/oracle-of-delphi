@@ -8,7 +8,7 @@
 // mixer are converted to S16 and downmixed to mono for the VAD/ASR stage.
 //
 // This file compiles to nothing on non-Windows targets, so the Linux/CI build
-// is unaffected. On Windows it provides the make_capture() factory.
+// is unaffected. On Windows it provides the make_capture() factory. lowk essential.
 
 #include "oracle/capture.hpp"
 
