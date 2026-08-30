@@ -14,22 +14,27 @@ for arg in "$@"; do
   esac
 done
 
-echo "==> [1/3] Rust workspace (oracle-ipc, oracle-core, oracle-actd)"
-cargo build $RELEASE
-cargo test --all
-
-echo "==> [2/3] C++ audio engine (oracle-audio) ${ALSA_FLAG:-(null backend)}"
-cmake -B oracle-audio/build -S oracle-audio -DCMAKE_BUILD_TYPE=Release $ALSA_FLAG >/dev/null
-cmake --build oracle-audio/build -j"$(nproc 2>/dev/null || echo 4)" >/dev/null
-"$ROOT/oracle-audio/build/oracle-audio-tests"
-
-echo "==> [3/3] HUD (oracle-hud)"
+# The HUD must be built FIRST. oracle-core embeds oracle-hud/dist with
+# #[derive(RustEmbed)], which is resolved at compile time, so on a clean
+# checkout the Rust build failed outright with "folder ... does not exist"
+# when this step ran last.
+echo "==> [1/3] HUD (oracle-hud)"
 if command -v npm >/dev/null; then
   ( cd oracle-hud && npm install --silent && npx tsc --noEmit && npx vite build >/dev/null )
   echo "HUD: typecheck + build OK"
 else
   echo "npm not found; skipping HUD build"
+  echo "WARNING: oracle-core embeds oracle-hud/dist and will not compile without it." >&2
 fi
+
+echo "==> [2/3] Rust workspace (oracle-ipc, oracle-core, oracle-actd)"
+cargo build $RELEASE
+cargo test --all
+
+echo "==> [3/3] C++ audio engine (oracle-audio) ${ALSA_FLAG:-(null backend)}"
+cmake -B oracle-audio/build -S oracle-audio -DCMAKE_BUILD_TYPE=Release $ALSA_FLAG >/dev/null
+cmake --build oracle-audio/build -j"$(nproc 2>/dev/null || echo 4)" >/dev/null
+"$ROOT/oracle-audio/build/oracle-audio-tests"
 
 echo
 echo "==> ALL COMPONENTS BUILT AND TESTED"

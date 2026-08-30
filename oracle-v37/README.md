@@ -53,6 +53,12 @@ See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md).
 ```bash
 # Build + test everything (add --release --alsa for production build)
 scripts/build_all.sh
+# Note: the HUD must be built before the Rust workspace. oracle-core embeds
+# oracle-hud/dist via #[derive(RustEmbed)], resolved at compile time, so on a
+# clean checkout `cargo build` fails until `vite build` has produced that folder.
+# build_all.sh does this in the right order; if you build by hand, run
+#   ( cd oracle-hud && npm install && npx vite build )
+# first.
 
 # Run the orchestrator with the HUD gateway; Ctrl-C drains gracefully
 cargo run -p oracle-core -- run
