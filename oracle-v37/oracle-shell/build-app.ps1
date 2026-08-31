@@ -5,6 +5,19 @@
 # thing lives in ONE folder. After this, double-clicking oracle-of-delphi.exe
 # brings up the LLM, the daemon, the HUD, and a real window — no browser, no
 # terminals. Re-run after any code change.
+#
+# Usage:
+#   .\build-app.ps1              build only
+#   .\build-app.ps1 -Run         build, then launch it
+#   .\build-app.ps1 -Run -Clean  force a full rebuild first
+#
+# If PowerShell refuses to run this:
+#   powershell -ExecutionPolicy Bypass -File .\build-app.ps1 -Run
+
+param(
+    [switch]$Run,
+    [switch]$Clean
+)
 
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -29,6 +42,14 @@ if ($npm) {
   throw "No npm and no prebuilt oracle-hud\dist — install Node.js or restore the dist folder."
 }
 
+if ($Clean) {
+  Write-Host "[oracle] clean build requested..." -ForegroundColor Yellow
+  Push-Location $root
+  try { cargo clean -p oracle-core -p oracle-actd } finally { Pop-Location }
+  Push-Location $here
+  try { cargo clean } finally { Pop-Location }
+}
+
 Write-Host "[oracle] building backend (oracle-core + oracle-actd)..." -ForegroundColor Yellow
 Push-Location $root
 try { cargo build --release -p oracle-core -p oracle-actd } finally { Pop-Location }
@@ -41,8 +62,35 @@ $shellDir = Join-Path $here "target\release"
 Copy-Item (Join-Path $root "target\release\oracle-core.exe") $shellDir -Force
 Copy-Item (Join-Path $root "target\release\oracle-actd.exe") $shellDir -Force
 
+$app = Join-Path $shellDir "oracle-of-delphi.exe"
+
+# Fail loudly here rather than at launch. The shell boots a window even when the
+# backend is misconfigured, so a missing config shows up as an assistant that
+# looks fine and silently has no LLM, no wake word and no voice -- the defaults
+# have autostart_llm=false. Catch it while the build output is still on screen.
+$config = if ($env:ORACLE_CONFIG) { $env:ORACLE_CONFIG } else { Join-Path $env:APPDATA "oracle\oracle.toml" }
+if (-not (Test-Path $config)) {
+  Write-Host ""
+  Write-Host "[oracle] WARNING: no config at $config" -ForegroundColor Red
+  Write-Host "         That is %APPDATA% (Roaming), NOT %LOCALAPPDATA%." -ForegroundColor Red
+  Write-Host "         Without it the app starts with defaults: no LLM autostart," -ForegroundColor Red
+  Write-Host "         no wake word, no TTS. Emit one with:" -ForegroundColor Red
+  Write-Host "           .\target\release\oracle-core.exe write-config `"$config`"" -ForegroundColor Red
+} else {
+  Write-Host "[oracle] config: $config" -ForegroundColor DarkGray
+  & (Join-Path $shellDir "oracle-core.exe") check-config --config $config
+}
+
 Write-Host ""
 Write-Host "[oracle] Done. Your app is:" -ForegroundColor Green
-Write-Host "         $shellDir\oracle-of-delphi.exe" -ForegroundColor Green
+Write-Host "         $app" -ForegroundColor Green
 Write-Host "         Double-click it (or make a desktop shortcut / drop one in shell:startup)." -ForegroundColor Green
 Write-Host "         Summon/dismiss anytime with Ctrl+Alt+O, or from the tray sun." -ForegroundColor Green
+
+if ($Run) {
+  Write-Host ""
+  Write-Host "[oracle] launching..." -ForegroundColor Cyan
+  # Start detached so closing this terminal does not take the assistant with it.
+  Start-Process -FilePath $app -WorkingDirectory $shellDir
+  Write-Host "[oracle] running. Logs: $env:LOCALAPPDATA\oracle\run\" -ForegroundColor Cyan
+}

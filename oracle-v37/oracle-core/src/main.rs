@@ -92,12 +92,36 @@ fn init_tracing(level: &str) {
 }
 
 fn load_config(args: &[String]) -> anyhow::Result<Config> {
-    let path = args
+    let explicit = args
         .iter()
         .position(|a| a == "--config")
         .and_then(|i| args.get(i + 1))
-        .map(PathBuf::from)
+        .map(PathBuf::from);
+    let path = explicit
+        .clone()
         .unwrap_or_else(|| PathBuf::from("oracle.toml"));
+
+    // A --config the caller typed themselves that does not exist is a mistake,
+    // not a request for defaults. Falling back silently here is a genuinely
+    // nasty failure: the defaults have autostart_llm=false and no voice
+    // programs, so the assistant boots looking healthy while the LLM, wake word
+    // and TTS are all simply absent -- with nothing on screen saying why.
+    //
+    // A *missing* --config still falls back, because booting with defaults is
+    // the documented offline path.
+    if let Some(p) = &explicit {
+        if !p.exists() {
+            anyhow::bail!(
+                "no config at {}\n\
+                 \n\
+                 Hint: on Windows the shell looks in %APPDATA%\\oracle\\oracle.toml \
+                 (Roaming), which is NOT %LOCALAPPDATA%. Run `oracle-core write-config \
+                 <path>` to emit a fully-populated one.",
+                p.display()
+            );
+        }
+    }
+
     println!(
         "[oracle] loading config: {} (exists: {})",
         path.display(),
@@ -2449,6 +2473,36 @@ mod wake_tests {
             clean_transcript_line("turn up the volume").as_deref(),
             Some("turn up the volume")
         );
+    }
+}
+
+#[cfg(test)]
+mod config_arg_tests {
+    use super::load_config;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn an_explicit_config_that_does_not_exist_is_a_hard_error() {
+        // The silent fallback here cost a real debugging session: the app boots
+        // looking healthy, but the defaults have autostart_llm=false and no
+        // voice programs, so the LLM, wake word and TTS are all just missing.
+        let err = load_config(&args(&["run", "--config", "/definitely/not/here.toml"]))
+            .expect_err("a missing explicit config must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("/definitely/not/here.toml"), "got: {msg}");
+        // The hint has to name the trap that caused it.
+        assert!(msg.contains("APPDATA"), "got: {msg}");
+    }
+
+    #[test]
+    fn no_config_flag_still_falls_back_to_defaults() {
+        // Booting with defaults is the documented offline path, so only an
+        // explicit --config is strict.
+        let cfg = load_config(&args(&["run"])).expect("bare run must still boot");
+        assert!(!cfg.supervise.autostart_llm, "defaults do not autostart");
     }
 }
 
