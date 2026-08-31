@@ -156,10 +156,7 @@ pub async fn compose(
 
     let req = LlmRequest {
         system: BRIEFING_SYSTEM.to_string(),
-        messages: vec![ChatMessage {
-            role: Role::User,
-            content: material.render_facts(),
-        }],
+        messages: vec![ChatMessage::text(Role::User, material.render_facts())],
         // No grammar: this is prose, not a tool call. The tool protocol's JSON
         // grammar would force it into {"say": ...} for no benefit.
         grammar: None,

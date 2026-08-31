@@ -38,6 +38,158 @@ pub struct Config {
     pub voice: VoiceConfig,
     #[serde(default)]
     pub browser: BrowserSettings,
+    #[serde(default)]
+    pub ambient: AmbientConfig,
+    #[serde(default)]
+    pub workwindow: WorkWindowConfig,
+    #[serde(default)]
+    pub consolidate: ConsolidateConfig,
+}
+
+/// `[consolidate]` — promoting episodes into the knowledge graph.
+///
+/// The pass that makes `ambient.retain_days` a promotion deadline instead of a
+/// plain delete: durable facts are lifted out of episodes before the episodes
+/// themselves are swept. Needs `[llm.small]`, and runs only in the idle work
+/// window — nothing here is time-sensitive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsolidateConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// How often to check for a batch, in seconds. The work window gates it
+    /// anyway, so this only sets how soon after going idle it starts.
+    #[serde(default = "default_consolidate_poll_secs")]
+    pub poll_secs: u64,
+    /// Episodes per pass. Large enough that facts spanning a few entries are
+    /// visible together; small enough to fit a 2B's context alongside the
+    /// instruction.
+    #[serde(default = "default_consolidate_batch")]
+    pub batch_size: usize,
+    #[serde(default = "default_consolidate_max_tokens")]
+    pub max_tokens: u32,
+    /// Mine ambient observations for facts, not just conversation.
+    ///
+    /// This is the setting with a real trade behind it. Observations are the
+    /// high-volume source and the only one with an expiry, so they are the
+    /// reason this pass exists — but they are also descriptions of screens
+    /// whose contents other people choose. Off means the graph only ever
+    /// learns from what the user said and did.
+    #[serde(default = "default_true")]
+    pub from_observations: bool,
+}
+
+impl Default for ConsolidateConfig {
+    fn default() -> Self {
+        ConsolidateConfig {
+            enabled: false,
+            poll_secs: default_consolidate_poll_secs(),
+            batch_size: default_consolidate_batch(),
+            max_tokens: default_consolidate_max_tokens(),
+            from_observations: true,
+        }
+    }
+}
+
+/// `[workwindow]` — when background work may use the GPU.
+///
+/// See `crate::workwindow`. The one setting that matters in practice is
+/// `foreign_vram_budget_mb`: it is what makes the assistant get out of the way
+/// when you launch something that wants the card.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkWindowConfig {
+    /// Seconds of user inactivity before deferrable background work starts.
+    /// Longer than the model's idle-unload threshold on purpose: unloading is
+    /// cheap to get wrong, starting to work is not.
+    #[serde(default = "default_ww_after_secs")]
+    pub after_secs: i64,
+    /// VRAM in MiB that other processes may hold before the window closes. A
+    /// desktop compositor holds a few hundred MB on any machine, so this is not
+    /// zero; a game holds gigabytes, which is what it is here to notice.
+    #[serde(default = "default_foreign_vram_budget_mb")]
+    pub foreign_vram_budget_mb: u64,
+    /// Our own expected VRAM footprint, subtracted from the total reading.
+    /// Without it the planner's own 11 GB reads as foreign pressure and the
+    /// window never opens.
+    #[serde(default = "default_own_vram_mb")]
+    pub own_vram_mb: u64,
+}
+
+impl Default for WorkWindowConfig {
+    fn default() -> Self {
+        WorkWindowConfig {
+            after_secs: default_ww_after_secs(),
+            foreign_vram_budget_mb: default_foreign_vram_budget_mb(),
+            own_vram_mb: default_own_vram_mb(),
+        }
+    }
+}
+
+/// `[ambient]` — the screen index.
+///
+/// Off by default, and it should be: an assistant that photographs your screen
+/// on a timer is a thing you switch on deliberately, not something you discover
+/// in a changelog. It also needs the vision tier (`[llm.small]`) to be on;
+/// without it there is nothing to read the frames.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AmbientConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Seconds between captures. Capture is cheap; interpretation is not, and
+    /// the change filter drops most frames anyway, so this can be short.
+    #[serde(default = "default_sample_secs")]
+    pub sample_secs: u64,
+    /// How often the interpreter checks for work.
+    #[serde(default = "default_interpret_poll_secs")]
+    pub interpret_poll_secs: u64,
+    /// Width the frame is scaled to before it reaches the model. 1024 is a
+    /// reasonable ceiling for a 2B VLM; smaller loses small text, larger costs
+    /// context for detail the model will not use.
+    #[serde(default = "default_ambient_max_width")]
+    pub max_width: u32,
+    /// Hamming distance (0-64) above which a frame counts as a new scene.
+    /// Lower indexes more and repeats more; higher misses short-lived screens.
+    #[serde(default = "default_change_threshold")]
+    pub change_threshold: u32,
+    /// Frames held between capture and interpretation. Bounded, in memory,
+    /// never on disk.
+    #[serde(default = "default_queue_len")]
+    pub queue_len: usize,
+    /// Interpret while the user is active, rather than waiting for an idle
+    /// machine. True is the useful setting: frames are produced *because* the
+    /// user is working, and waiting for idleness would discard most of them.
+    /// GPU pressure and live turns still hold it back either way.
+    #[serde(default = "default_true")]
+    pub interpret_while_active: bool,
+    /// Token budget for one frame's summary.
+    #[serde(default = "default_ambient_max_tokens")]
+    pub max_tokens: u32,
+    /// Salience for stored observations. Deliberately below a conversation's:
+    /// what the user said should outrank what was on screen behind them.
+    #[serde(default = "default_ambient_salience")]
+    pub salience: f32,
+    /// Days to keep observations. 0 disables expiry.
+    #[serde(default = "default_retain_days")]
+    pub retain_days: u32,
+}
+
+impl Default for AmbientConfig {
+    fn default() -> Self {
+        AmbientConfig {
+            enabled: false,
+            sample_secs: default_sample_secs(),
+            interpret_poll_secs: default_interpret_poll_secs(),
+            max_width: default_ambient_max_width(),
+            change_threshold: default_change_threshold(),
+            queue_len: default_queue_len(),
+            interpret_while_active: true,
+            max_tokens: default_ambient_max_tokens(),
+            salience: default_ambient_salience(),
+            retain_days: default_retain_days(),
+        }
+    }
 }
 
 /// `[browser]` — Delphi's Chrome-over-CDP web browser. All optional; defaults
@@ -132,6 +284,59 @@ pub struct LlmConfig {
     /// Directory holding GGUF model files (e.g. E:\\oracle-models on Windows).
     #[serde(default)]
     pub model_dir: String,
+    /// `[llm.small]` — the resident small/vision tier. See [`SmallLlmConfig`].
+    #[serde(default)]
+    pub small: SmallLlmConfig,
+}
+
+/// `[llm.small]` — the second, always-warm model tier.
+///
+/// The 14B planner is the wrong tool for continuous background work: it holds
+/// 10-12 GB and is only worth loading for a real turn. But the ambient index and
+/// the consolidation pass need a model that is *always there*, cheap to call,
+/// and never worth unloading. That is a different model, not a different mode of
+/// the same one.
+///
+/// A 2B-class VLM at Q4 is ~2.5 GB resident. That is a defensible standing cost
+/// in a way that 11 GB is not, and it is what lets the big model stay strictly
+/// on-demand.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SmallLlmConfig {
+    /// Off by default: this is a second model download and a second server.
+    #[serde(default)]
+    pub enabled: bool,
+    /// "mock", or an http(s) URL to a second llama.cpp server. Must not be the
+    /// same port as `llm.backend` — they are two separate processes.
+    #[serde(default)]
+    pub backend: String,
+    #[serde(default)]
+    pub model: String,
+    /// Background summaries are short by construction; a large budget here just
+    /// invites the small model to ramble.
+    #[serde(default = "default_small_max_tokens")]
+    pub max_tokens: u32,
+    /// Low by default. This tier extracts and summarizes rather than converses,
+    /// and creativity in an index is called a hallucination.
+    #[serde(default = "default_small_temperature")]
+    pub temperature: f32,
+    /// Keep this tier loaded through idle. The whole point of a small model is
+    /// that it is cheap enough to leave running; set false only to debug.
+    #[serde(default = "default_true")]
+    pub resident: bool,
+}
+
+impl Default for SmallLlmConfig {
+    fn default() -> Self {
+        SmallLlmConfig {
+            enabled: false,
+            backend: String::new(),
+            model: String::new(),
+            max_tokens: default_small_max_tokens(),
+            temperature: default_small_temperature(),
+            resident: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +358,51 @@ pub struct MemoryConfig {
     /// invite spurious connections.
     #[serde(default = "default_recall_min_score")]
     pub recall_min_score: f32,
+    /// `[memory.embedder]` — the semantic embedding sidecar.
+    #[serde(default)]
+    pub embedder: EmbedderConfig,
+}
+
+/// `[memory.embedder]` — what turns memory from keyword matching into recall.
+///
+/// The built-in `HashEmbedder` matches on tokens, so "the borrow checker
+/// complaint in dispatch.rs" does not retrieve "lifetime error in the
+/// dispatcher". Pointing this at a llama.cpp sidecar serving BGE-small
+/// (`--embedding --pooling mean`) is what makes retrieval semantic.
+///
+/// It is a third supervised child rather than an in-process ONNX Runtime: the
+/// supervision, restart and logging already exist, and `oracle-core` keeps a
+/// native-dependency surface of zero.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbedderConfig {
+    /// Off = the offline hash embedder. Retrieval still works; it is just
+    /// lexical.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Sidecar root, e.g. "http://127.0.0.1:8082". Its own port: this is a
+    /// third llama.cpp server, not a route on an existing one.
+    #[serde(default)]
+    pub backend: String,
+    /// Model name, which doubles as the recorded vector-space id. Changing it
+    /// makes existing rows vector-stale by design — see memory::embed.
+    #[serde(default = "default_embed_model")]
+    pub model: String,
+    /// Expected output width. A mismatch is refused rather than stored, because
+    /// two widths in one column turn cosine into a length check.
+    #[serde(default = "default_embed_dim")]
+    pub dim: usize,
+}
+
+impl Default for EmbedderConfig {
+    fn default() -> Self {
+        EmbedderConfig {
+            enabled: false,
+            backend: String::new(),
+            model: default_embed_model(),
+            dim: default_embed_dim(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -226,6 +476,35 @@ pub struct SuperviseConfig {
     /// How long to wait for llama-server to report healthy after a reload.
     #[serde(default = "default_llm_ready_timeout_secs")]
     pub llm_ready_timeout_secs: u64,
+    /// Launch the small/vision tier's llama-server as a second managed child.
+    ///
+    /// Separate from `autostart_llm` because the two tiers are two processes on
+    /// two ports with two model files; one being supervised says nothing about
+    /// the other. Ignored unless `[llm.small] enabled = true`.
+    #[serde(default)]
+    pub autostart_small_llm: bool,
+    /// The small tier's server program. Empty = reuse `llm_program`, which is
+    /// the common case: the same llama-server binary, a different model.
+    #[serde(default)]
+    pub small_llm_program: String,
+    /// Arguments for the small tier's server (its own model path and port).
+    #[serde(default)]
+    pub small_llm_args: Vec<String>,
+    /// Readiness timeout for the small tier. Lower than the big model's because
+    /// a 2B loads in seconds; if it is not up by then something is wrong.
+    #[serde(default = "default_small_ready_timeout_secs")]
+    pub small_llm_ready_timeout_secs: u64,
+    /// Launch the embedding sidecar as a third managed child.
+    #[serde(default)]
+    pub autostart_embedder: bool,
+    /// The embedder's server program. Empty = reuse `llm_program`; a BGE GGUF
+    /// is served by the same llama-server binary with `--embedding`.
+    #[serde(default)]
+    pub embedder_program: String,
+    /// Arguments for the embedding sidecar (model path, its own port,
+    /// `--embedding`, `--pooling mean`).
+    #[serde(default)]
+    pub embedder_args: Vec<String>,
 }
 
 impl Default for SuperviseConfig {
@@ -237,6 +516,13 @@ impl Default for SuperviseConfig {
             autostart_actd: true,
             actd_program: String::new(),
             open_window: true,
+            autostart_small_llm: false,
+            small_llm_program: String::new(),
+            small_llm_args: Vec::new(),
+            small_llm_ready_timeout_secs: default_small_ready_timeout_secs(),
+            autostart_embedder: false,
+            embedder_program: String::new(),
+            embedder_args: Vec::new(),
             browser: default_browser(),
             idle_unload_secs: default_idle_unload_secs(),
             llm_ready_timeout_secs: default_llm_ready_timeout_secs(),
@@ -265,6 +551,69 @@ fn default_recall_min_score() -> f32 {
 /// afternoon away gives the GPU back.
 fn default_idle_unload_secs() -> i64 {
     600
+}
+/// Normalize a backend URL for comparison: trailing slashes and case in the
+/// host must not hide a port collision.
+fn norm_backend(b: &str) -> String {
+    b.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+fn default_consolidate_poll_secs() -> u64 {
+    300
+}
+fn default_consolidate_batch() -> usize {
+    12
+}
+fn default_consolidate_max_tokens() -> u32 {
+    400
+}
+fn default_ww_after_secs() -> i64 {
+    900
+}
+fn default_foreign_vram_budget_mb() -> u64 {
+    1024
+}
+fn default_own_vram_mb() -> u64 {
+    3_000
+}
+fn default_sample_secs() -> u64 {
+    45
+}
+fn default_interpret_poll_secs() -> u64 {
+    5
+}
+fn default_ambient_max_width() -> u32 {
+    1024
+}
+fn default_change_threshold() -> u32 {
+    6
+}
+fn default_queue_len() -> usize {
+    24
+}
+fn default_ambient_max_tokens() -> u32 {
+    120
+}
+fn default_ambient_salience() -> f32 {
+    0.25
+}
+fn default_retain_days() -> u32 {
+    21
+}
+fn default_embed_model() -> String {
+    "bge-small-en-v1.5".into()
+}
+fn default_embed_dim() -> usize {
+    crate::memory::embed::EMBED_DIM
+}
+fn default_small_max_tokens() -> u32 {
+    512
+}
+fn default_small_temperature() -> f32 {
+    0.2
+}
+fn default_small_ready_timeout_secs() -> u64 {
+    60
 }
 fn default_llm_ready_timeout_secs() -> u64 {
     90
@@ -450,6 +799,7 @@ impl Default for LlmConfig {
             max_tokens: 1024,
             temperature: 0.7,
             model_dir: String::new(),
+            small: SmallLlmConfig::default(),
         }
     }
 }
@@ -595,6 +945,7 @@ impl Default for MemoryConfig {
             auto_record: true,
             recall_limit: default_recall_limit(),
             recall_min_score: default_recall_min_score(),
+            embedder: EmbedderConfig::default(),
         }
     }
 }
@@ -702,6 +1053,207 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "llm.backend must be \"mock\" or an http(s) URL".into(),
             ));
+        }
+        self.validate_small_tier()?;
+        self.validate_embedder()?;
+        self.validate_ambient()?;
+        self.validate_consolidate()?;
+        Ok(())
+    }
+
+    /// Rules for `[consolidate]`.
+    fn validate_consolidate(&self) -> Result<(), ConfigError> {
+        let c = &self.consolidate;
+        if !c.enabled {
+            return Ok(());
+        }
+        if !self.llm.small.enabled {
+            return Err(ConfigError::Invalid(
+                "consolidate.enabled = true requires [llm.small] enabled = true — \
+                 the extraction pass runs on the small tier"
+                    .into(),
+            ));
+        }
+        if c.batch_size == 0 {
+            return Err(ConfigError::Invalid(
+                "consolidate.batch_size must be at least 1".into(),
+            ));
+        }
+        // A batch that cannot fit the small tier's context produces a truncated
+        // prompt and silently wrong extraction, which is worse than refusing.
+        if c.batch_size > 100 {
+            return Err(ConfigError::Invalid(
+                "consolidate.batch_size above 100 will not fit a small model's context".into(),
+            ));
+        }
+        // The pairing that quietly loses data: observations expire on a timer,
+        // and if nothing promotes them first they are simply gone.
+        if self.ambient.enabled && self.ambient.retain_days > 0 && !c.from_observations {
+            tracing::warn!(
+                "[config] ambient observations expire after {} days but \
+                 consolidate.from_observations is false — nothing will promote them first",
+                self.ambient.retain_days
+            );
+        }
+        Ok(())
+    }
+
+    /// Rules for `[ambient]`.
+    fn validate_ambient(&self) -> Result<(), ConfigError> {
+        let a = &self.ambient;
+        if !a.enabled {
+            return Ok(());
+        }
+        // The hard one: without the vision tier there is no model to read the
+        // frames, so the sampler would capture the screen on a timer and queue
+        // it for nobody. That is all of the privacy cost and none of the
+        // benefit, so it fails at load rather than running.
+        if !self.llm.small.enabled {
+            return Err(ConfigError::Invalid(
+                "ambient.enabled = true requires [llm.small] enabled = true — \
+                 the vision tier is what reads the frames"
+                    .into(),
+            ));
+        }
+        if a.sample_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "ambient.sample_secs must be at least 1".into(),
+            ));
+        }
+        if a.change_threshold > 64 {
+            return Err(ConfigError::Invalid(
+                "ambient.change_threshold is a Hamming distance over 64 bits; max is 64".into(),
+            ));
+        }
+        if a.queue_len == 0 {
+            return Err(ConfigError::Invalid(
+                "ambient.queue_len must be at least 1".into(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&a.salience) {
+            return Err(ConfigError::Invalid(
+                "ambient.salience must be in 0.0..=1.0".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Rules for `[memory.embedder]`.
+    ///
+    /// Same port-collision reasoning as the small tier, extended to three
+    /// servers: an embedder pointed at the planner's port would send embedding
+    /// requests to a chat model, which answers with prose rather than an error.
+    fn validate_embedder(&self) -> Result<(), ConfigError> {
+        let e = &self.memory.embedder;
+        if !e.enabled {
+            return Ok(());
+        }
+        if e.backend.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "memory.embedder.enabled = true requires memory.embedder.backend".into(),
+            ));
+        }
+        if !e.backend.starts_with("http") {
+            return Err(ConfigError::Invalid(
+                "memory.embedder.backend must be an http(s) URL".into(),
+            ));
+        }
+        for (label, other) in [
+            ("llm.backend", &self.llm.backend),
+            ("llm.small.backend", &self.llm.small.backend),
+        ] {
+            if *other != "mock" && norm_backend(&e.backend) == norm_backend(other) {
+                return Err(ConfigError::Invalid(format!(
+                    "memory.embedder.backend must not be the same endpoint as {label} — \
+                     the embedder is its own llama.cpp server on its own port"
+                )));
+            }
+        }
+        if e.dim == 0 {
+            return Err(ConfigError::Invalid(
+                "memory.embedder.dim must be non-zero".into(),
+            ));
+        }
+        if self.supervise.autostart_embedder {
+            let program = if self.supervise.embedder_program.trim().is_empty() {
+                self.supervise.llm_program.trim()
+            } else {
+                self.supervise.embedder_program.trim()
+            };
+            if program.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "supervise.autostart_embedder = true needs supervise.embedder_program \
+                     (or supervise.llm_program to fall back to)"
+                        .into(),
+                ));
+            }
+            if self.supervise.embedder_args.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "supervise.autostart_embedder = true needs supervise.embedder_args \
+                     (at least the model path, its own --port, and --embedding)"
+                        .into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Rules specific to `[llm.small]`.
+    ///
+    /// The sharp one is the shared-backend check. Two llama-server processes on
+    /// one port do not error — the second simply fails to bind and the
+    /// supervisor restart-loops it forever while every "small" request is
+    /// silently answered by the 14B. That looks like the tier working, at 11 GB
+    /// resident, which is the exact failure this whole feature exists to avoid.
+    fn validate_small_tier(&self) -> Result<(), ConfigError> {
+        let small = &self.llm.small;
+        if !small.enabled {
+            return Ok(());
+        }
+        if small.backend.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "llm.small.enabled = true requires llm.small.backend".into(),
+            ));
+        }
+        if small.backend != "mock" && !small.backend.starts_with("http") {
+            return Err(ConfigError::Invalid(
+                "llm.small.backend must be \"mock\" or an http(s) URL".into(),
+            ));
+        }
+        if small.backend != "mock"
+            && norm_backend(&small.backend) == norm_backend(&self.llm.backend)
+        {
+            return Err(ConfigError::Invalid(
+                "llm.small.backend must not be the same endpoint as llm.backend — \
+                 the two tiers are two servers on two ports"
+                    .into(),
+            ));
+        }
+        if !(0.0..=2.0).contains(&small.temperature) {
+            return Err(ConfigError::Invalid(
+                "llm.small.temperature must be in 0.0..=2.0".into(),
+            ));
+        }
+        if self.supervise.autostart_small_llm {
+            let program = if self.supervise.small_llm_program.trim().is_empty() {
+                self.supervise.llm_program.trim()
+            } else {
+                self.supervise.small_llm_program.trim()
+            };
+            if program.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "supervise.autostart_small_llm = true needs supervise.small_llm_program \
+                     (or supervise.llm_program to fall back to)"
+                        .into(),
+                ));
+            }
+            if self.supervise.small_llm_args.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "supervise.autostart_small_llm = true needs supervise.small_llm_args \
+                     (at least the model path and its own --port)"
+                        .into(),
+                ));
+            }
         }
         Ok(())
     }

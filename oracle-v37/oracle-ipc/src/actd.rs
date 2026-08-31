@@ -87,6 +87,25 @@ pub enum ActRequest {
         #[serde(default)]
         max_depth: Option<u32>,
     },
+    /// Capture a window's pixels as a PNG. `window_id` None → the foreground
+    /// window. Observe-only: it looks, it never touches.
+    ///
+    /// This is the most invasive `Observe` there is — it sees everything on the
+    /// window, including what `ReadUiTree` cannot reach (canvas, video, images)
+    /// and what no accessibility API exposes. Lockdown denies it along with
+    /// every other op, so "lockdown" does stop the assistant watching and not
+    /// merely stop it touching; the finer control is that ambient capture is a
+    /// separate, off-by-default feature in oracle-core rather than something a
+    /// granted `Observe` implies.
+    CaptureWindow {
+        #[serde(default)]
+        window_id: Option<u64>,
+        /// Downscale hint. Backends that can scale during capture (Windows
+        /// `StretchBlt`) honour it for free; others return native size and let
+        /// the caller resize. Never an upscale.
+        #[serde(default)]
+        max_width: Option<u32>,
+    },
     /// Invoke — a synthetic click / default action — on the first UI element
     /// whose name matches, within a window (`window_id` None → foreground).
     /// Sensitive: a click can trigger anything the app exposes, so it is gated
@@ -126,6 +145,7 @@ impl ActRequest {
         match self {
             ActRequest::ListWindows
             | ActRequest::ListProcesses
+            | ActRequest::CaptureWindow { .. }
             | ActRequest::ReadUiTree { .. } => Capability::Observe,
             ActRequest::FocusWindow { .. }
             | ActRequest::SetLockdown { .. }
@@ -243,9 +263,54 @@ pub struct UiElement {
     pub rect: Option<[i32; 4]>,
 }
 
+/// One captured window: PNG pixels plus what is needed to decide whether the
+/// picture is worth spending a model on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapturedImage {
+    pub window_id: u64,
+    /// The window's title at capture time. Attacker-controllable (a web page
+    /// picks its own), so callers must frame it as data, never instructions.
+    pub title: String,
+    /// Pixel dimensions of the returned image, after any capture-time scaling.
+    pub width: u32,
+    pub height: u32,
+    /// PNG bytes, base64. Base64 because the transport is line-framed JSON;
+    /// a binary side-channel would be faster and is not worth a second framing
+    /// format for a few hundred KB every several seconds.
+    pub png_b64: String,
+}
+
+// NB: no perceptual hash on the wire. It was tempting to have each backend
+// compute one from the raw pixels it already holds, but macOS captures via
+// `screencapture`, which hands back an encoded PNG and no pixels — that backend
+// would have to decode just to hash, and the logic would exist three times with
+// three chances to diverge. The caller decodes once and hashes there instead:
+// one implementation, testable anywhere, and a PNG decode is nothing beside the
+// model call it gates.
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capturing_the_screen_is_observe_but_not_free() {
+        // Observe, consistent with ReadUiTree: both read window content without
+        // touching anything.
+        assert_eq!(
+            ActRequest::CaptureWindow {
+                window_id: None,
+                max_width: None
+            }
+            .required_capability(),
+            Capability::Observe
+        );
+        // ...and never irreversible: looking changes nothing.
+        assert!(!ActRequest::CaptureWindow {
+            window_id: None,
+            max_width: None
+        }
+        .is_irreversible());
+    }
 
     #[test]
     fn capability_is_derived_from_op_not_trusted() {

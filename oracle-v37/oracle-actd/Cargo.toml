@@ -22,6 +22,11 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+# PNG encoding for window capture. Pure Rust, no system libs -- the actuator
+# daemon is the privileged process, so its dependency surface stays deliberately
+# small. Only an encoder is needed here; decoding happens in oracle-core.
+png = "0.17"
+base64 = "0.22"
 
 # Windows-only: raw Win32 bindings for the actuator PAL (windows/process/input).
 # Not built on Linux/CI; compiled on the Windows target.
@@ -34,6 +39,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_Graphics_Dwm",
+    # Window capture: GDI device contexts, BitBlt/StretchBlt, DIB sections.
+    "Win32_Graphics_Gdi",
 ] }
 # UI Automation (a11y tree read + click) is COM: the higher-level `windows`
 # crate gives it proper COM wrappers (refcounting, Result-based errors) that

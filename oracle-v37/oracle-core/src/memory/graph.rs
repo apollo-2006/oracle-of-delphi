@@ -208,6 +208,28 @@ impl KnowledgeGraph {
     }
 
     /// Add an alias to an existing node (accumulates over time, §5.3).
+    /// Where an edge came from, if it exists.
+    ///
+    /// Provenance is recorded on every assertion but deliberately not returned
+    /// in [`Edge`]: that struct is what the planner sees, and widening it is a
+    /// change to the tool contract. This accessor exists because the question
+    /// "did this fact come from something the user said, or from a web page
+    /// that was on screen?" has to be answerable — the consolidation pass marks
+    /// screen-derived batches for exactly that reason.
+    pub fn edge_provenance(&self, subj: &str, rel: &str, obj: &str) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT e.provenance FROM kg_edge e \
+             JOIN kg_node s ON s.id = e.src \
+             JOIN kg_node d ON d.id = e.dst \
+             WHERE s.name = ? AND e.rel = ? AND d.name = ? \
+             ORDER BY e.id DESC LIMIT 1",
+            params![subj, rel, obj],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+    }
+
     pub fn add_alias(&self, name: &str, alias: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         let id = Self::resolve_or_create(&conn, name)?;
@@ -249,6 +271,23 @@ mod tests {
             .unwrap();
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].dst, "Dr. Chen");
+    }
+
+    #[test]
+    fn provenance_is_readable_back_off_an_asserted_edge() {
+        let g = kg();
+        g.query(KgQuery::Assert {
+            subj: "User".into(),
+            rel: "advisor".into(),
+            obj: "Dr. Chen".into(),
+            provenance: "ep:4-9/screen".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            g.edge_provenance("User", "advisor", "Dr. Chen").as_deref(),
+            Some("ep:4-9/screen")
+        );
+        assert!(g.edge_provenance("User", "advisor", "Nobody").is_none());
     }
 
     #[test]

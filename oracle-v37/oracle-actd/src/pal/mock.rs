@@ -2,7 +2,7 @@
 //! daemon's policy + RPC + audit paths are fully testable on any OS.
 
 use super::{PalError, Platform};
-use oracle_ipc::actd::{MediaKey, ProcInfo, UiElement, WindowInfo};
+use oracle_ipc::actd::{CapturedImage, MediaKey, ProcInfo, UiElement, WindowInfo};
 use std::sync::Mutex;
 
 pub struct MockPlatform {
@@ -211,6 +211,55 @@ impl Platform for MockPlatform {
         Ok(())
     }
 
+    fn capture_window(
+        &self,
+        window_id: Option<u64>,
+        max_width: u32,
+    ) -> Result<CapturedImage, PalError> {
+        let inner = self.inner.lock().unwrap();
+        // Same resolution rule as every other window op: a named window must
+        // exist, None means whatever is focused.
+        let win = match window_id {
+            Some(id) => inner
+                .windows
+                .iter()
+                .find(|w| w.id == id)
+                .ok_or(PalError::NoWindow(id))?,
+            None => inner
+                .windows
+                .iter()
+                .find(|w| w.focused)
+                .ok_or_else(|| PalError::Backend("no focused window".into()))?,
+        };
+
+        // A deterministic pattern rather than a solid fill: a solid image makes
+        // every change-detection test pass trivially, including the broken
+        // ones.
+        //
+        // The variation between windows has to be STRUCTURAL, not a brightness
+        // offset. Perceptual hashing compares each cell against the image's own
+        // mean precisely so that dimming a screen is not mistaken for changing
+        // it -- so two windows differing only by a constant would hash
+        // identically and quietly make the deduplication tests meaningless.
+        // Here the window id sets the checker size, which moves the pattern
+        // rather than its level.
+        const W: u32 = 64;
+        const H: u32 = 48;
+        let cell = 2 + (win.id % 7) as u32; // 2..=8 px checks
+        let mut rgba = Vec::with_capacity((W * H * 4) as usize);
+        for y in 0..H {
+            for x in 0..W {
+                let on = ((x / cell) + (y / cell)).is_multiple_of(2);
+                let v = if on { 230 } else { 25 };
+                rgba.push(v);
+                rgba.push(v);
+                rgba.push(v);
+                rgba.push(255);
+            }
+        }
+        super::capture::finish(win.id, win.title.clone(), &rgba, W, H, max_width)
+    }
+
     fn read_ui_tree(
         &self,
         window_id: Option<u64>,
@@ -288,10 +337,49 @@ mod tests {
     }
 
     #[test]
+    fn capturing_the_focused_window_yields_a_png() {
+        let p = MockPlatform::new();
+        let img = p.capture_window(None, 1024).unwrap();
+        assert!(!img.png_b64.is_empty());
+        assert_eq!((img.width, img.height), (64, 48));
+    }
+
+    #[test]
+    fn capture_honours_the_scale_hint() {
+        let p = MockPlatform::new();
+        let img = p.capture_window(None, 16).unwrap();
+        assert_eq!(img.width, 16);
+        assert_eq!(img.height, 12, "4:3 preserved");
+    }
+
+    #[test]
+    fn capturing_a_window_that_does_not_exist_is_an_error() {
+        let p = MockPlatform::new();
+        assert!(matches!(
+            p.capture_window(Some(999_999), 1024),
+            Err(PalError::NoWindow(999_999))
+        ));
+    }
+
+    #[test]
+    fn different_windows_capture_to_different_pixels() {
+        // Guards the change-detection tests downstream: if every mock capture
+        // were identical, a broken deduplicator would still look correct.
+        let p = MockPlatform::new();
+        let windows = p.list_windows().unwrap();
+        assert!(windows.len() >= 2, "need two windows for this test");
+        let a = p.capture_window(Some(windows[0].id), 64).unwrap();
+        let b = p.capture_window(Some(windows[1].id), 64).unwrap();
+        assert_ne!(a.png_b64, b.png_b64);
+    }
+
+    #[test]
     fn reads_ui_tree_and_respects_depth() {
         let p = MockPlatform::new();
         let all = p.read_ui_tree(None, 10).unwrap();
-        assert!(all.iter().any(|e| e.name == "Save" && e.control_type == "button"));
+        assert!(all
+            .iter()
+            .any(|e| e.name == "Save" && e.control_type == "button"));
         // depth 0 keeps only the window root.
         let shallow = p.read_ui_tree(None, 0).unwrap();
         assert_eq!(shallow.len(), 1);

@@ -6,10 +6,12 @@
 //! (llama-server, ONNX embeddings, live Google/HA) swapping in behind traits.
 
 pub mod agent;
+pub mod ambient;
 pub mod audio;
 pub mod briefing;
 pub mod browser;
 pub mod config;
+pub mod consolidate;
 pub mod confirm;
 pub mod connectors;
 pub mod gateway;
@@ -21,7 +23,9 @@ pub mod observ;
 pub mod proactive;
 pub mod security;
 pub mod supervisor;
+pub mod tiers;
 pub mod tools;
+pub mod workwindow;
 
 use memory::{HashEmbedder, KnowledgeGraph, MemoryStore};
 use proactive::routines::RoutineStore;
@@ -62,9 +66,22 @@ pub struct Shared {
 }
 
 impl Shared {
-    /// Production constructor: open the DB at `db_path`.
+    /// Production constructor: open the DB at `db_path` with the offline hash
+    /// embedder. Retrieval is lexical; see [`Shared::open_with_embedder`].
     pub fn open(db_path: &str) -> anyhow::Result<Self> {
-        let memory = MemoryStore::open(db_path, Box::new(HashEmbedder::default()))?;
+        Self::open_with_embedder(db_path, Box::new(HashEmbedder::default()))
+    }
+
+    /// Open with a chosen embedder — in production, the BGE sidecar.
+    ///
+    /// The embedder is a constructor argument rather than a setter because it
+    /// determines the vector space every row is written into; swapping it after
+    /// rows exist is a migration, not a configuration change.
+    pub fn open_with_embedder(
+        db_path: &str,
+        embedder: Box<dyn memory::Embedder>,
+    ) -> anyhow::Result<Self> {
+        let memory = MemoryStore::open(db_path, embedder)?;
         let graph = KnowledgeGraph::open(db_path, KnowledgeGraph::default_vocab())?;
         let routines = RoutineStore::open(db_path)?;
         Ok(Shared {

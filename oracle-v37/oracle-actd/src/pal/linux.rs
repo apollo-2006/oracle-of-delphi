@@ -8,7 +8,7 @@
 //! *reporting degraded capabilities honestly* (§3.1) rather than pretending.
 
 use super::{PalError, Platform};
-use oracle_ipc::actd::{ProcInfo, UiElement, WindowInfo};
+use oracle_ipc::actd::{CapturedImage, ProcInfo, UiElement, WindowInfo};
 use std::fs;
 
 #[derive(Default)]
@@ -110,6 +110,22 @@ impl Platform for LinuxPlatform {
             .status()
             .map(|_| ())
             .map_err(|e| PalError::Backend(format!("loginctl: {e}")))
+    }
+
+    fn capture_window(
+        &self,
+        _window_id: Option<u64>,
+        _max_width: u32,
+    ) -> Result<CapturedImage, PalError> {
+        // X11 (XGetImage / XComposite) and Wayland (wlr-screencopy, or the
+        // xdg-desktop-portal ScreenCast interface) are both real options, but
+        // they are different enough that one of them being written is not the
+        // other working. Unsupported is the honest answer until one exists:
+        // ambient capture then reports itself off on Linux instead of silently
+        // indexing blank frames.
+        Err(PalError::Unsupported(
+            "window capture on Linux (X11/Wayland backend not implemented)",
+        ))
     }
 
     fn read_ui_tree(

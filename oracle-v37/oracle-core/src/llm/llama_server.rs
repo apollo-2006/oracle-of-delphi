@@ -39,7 +39,28 @@ impl LlamaServer {
                 Role::Assistant => "assistant",
                 Role::Tool => "tool",
             };
-            messages.push(serde_json::json!({"role": role, "content": m.content}));
+            // A message with no images keeps the plain-string content form.
+            // Sending the multimodal array shape unconditionally would work on
+            // llama-server but changes the prompt a text model sees, and there
+            // is no reason to perturb the path that already works.
+            if m.images.is_empty() {
+                messages.push(serde_json::json!({"role": role, "content": m.content}));
+            } else {
+                let mut parts = Vec::new();
+                // Images first: a VLM conditions the text on them, and putting
+                // the instruction after the picture is what the chat templates
+                // are trained on.
+                for url in &m.images {
+                    parts.push(serde_json::json!({
+                        "type": "image_url",
+                        "image_url": { "url": url }
+                    }));
+                }
+                if !m.content.is_empty() {
+                    parts.push(serde_json::json!({"type": "text", "text": m.content}));
+                }
+                messages.push(serde_json::json!({"role": role, "content": parts}));
+            }
         }
         let mut body = serde_json::json!({
             "model": self.model,
@@ -181,10 +202,7 @@ mod tests {
     fn req(grammar: Option<String>) -> LlmRequest {
         LlmRequest {
             system: "sys".into(),
-            messages: vec![ChatMessage {
-                role: Role::User,
-                content: "hi".into(),
-            }],
+            messages: vec![ChatMessage::text(Role::User, "hi")],
             grammar,
             max_tokens: 128,
             temperature: 0.3,
@@ -193,6 +211,51 @@ mod tests {
             min_p: LlmRequest::DEFAULT_MIN_P,
             repeat_penalty: LlmRequest::DEFAULT_REPEAT_PENALTY,
         }
+    }
+
+    #[test]
+    fn a_text_only_message_keeps_the_plain_string_content_form() {
+        // The path every existing turn takes must be byte-identical to before
+        // vision existed: changing the content shape changes what a text model
+        // is prompted with.
+        let s = LlamaServer::new("http://x", "m");
+        let body = s.build_body(&req(None));
+        let content = &body["messages"][1]["content"];
+        assert!(content.is_string(), "got {content}");
+        assert_eq!(content.as_str().unwrap(), "hi");
+    }
+
+    #[test]
+    fn an_image_message_becomes_a_multimodal_content_array() {
+        let s = LlamaServer::new("http://x", "m");
+        let mut r = req(None);
+        r.messages = vec![ChatMessage::with_png(Role::User, "what is this?", "QUJD")];
+        let body = s.build_body(&r);
+        let parts = body["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        // Image first: the chat templates a VLM is trained on put the picture
+        // ahead of the instruction.
+        assert_eq!(parts[0]["type"], "image_url");
+        assert_eq!(
+            parts[0]["image_url"]["url"].as_str().unwrap(),
+            "data:image/png;base64,QUJD"
+        );
+        assert_eq!(parts[1]["type"], "text");
+        assert_eq!(parts[1]["text"], "what is this?");
+    }
+
+    #[test]
+    fn an_image_with_no_prompt_text_emits_only_the_image_part() {
+        let s = LlamaServer::new("http://x", "m");
+        let mut r = req(None);
+        r.messages = vec![ChatMessage::with_png(Role::User, "", "QUJD")];
+        let body = s.build_body(&r);
+        let parts = body["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(
+            parts.len(),
+            1,
+            "an empty text part would confuse the template"
+        );
     }
 
     #[test]

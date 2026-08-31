@@ -34,7 +34,7 @@
 //! rather than as a silent no-op.
 
 use super::{PalError, Platform};
-use oracle_ipc::actd::{MediaKey, ProcInfo, UiElement, WindowInfo, WindowOp};
+use oracle_ipc::actd::{CapturedImage, MediaKey, ProcInfo, UiElement, WindowInfo, WindowOp};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -45,7 +45,80 @@ impl MacosPlatform {
     pub fn new() -> Self {
         MacosPlatform
     }
+
+    /// Screen rectangle and title of a window, or of the frontmost window when
+    /// `window_id` is None.
+    ///
+    /// Returns `(x, y, width, height)` in the global screen space
+    /// `screencapture -R` expects.
+    fn window_rect(&self, window_id: Option<u64>) -> Result<WindowRect, PalError> {
+        let script = match window_id {
+            Some(id) => {
+                let (pid, index) = unpack_id(id);
+                format!(
+                    r#"
+tell application "System Events"
+  set p to first process whose unix id is {pid}
+  set w to window {index} of p
+  set pos to position of w
+  set sz to size of w
+  set t to ""
+  try
+    set t to name of w
+  end try
+  return ((item 1 of pos) as text) & tab & ((item 2 of pos) as text) & tab & ¬
+         ((item 1 of sz) as text) & tab & ((item 2 of sz) as text) & tab & t
+end tell
+"#
+                )
+            }
+            None => r#"
+tell application "System Events"
+  set p to first process whose frontmost is true
+  set w to window 1 of p
+  set pos to position of w
+  set sz to size of w
+  set t to ""
+  try
+    set t to name of w
+  end try
+  return ((item 1 of pos) as text) & tab & ((item 2 of pos) as text) & tab & ¬
+         ((item 1 of sz) as text) & tab & ((item 2 of sz) as text) & tab & t
+end tell
+"#
+            .to_string(),
+        };
+        let raw = osascript(&script)?;
+        parse_window_rect(&raw)
+            .ok_or_else(|| PalError::Backend(format!("could not read window bounds from {raw:?}")))
+    }
 }
+
+/// Parse the tab-separated `x\ty\tw\th\ttitle` line `window_rect` asks for.
+///
+/// A free function so the parsing -- which is where the bugs live -- is tested
+/// on any platform, matching how the rest of this backend is structured.
+fn parse_window_rect(raw: &str) -> Option<WindowRect> {
+    let f: Vec<&str> = raw.trim().split('\t').collect();
+    if f.len() < 4 {
+        return None;
+    }
+    let x = f[0].trim().parse::<i32>().ok()?;
+    let y = f[1].trim().parse::<i32>().ok()?;
+    let w = f[2].trim().parse::<i32>().ok()?;
+    let h = f[3].trim().parse::<i32>().ok()?;
+    // A title may itself contain tabs; everything past the fourth field is it.
+    let title = if f.len() > 4 {
+        f[4..].join("\t")
+    } else {
+        String::new()
+    };
+    Some(((x, y, w, h), title))
+}
+
+/// A window's screen rectangle as `(x, y, width, height)`, paired with its
+/// title -- what `screencapture -R` needs plus what the caller records.
+type WindowRect = ((i32, i32, i32, i32), String);
 
 /// Window ids are synthesized as `(pid << 32) | one_based_index`.
 ///
@@ -78,6 +151,39 @@ fn escape(s: &str) -> String {
 }
 
 /// Run an AppleScript and return its trimmed stdout.
+/// Arguments for a rectangle capture, minus the destination path.
+///
+/// Split out so the flag set is unit-testable off a Mac: `-x` (no shutter
+/// sound), `-o` (no window shadow in the frame), `-C` excluded deliberately --
+/// the cursor is noise to a vision model and moves between otherwise identical
+/// frames, which would defeat change detection.
+fn screencapture_args(x: i32, y: i32, w: i32, h: i32) -> Vec<String> {
+    vec![
+        "-x".to_string(),
+        "-o".to_string(),
+        "-R".to_string(),
+        format!("{x},{y},{w},{h}"),
+    ]
+}
+
+/// Read width/height straight out of a PNG's IHDR chunk.
+///
+/// Cheaper and smaller than pulling in a decoder for two numbers: the header is
+/// at a fixed offset in every valid PNG, and anything that does not start with
+/// the magic is rejected rather than guessed at.
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" {
+        return None;
+    }
+    // Bytes 16..24 are IHDR's width and height, big-endian.
+    let w = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+    let h = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some((w, h))
+}
+
 fn osascript(script: &str) -> Result<String, PalError> {
     let mut child = Command::new("osascript")
         .arg("-")
@@ -395,6 +501,75 @@ end tell
             .map_err(|e| PalError::Backend(format!("pmset: {e}")))
     }
 
+    fn capture_window(
+        &self,
+        window_id: Option<u64>,
+        max_width: u32,
+    ) -> Result<CapturedImage, PalError> {
+        // Window ids here are (pid, index) pairs, not CoreGraphics window ids,
+        // so `screencapture -l` -- which wants a CGWindowID -- is unavailable.
+        // The bounds ARE reachable through the same Accessibility API every
+        // other method uses, so capture the screen rectangle the window
+        // occupies instead.
+        //
+        // The honest limitation: `-R` captures the SCREEN region, so anything
+        // overlapping the target is included. For the focused window (the
+        // ambient index's only real caller) that is almost always nothing, but
+        // it is a region grab wearing a window grab's name and should be read
+        // that way.
+        let (rect, title) = self.window_rect(window_id)?;
+        let (x, y, w, h) = rect;
+        if w <= 0 || h <= 0 {
+            return Err(PalError::Backend(format!(
+                "window has no area ({w}x{h}); it is probably minimized"
+            )));
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "oracle-capture-{}-{}.png",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let out = Command::new("screencapture")
+            .args(screencapture_args(x, y, w, h))
+            .arg(&path)
+            .output()
+            .map_err(|e| PalError::Backend(format!("screencapture: {e}")))?;
+
+        // Read and delete before inspecting status, so a partial failure never
+        // leaves a screenshot of the user's desktop sitting in /tmp.
+        let bytes = std::fs::read(&path).ok();
+        let _ = std::fs::remove_file(&path);
+
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(PalError::Backend(format!(
+                "screencapture failed: {err} — Screen Recording may not be granted \
+                 (System Settings → Privacy & Security → Screen Recording)"
+            )));
+        }
+        let bytes = bytes.ok_or_else(|| {
+            PalError::Backend(
+                "screencapture wrote no file — Screen Recording is likely not granted".into(),
+            )
+        })?;
+        let (pw, ph) = png_dimensions(&bytes).ok_or_else(|| {
+            PalError::Backend("screencapture produced something that is not a PNG".into())
+        })?;
+
+        // No downscale here: shrinking would mean decoding the PNG, and the
+        // caller decodes anyway. `max_width` is documented as a hint for
+        // exactly this case.
+        let _ = max_width;
+        Ok(super::capture::finish_png(
+            window_id.unwrap_or(0),
+            title,
+            bytes,
+            pw,
+            ph,
+        ))
+    }
+
     fn read_ui_tree(
         &self,
         window_id: Option<u64>,
@@ -639,6 +814,76 @@ fn parse_ui_lines(raw: &str) -> Vec<UiElement> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rect_line_parses_into_bounds_and_title() {
+        let (rect, title) = parse_window_rect("100\t200\t1280\t720\tmain.rs — oracle").unwrap();
+        assert_eq!(rect, (100, 200, 1280, 720));
+        assert_eq!(title, "main.rs — oracle");
+    }
+
+    #[test]
+    fn a_title_containing_tabs_survives_parsing() {
+        // Window titles are attacker-controllable, and a tab in one would
+        // otherwise truncate the title or shift the fields.
+        let (rect, title) = parse_window_rect("0\t0\t10\t10\ta\tb\tc").unwrap();
+        assert_eq!(rect, (0, 0, 10, 10));
+        assert_eq!(title, "a\tb\tc");
+    }
+
+    #[test]
+    fn a_window_with_no_title_still_parses() {
+        let (_, title) = parse_window_rect("0\t0\t10\t10").unwrap();
+        assert_eq!(title, "");
+    }
+
+    #[test]
+    fn garbage_from_osascript_is_rejected_rather_than_guessed_at() {
+        assert!(parse_window_rect("").is_none());
+        assert!(parse_window_rect("not\ta\trect\tat all").is_none());
+        assert!(parse_window_rect("1\t2").is_none());
+    }
+
+    #[test]
+    fn negative_coordinates_parse() {
+        // A window on a display left of or above the primary has negative
+        // origin coordinates; screencapture -R accepts them.
+        let (rect, _) = parse_window_rect("-1920\t-300\t800\t600\tx").unwrap();
+        assert_eq!(rect, (-1920, -300, 800, 600));
+    }
+
+    #[test]
+    fn screencapture_args_are_silent_shadowless_and_cursorless() {
+        let a = screencapture_args(10, 20, 300, 400);
+        assert!(a.contains(&"-x".to_string()), "no shutter sound");
+        assert!(a.contains(&"-o".to_string()), "no window shadow");
+        assert_eq!(a[a.len() - 1], "10,20,300,400");
+        // -C would burn the mouse cursor into the frame. That moves between
+        // otherwise identical screens and would defeat change detection.
+        assert!(!a.contains(&"-C".to_string()));
+    }
+
+    #[test]
+    fn png_dimensions_reads_the_ihdr() {
+        // A minimal valid PNG header: magic, then IHDR length+type, then 8x8.
+        let mut png = Vec::from(*b"\x89PNG\r\n\x1a\n");
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&1920u32.to_be_bytes());
+        png.extend_from_slice(&1080u32.to_be_bytes());
+        assert_eq!(png_dimensions(&png), Some((1920, 1080)));
+    }
+
+    #[test]
+    fn something_that_is_not_a_png_has_no_dimensions() {
+        // screencapture writes nothing when Screen Recording is denied; a
+        // truncated or empty file must not be read as a zero-sized image.
+        assert_eq!(png_dimensions(b"not a png at all......."), None);
+        assert_eq!(png_dimensions(&[]), None);
+        let mut zero = Vec::from(*b"\x89PNG\r\n\x1a\n");
+        zero.extend_from_slice(&[0u8; 16]);
+        assert_eq!(png_dimensions(&zero), None, "0x0 is not a usable capture");
+    }
 
     #[test]
     fn window_id_roundtrips() {

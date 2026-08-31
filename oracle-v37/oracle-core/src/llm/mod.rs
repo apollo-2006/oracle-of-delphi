@@ -79,6 +79,33 @@ impl LlmRequest {
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
+    /// Images attached to this message, as `data:` URIs.
+    ///
+    /// Empty for every text-only turn, which is all of them outside the ambient
+    /// index — so the wire format stays exactly as it was unless a caller
+    /// actually attaches something. A backend without vision ignores these; the
+    /// only one that sets them is the VLM tier.
+    pub images: Vec<String>,
+}
+
+impl ChatMessage {
+    /// A text-only message — the overwhelmingly common case.
+    pub fn text(role: Role, content: impl Into<String>) -> Self {
+        ChatMessage {
+            role,
+            content: content.into(),
+            images: Vec::new(),
+        }
+    }
+
+    /// A message carrying one image, given as raw PNG bytes.
+    pub fn with_png(role: Role, content: impl Into<String>, png_b64: &str) -> Self {
+        ChatMessage {
+            role,
+            content: content.into(),
+            images: vec![format!("data:image/png;base64,{png_b64}")],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

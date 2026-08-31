@@ -182,6 +182,22 @@ impl<P: Platform> Daemon<P> {
                 .platform
                 .lock_screen()
                 .map(|_| json!({ "locked": true })),
+            ActRequest::CaptureWindow {
+                window_id,
+                max_width,
+            } => {
+                // Clamp the scale hint. The floor stops a caller asking for a
+                // 1px image the model cannot read; the ceiling stops one asking
+                // for an unscaled 4K frame, which is ~32 MB of pixels and a
+                // 40 MB base64 payload on a line-framed socket.
+                let width = max_width.unwrap_or(1024).clamp(64, 2048);
+                self.platform.capture_window(window_id, width).map(|img| {
+                    // The image itself is deliberately NOT logged or echoed
+                    // anywhere but the response: it is the most sensitive thing
+                    // this daemon can produce.
+                    json!({ "image": img })
+                })
+            }
             ActRequest::ReadUiTree {
                 window_id,
                 max_depth,
@@ -233,6 +249,7 @@ fn op_name(req: &ActRequest) -> &'static str {
         ActRequest::WindowOp { .. } => "window_op",
         ActRequest::LockScreen => "lock_screen",
         ActRequest::ReadUiTree { .. } => "read_ui_tree",
+        ActRequest::CaptureWindow { .. } => "capture_window",
         ActRequest::InvokeElement { .. } => "invoke_element",
         ActRequest::ShellExec { .. } => "shell_exec",
         ActRequest::SetLockdown { .. } => "set_lockdown",

@@ -38,6 +38,10 @@ rumqttc = "0.24"
 # its own frontend — no separate web server, no Tauri. Debug builds read the
 # folder from disk (hot reload); release builds bake it into the .exe.
 rust-embed = { version = "8", features = ["debug-embed"] }
+# PNG decoding for the ambient index: frames arrive encoded from actd and are
+# reduced to a perceptual hash before anything decides to spend a model on them.
+# Decoder only -- oracle-actd owns the encoding side.
+png = "0.17"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
@@ -45,3 +49,6 @@ tokio-tungstenite = "0.24"
 async-trait = "0.1"
 # For the end-to-end OS-tools test: spin up a real actd server over a socket.
 oracle-actd = { path = "../oracle-actd" }
+# The vector-space and migration tests need a real file: ":memory:" cannot be
+# closed and reopened with a different embedder, which is the whole scenario.
+tempfile = "3"

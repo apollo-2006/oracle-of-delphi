@@ -1,7 +1,40 @@
-# Windows-native profile for Oracle of Delphi
-# Place at %APPDATA%\oracle\oracle.toml (or pass --config).
-# Uses a named pipe for the actd link, the E:\oracle-models store, and the
-# specific capture/output devices on this machine.
+# Oracle of Delphi — Windows profile with the AMBIENT STACK TURNED ON.
+#
+# This is `oracle.windows.toml` with four subsystems enabled. Copy it to
+#   %APPDATA%\oracle\oracle.toml
+# (Roaming — NOT %LOCALAPPDATA%; build-app.ps1 warns about exactly this) and
+# check it before launching:
+#   .\target\release\oracle-core.exe check-config --config "$env:APPDATA\oracle\oracle.toml"
+#
+# ── BEFORE THIS WILL START ───────────────────────────────────────────────────
+# Three GGUFs must exist at the paths in [supervise]. Two are NEW downloads:
+#
+#   1. A vision model + its projector, for the ambient index. Any llama.cpp-
+#      supported VLM works; the args below assume Qwen3-VL-2B. You need BOTH
+#      the model AND its -mmproj file — a VLM without the projector loads fine
+#      and is simply blind, which is a confusing way to fail.
+#   2. BGE-small, for semantic recall.
+#
+# The filenames below are what this file expects. Either name your downloads to
+# match, or edit the paths — a wrong path shows up as a supervised child that
+# restart-loops in %LOCALAPPDATA%\oracle\run\llm-small.log.
+#
+# ── TESTING IN STAGES ────────────────────────────────────────────────────────
+# Everything is on here, which is a lot of new surface at once. To bisect a
+# problem, flip these back to false and re-enable one at a time, in this order:
+#
+#   [llm.small] enabled          + supervise.autostart_small_llm
+#   [memory.embedder] enabled    + supervise.autostart_embedder
+#   [ambient] enabled
+#   [consolidate] enabled
+#
+# Each later stage depends on an earlier one, and config validation enforces it:
+# ambient and consolidate both refuse to start without [llm.small].
+#
+# ── PORTS ────────────────────────────────────────────────────────────────────
+# Three llama.cpp servers, three ports: 8080 planner, 8081 vision, 8082
+# embeddings. Sharing any two is rejected at load, because the failure is
+# otherwise silent.
 
 [general]
 # On Windows, a writable per-user runtime dir. %LOCALAPPDATA%\oracle works well.
@@ -36,7 +69,7 @@ model_dir = "E:\\oracle-models"
 # silent (the small tier's requests get answered by the 14B and nothing looks
 # wrong except the VRAM).
 [llm.small]
-enabled = false                      # flip on once the GGUF is downloaded
+enabled = true                       # needs the VLM + mmproj below
 backend = "http://127.0.0.1:8081"
 model = "qwen3-vl-2b-instruct-q4_k_m"
 max_tokens = 512
@@ -65,7 +98,7 @@ recall_min_score = 0.15
 # existing row vector-stale (they stay reachable by keyword). Startup prints how
 # many, so a switch is visible rather than felt as "she forgot everything".
 [memory.embedder]
-enabled = false                      # flip on once the GGUF is downloaded
+enabled = true                       # needs the BGE gguf below
 backend = "http://127.0.0.1:8082"    # a THIRD port; not shared with either LLM
 model = "bge-small-en-v1.5"
 dim = 384                            # must match the model; a mismatch is refused
@@ -83,7 +116,7 @@ dim = 384                            # must match the model; a mismatch is refus
 # Frames are never written to disk. They live in a bounded in-memory queue, go
 # to the model, and are dropped. What persists is the text.
 [ambient]
-enabled = false
+enabled = true
 sample_secs = 45              # capture is cheap; the change filter drops most
 interpret_poll_secs = 5
 max_width = 1024              # what the VLM sees; smaller loses small text
@@ -114,7 +147,7 @@ own_vram_mb = 3000            # our own resident footprint, not foreign pressure
 # Runs only in the idle work window -- a fact learned an hour late is the same
 # fact. Requires [llm.small].
 [consolidate]
-enabled = false
+enabled = true
 poll_secs = 300
 batch_size = 12               # facts spanning a few entries stay visible together
 max_tokens = 400
@@ -192,7 +225,7 @@ llm_args = [
 # --- Small/vision tier server ---
 # The same llama-server binary, a different model, a different port. Leave
 # small_llm_program empty to reuse llm_program above.
-autostart_small_llm = false
+autostart_small_llm = true
 small_llm_program = ""
 small_llm_args = [
   "-m", "E:\\oracle-models\\qwen3-vl-2b-instruct-q4_k_m.gguf",
@@ -208,7 +241,7 @@ small_llm_ready_timeout_secs = 60
 # The same llama-server binary again, serving BGE with --embedding on port 8082.
 # --pooling mean is what BGE expects; without it the vectors are subtly wrong
 # rather than absent, which is the hard kind of wrong to notice.
-autostart_embedder = false
+autostart_embedder = true
 embedder_program = ""
 embedder_args = [
   "-m", "E:\\oracle-models\\bge-small-en-v1.5-q8_0.gguf",

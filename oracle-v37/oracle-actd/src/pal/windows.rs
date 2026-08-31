@@ -12,9 +12,14 @@
 mod uia;
 
 use super::{PalError, Platform};
-use oracle_ipc::actd::{MediaKey, ProcInfo, UiElement, WindowInfo, WindowOp};
+use oracle_ipc::actd::{CapturedImage, MediaKey, ProcInfo, UiElement, WindowInfo, WindowOp};
 use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, RECT};
 use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows_sys::Win32::Graphics::Gdi::{
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
+    SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HALFTONE,
+    SRCCOPY,
+};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
@@ -112,6 +117,120 @@ unsafe fn is_cloaked(hwnd: HWND) -> bool {
         std::mem::size_of::<u32>() as u32,
     );
     hr == 0 && cloaked != 0
+}
+
+/// A window's title, or empty when it has none.
+fn window_title(hwnd: HWND) -> String {
+    let mut buf = [0u16; 512];
+    let len = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+    if len <= 0 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buf[..len as usize])
+}
+
+/// Blit a window into a top-down 32-bit DIB and return it as RGBA.
+///
+/// # Safety
+/// `hwnd` must be a live window handle; the caller re-resolves it first.
+unsafe fn blit_window_rgba(
+    hwnd: HWND,
+    src_w: i32,
+    src_h: i32,
+    dst_w: i32,
+    dst_h: i32,
+) -> Result<Vec<u8>, PalError> {
+    // The screen DC is the source. Capturing from the screen (rather than
+    // PrintWindow) means an occluded window yields whatever is actually on
+    // top -- which is what the user is looking at, and what the ambient index
+    // should record. It also means a fully covered window captures the covering
+    // one; the caller only ever asks for the foreground window, where that is
+    // not a distinction.
+    let screen_dc = GetDC(std::ptr::null_mut());
+    if screen_dc.is_null() {
+        return Err(PalError::Backend("GetDC(NULL) failed".into()));
+    }
+
+    // Everything below must release its handles on every exit path, so the
+    // body is a closure and cleanup is unconditional. GDI handles are a
+    // process-wide finite resource: leaking a few per capture, several times a
+    // minute, exhausts the desktop heap in hours.
+    let result = (|| {
+        let mem_dc = CreateCompatibleDC(screen_dc);
+        if mem_dc.is_null() {
+            return Err(PalError::Backend("CreateCompatibleDC failed".into()));
+        }
+
+        let mut info: BITMAPINFO = std::mem::zeroed();
+        info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        info.bmiHeader.biWidth = dst_w;
+        // Negative height requests a TOP-DOWN DIB. Without this the rows come
+        // back bottom-up and every capture is vertically mirrored -- which a
+        // vision model will describe with total confidence.
+        info.bmiHeader.biHeight = -dst_h;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB as u32;
+
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let dib = CreateDIBSection(
+            mem_dc,
+            &info,
+            DIB_RGB_COLORS,
+            &mut bits,
+            std::ptr::null_mut(),
+            0,
+        );
+        if dib.is_null() || bits.is_null() {
+            DeleteDC(mem_dc);
+            return Err(PalError::Backend("CreateDIBSection failed".into()));
+        }
+
+        let old = SelectObject(mem_dc, dib as _);
+        // HALFTONE is the box filter; without it StretchBlt point-samples and
+        // small text turns to noise on the way down.
+        SetStretchBltMode(mem_dc, HALFTONE as i32);
+
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        let ok = if GetWindowRect(hwnd, &mut rect) != 0 {
+            StretchBlt(
+                mem_dc, 0, 0, dst_w, dst_h, screen_dc, rect.left, rect.top, src_w, src_h, SRCCOPY,
+            ) != 0
+        } else {
+            false
+        };
+
+        let out = if ok {
+            let n = (dst_w as usize) * (dst_h as usize) * 4;
+            let src = std::slice::from_raw_parts(bits as *const u8, n);
+            // GDI gives BGRA; the wire format is RGBA. The alpha byte from a
+            // screen blit is meaningless (usually 0), so force it opaque --
+            // leaving it would encode a fully transparent PNG.
+            let mut rgba = Vec::with_capacity(n);
+            for px in src.chunks_exact(4) {
+                rgba.push(px[2]);
+                rgba.push(px[1]);
+                rgba.push(px[0]);
+                rgba.push(255);
+            }
+            Ok(rgba)
+        } else {
+            Err(PalError::Backend("StretchBlt failed".into()))
+        };
+
+        SelectObject(mem_dc, old);
+        DeleteObject(dib as _);
+        DeleteDC(mem_dc);
+        out
+    })();
+
+    ReleaseDC(std::ptr::null_mut(), screen_dc);
+    result
 }
 
 impl Platform for WindowsPlatform {
@@ -309,6 +428,62 @@ impl Platform for WindowsPlatform {
             MediaKey::Mute => (VK_VOLUME_MUTE, 1),
         };
         tap_vk(vk, times)
+    }
+
+    fn capture_window(
+        &self,
+        window_id: Option<u64>,
+        max_width: u32,
+    ) -> Result<CapturedImage, PalError> {
+        let hwnd = match window_id {
+            Some(id) => {
+                let h = id as HWND;
+                // Re-resolve rather than trusting the id: a stale handle passed
+                // to GDI is not an error, it is undefined behaviour.
+                if !self.list_windows()?.iter().any(|w| w.id == id) {
+                    return Err(PalError::NoWindow(id));
+                }
+                h
+            }
+            None => unsafe { GetForegroundWindow() },
+        };
+        if hwnd.is_null() {
+            return Err(PalError::Backend("no foreground window".into()));
+        }
+
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+            return Err(PalError::Backend("GetWindowRect failed".into()));
+        }
+        let src_w = rect.right - rect.left;
+        let src_h = rect.bottom - rect.top;
+        if src_w <= 0 || src_h <= 0 {
+            return Err(PalError::Backend(format!(
+                "window has no area ({src_w}x{src_h}); it is probably minimized"
+            )));
+        }
+
+        // Scale during the blit. StretchBlt with HALFTONE does the box filter in
+        // GDI, so a 4K window becomes a 768px image without ever materializing
+        // 32 MB of pixels or shipping them over the socket.
+        let (dst_w, dst_h) = super::capture::scaled_dims(src_w, src_h, max_width);
+
+        let title = window_title(hwnd);
+        let rgba = unsafe { blit_window_rgba(hwnd, src_w, src_h, dst_w, dst_h) }?;
+        super::capture::finish(
+            hwnd as u64,
+            title,
+            &rgba,
+            dst_w as u32,
+            dst_h as u32,
+            // Already scaled; passing 0 tells the helper not to scale again.
+            0,
+        )
     }
 
     fn read_ui_tree(

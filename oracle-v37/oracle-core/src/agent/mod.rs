@@ -437,10 +437,10 @@ impl Agent {
         let user_wants_action = looks_actionable(&user_text);
         let user_text_for_memory = user_text.clone();
         let mut messages = history;
-        messages.push(crate::llm::ChatMessage {
-            role: crate::llm::Role::User,
-            content: user_text,
-        });
+        messages.push(crate::llm::ChatMessage::text(
+            crate::llm::Role::User,
+            user_text,
+        ));
         let manifest = self.tools.manifest();
         // The grammar (built from the registered tool names) and the tool docs +
         // protocol block appended to the system prompt. Together they make the
@@ -595,16 +595,10 @@ impl Agent {
 }
 
 fn assistant_msg(text: &str) -> crate::llm::ChatMessage {
-    crate::llm::ChatMessage {
-        role: crate::llm::Role::Assistant,
-        content: text.to_string(),
-    }
+    crate::llm::ChatMessage::text(crate::llm::Role::Assistant, text)
 }
 fn tool_msg(text: &str) -> crate::llm::ChatMessage {
-    crate::llm::ChatMessage {
-        role: crate::llm::Role::Tool,
-        content: text.to_string(),
-    }
+    crate::llm::ChatMessage::text(crate::llm::Role::Tool, text)
 }
 
 /// Injected when the model tries to end an action request having called no tool.

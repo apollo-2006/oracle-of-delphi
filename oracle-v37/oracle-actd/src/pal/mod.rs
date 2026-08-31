@@ -8,8 +8,9 @@
 //! generic over [`Platform`], so the same policy/RPC/audit code runs on any
 //! backend.
 
-use oracle_ipc::actd::{ProcInfo, UiElement, WindowInfo};
+use oracle_ipc::actd::{CapturedImage, ProcInfo, UiElement, WindowInfo};
 
+pub mod capture;
 pub mod mock;
 
 #[cfg(target_os = "linux")]
@@ -40,6 +41,8 @@ pub enum PalError {
     InjectionBlocked(String),
     #[error("backend error: {0}")]
     Backend(String),
+    #[error("not supported on this platform: {0}")]
+    Unsupported(&'static str),
 }
 
 /// The OS operations the daemon needs. Kept small and synchronous; the RPC
@@ -68,6 +71,18 @@ pub trait Platform: Send + Sync {
         window_id: Option<u64>,
         max_depth: u32,
     ) -> Result<Vec<UiElement>, PalError>;
+    /// Capture a window's pixels (or the foreground window when `window_id` is
+    /// None) as a PNG, scaled so its width does not exceed `max_width`.
+    ///
+    /// No default implementation on purpose: a backend that silently returned
+    /// a blank image would make the ambient index quietly useless, so each
+    /// platform has to say either how it captures or that it cannot.
+    fn capture_window(
+        &self,
+        window_id: Option<u64>,
+        max_width: u32,
+    ) -> Result<CapturedImage, PalError>;
+
     /// Invoke (synthetic click / default action) the first element whose name
     /// matches `name` (and, if given, whose control type matches
     /// `control_type`) in the given window (or the foreground window). Returns

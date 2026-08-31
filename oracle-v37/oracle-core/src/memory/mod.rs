@@ -15,7 +15,7 @@ pub mod embed;
 pub mod graph;
 pub mod store;
 
-pub use embed::{Embedder, HashEmbedder};
+pub use embed::{Embedder, HashEmbedder, HttpEmbedder, EMBED_DIM, HASH_SPACE};
 pub use graph::{Edge, KnowledgeGraph};
 pub use store::{Episode, EpisodeKind, MemoryStore, RetrievedItem};
 

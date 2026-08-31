@@ -20,7 +20,6 @@ use oracle_core::agent::{Agent, AgentConfig, AgentEvent};
 use oracle_core::config::Config;
 use oracle_core::gateway::server::HudGateway;
 use oracle_core::lifecycle::{install_signal_handlers, SessionSnapshot, ShutdownController};
-use oracle_core::llm::{LlamaServer, Llm, MockLlm};
 use oracle_core::observ::{LatencyRecorder, Stage};
 use oracle_core::supervisor::{ChildSpec, Supervisor};
 use oracle_core::{demo_registry, Shared};
@@ -312,10 +311,11 @@ async fn already_running(bind: &str) -> bool {
 
 /// Build and start the process supervisor from config: the LLM server and the
 /// actd daemon, each launched hidden and kept alive until core shuts down.
-fn start_supervisor(cfg: &Config) -> (Supervisor, Option<oracle_core::supervisor::ChildHandle>) {
+fn start_supervisor(cfg: &Config) -> SupervisedLlms {
     let mut sup = Supervisor::new(CancellationToken::new());
     let rt = PathBuf::from(&cfg.general.runtime_dir);
     let mut llm_handle = None;
+    let mut small_handle = None;
 
     if cfg.supervise.autostart_llm {
         if cfg.supervise.llm_program.trim().is_empty() {
@@ -339,6 +339,64 @@ fn start_supervisor(cfg: &Config) -> (Supervisor, Option<oracle_core::supervisor
         println!(
             "[oracle] LLM autostart is OFF (supervise.autostart_llm=false) — start llama-server yourself, or set it true in oracle.toml"
         );
+    }
+
+    // The small/vision tier: a second llama-server, its own model, its own port.
+    // Only launched when the tier is actually enabled — supervising a server for
+    // a tier nothing will call is 2.5 GB of VRAM held for nothing.
+    if cfg.supervise.autostart_small_llm {
+        if !cfg.llm.small.enabled {
+            println!(
+                "[oracle] supervise.autostart_small_llm=true but [llm.small] enabled=false — NOT launching the small tier"
+            );
+        } else {
+            // Empty small_llm_program means "the same llama-server binary",
+            // which is the usual case: one build, two models, two ports.
+            let program = if cfg.supervise.small_llm_program.trim().is_empty() {
+                cfg.supervise.llm_program.clone()
+            } else {
+                cfg.supervise.small_llm_program.clone()
+            };
+            println!(
+                "[oracle] launching small-tier LLM server: {} {}",
+                program,
+                cfg.supervise.small_llm_args.join(" ")
+            );
+            small_handle = Some(sup.supervise(ChildSpec {
+                name: "llm-small".into(),
+                program,
+                args: cfg.supervise.small_llm_args.clone(),
+                log_path: rt.join("llm-small.log"),
+            }));
+        }
+    }
+
+    // The embedding sidecar: a third llama.cpp server, serving BGE with
+    // --embedding. Same reasoning as the small tier -- only launched when the
+    // thing that would call it is actually on.
+    if cfg.supervise.autostart_embedder {
+        if !cfg.memory.embedder.enabled {
+            println!(
+                "[oracle] supervise.autostart_embedder=true but [memory.embedder] enabled=false — NOT launching the embedder"
+            );
+        } else {
+            let program = if cfg.supervise.embedder_program.trim().is_empty() {
+                cfg.supervise.llm_program.clone()
+            } else {
+                cfg.supervise.embedder_program.clone()
+            };
+            println!(
+                "[oracle] launching embedding sidecar: {} {}",
+                program,
+                cfg.supervise.embedder_args.join(" ")
+            );
+            sup.supervise(ChildSpec {
+                name: "embedder".into(),
+                program,
+                args: cfg.supervise.embedder_args.clone(),
+                log_path: rt.join("embedder.log"),
+            });
+        }
     }
 
     if cfg.supervise.autostart_actd {
@@ -372,9 +430,23 @@ fn start_supervisor(cfg: &Config) -> (Supervisor, Option<oracle_core::supervisor
     // lifecycle, with a health poll. See the run loop.
 
     if !sup.is_empty() {
-        tracing::info!("supervisor managing the LLM server and/or actd daemon");
+        tracing::info!("supervisor managing the LLM server(s) and/or actd daemon");
     }
-    (sup, llm_handle)
+    SupervisedLlms {
+        supervisor: sup,
+        big: llm_handle,
+        small: small_handle,
+    }
+}
+
+/// What `start_supervisor` hands back: the supervisor plus one child handle per
+/// model tier. Named rather than a 3-tuple because the two handles are the same
+/// type and swapping them would unload the wrong model — a bug that would look
+/// like "the small tier keeps dying" and be very hard to read back from logs.
+struct SupervisedLlms {
+    supervisor: Supervisor,
+    big: Option<oracle_core::supervisor::ChildHandle>,
+    small: Option<oracle_core::supervisor::ChildHandle>,
 }
 
 /// Reap any orphaned `oracle-actd` still holding the named pipe, so the fresh
@@ -726,19 +798,45 @@ fn open_in_browser(url: &str) {
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
-fn build_llm(cfg: &Config) -> Arc<dyn Llm> {
-    if cfg.llm.backend == "mock" {
-        eprintln!("[oracle] LLM backend: mock (offline)");
-        Arc::new(MockLlm::demo())
-    } else {
+/// Choose the embedder: the BGE sidecar when configured, else the offline
+/// hash embedder.
+///
+/// Note this does NOT probe the sidecar. A store that opened against a
+/// temporarily-down embedder is still correct — its writes fail loudly and its
+/// reads fall back to keyword — whereas refusing to start the assistant because
+/// an auxiliary server is slow to boot would be a much worse trade.
+fn build_embedder(cfg: &Config) -> Box<dyn oracle_core::memory::Embedder> {
+    let e = &cfg.memory.embedder;
+    if e.enabled {
         eprintln!(
-            "[oracle] LLM backend: {} (model {})",
-            cfg.llm.backend, cfg.llm.model
+            "[oracle] embedder: {} at {} ({}d) — retrieval is semantic",
+            e.model, e.backend, e.dim
         );
-        Arc::new(LlamaServer::new(
-            cfg.llm.backend.clone(),
-            cfg.llm.model.clone(),
+        Box::new(oracle_core::memory::HttpEmbedder::new(
+            e.backend.clone(),
+            e.model.clone(),
+            e.dim,
         ))
+    } else {
+        eprintln!("[oracle] embedder: offline hash (lexical retrieval only)");
+        Box::new(oracle_core::memory::HashEmbedder::default())
+    }
+}
+
+/// Say so when memories exist in a vector space the current embedder cannot
+/// compare against.
+///
+/// This is the first run after switching embedders, and without a word here it
+/// presents as "she forgot everything" — the rows are all still there, they are
+/// simply unreachable by similarity until something re-embeds them.
+fn report_stale_memory(shared: &Shared) {
+    match shared.memory.stale_space_count() {
+        Ok(0) => {}
+        Ok(n) => println!(
+            "[oracle] {n} memories were written by a different embedder — reachable by keyword, \
+             not by meaning, until they are re-embedded"
+        ),
+        Err(e) => tracing::warn!(error = %e, "could not count stale memories"),
     }
 }
 
@@ -814,14 +912,30 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
 
     // Self-supervision: bring up the LLM server and actd as hidden background
     // children so the whole assistant starts from one launch, no terminals.
-    let (supervisor, llm_child) = start_supervisor(&cfg);
+    let supervised = start_supervisor(&cfg);
+    let supervisor = supervised.supervisor;
 
-    // Idle unload: give the GPU back between conversations. See oracle_core::idle.
-    let llm_life = Arc::new(oracle_core::idle::LlmLifecycle::new(
-        llm_child,
-        &cfg.llm.backend,
-        std::time::Duration::from_secs(cfg.supervise.llm_ready_timeout_secs),
+    // Two model tiers behind one handle: the on-demand 14B planner and the
+    // resident small/vision model. See oracle_core::tiers for why the split
+    // exists and why `small()` is an Option rather than a fallback.
+    let tiers = Arc::new(oracle_core::tiers::LlmTiers::new(
+        &cfg,
+        supervised.big,
+        supervised.small,
     ));
+    if tiers.small_enabled() {
+        println!(
+            "[oracle] small tier enabled ({}) — resident, does the background work",
+            cfg.llm.small.model
+        );
+    }
+
+    // Idle unload: give the GPU back between conversations. This is the BIG
+    // tier's lifecycle — the small model is resident by design and must not be
+    // unloaded with it. See oracle_core::idle.
+    let llm_life = tiers
+        .lifecycle(oracle_core::tiers::Tier::Big)
+        .expect("the planner tier always exists");
     let idle_tracker = Arc::new(oracle_core::idle::IdleTracker::new(
         chrono::Utc::now().timestamp(),
         cfg.supervise.idle_unload_secs,
@@ -848,13 +962,14 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let actd = connect_actd(&cfg, cfg.supervise.autostart_actd).await;
     let actd_up = actd.is_some();
     let shared = Arc::new(
-        Shared::open(&cfg.memory.db_path)?
+        Shared::open_with_embedder(&cfg.memory.db_path, build_embedder(&cfg))?
             .with_google(load_google(&cfg))
             .with_actd(actd)
             .with_browser(cfg.browser.to_browser_config())
             .with_confirmer(confirmer.clone()),
     );
-    let llm = build_llm(&cfg);
+    report_stale_memory(&shared);
+    let llm = tiers.big();
     // Arc so each HUD-driven turn can run on its own task.
     let google_for_proactive = shared.google.clone();
     let agent_shared = shared.clone();
@@ -862,7 +977,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // The away briefing. Shares the LLM handle with the agent -- one model,
     // loaded once -- and reads the same event log the proactive loop writes.
     let briefer = Arc::new(Briefer {
-        llm: build_llm(&cfg),
+        llm: tiers.big(),
         shared: agent_shared.clone(),
         google: agent_shared.google.clone(),
         cfg: cfg.briefing.clone(),
@@ -1012,6 +1127,87 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         turn_busy.clone(),
         proactive_stop.clone(),
     );
+    // The ambient index: capture the screen, read it with the resident vision
+    // model, and make what it saw searchable. Two tasks with a bounded queue
+    // between them -- see oracle_core::ambient for why they are separate.
+    // One work window shared by every background consumer: they must agree on
+    // whether the GPU is free, and two probes would poll `rocm-smi` twice to
+    // reach the same answer.
+    let work_window = Arc::new(oracle_core::workwindow::WorkWindow::new(
+        idle_tracker.clone(),
+        turn_busy.clone(),
+        Box::new(oracle_core::workwindow::SmiGpuProbe::new(
+            cfg.workwindow.own_vram_mb,
+        )),
+        cfg.workwindow.after_secs,
+        cfg.workwindow.foreign_vram_budget_mb,
+        true,
+    ));
+
+    if cfg.ambient.enabled {
+        match tiers.small() {
+            Some(vlm) => {
+                let queue = Arc::new(oracle_core::ambient::FrameQueue::new(cfg.ambient.queue_len));
+                let window = work_window.clone();
+                oracle_core::ambient::spawn_sampler(
+                    cfg.ambient.clone(),
+                    agent_shared.clone(),
+                    queue.clone(),
+                    turn_busy.clone(),
+                    proactive_stop.clone(),
+                );
+                oracle_core::ambient::spawn_interpreter(
+                    cfg.ambient.clone(),
+                    vlm,
+                    agent_shared.clone(),
+                    queue,
+                    window,
+                    proactive_stop.clone(),
+                );
+                oracle_core::ambient::spawn_retention(
+                    cfg.ambient.clone(),
+                    agent_shared.clone(),
+                    proactive_stop.clone(),
+                );
+                println!(
+                    "[oracle] ambient index on: sampling every {}s, retaining {} days",
+                    cfg.ambient.sample_secs, cfg.ambient.retain_days
+                );
+            }
+            None => {
+                // Config validation rejects this pairing, so reaching here
+                // means the tier failed to build rather than being unset.
+                println!("[oracle] ambient index is on but the vision tier is unavailable — not sampling");
+            }
+        }
+    }
+
+    // Consolidation: lift durable facts out of episodes and into the knowledge
+    // graph before the episodes expire. Idle-window only -- a fact learned an
+    // hour late is the same fact.
+    if cfg.consolidate.enabled {
+        match tiers.small() {
+            Some(small) => {
+                oracle_core::consolidate::spawn(
+                    cfg.consolidate.clone(),
+                    small,
+                    agent_shared.clone(),
+                    work_window.clone(),
+                    proactive_stop.clone(),
+                );
+                match agent_shared.memory.unconsolidated_count() {
+                    Ok(n) if n > 0 => println!(
+                        "[oracle] consolidation on: {n} episodes pending promotion to the graph"
+                    ),
+                    _ => println!("[oracle] consolidation on"),
+                }
+            }
+            None => println!(
+                "[oracle] consolidation is on but the small tier is unavailable — not running"
+            ),
+        }
+    }
+
     if cfg.proactive.enabled {
         spawn_proactive(
             cfg.proactive.clone(),
@@ -1058,13 +1254,13 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
                 use oracle_core::llm::{ChatMessage, Role};
                 let est = |s: &str| s.len() / 4 + 4; // ~4 chars/token, +4 framing
                 history_tokens += est(&user_text);
-                history.push(ChatMessage { role: Role::User, content: user_text });
+                history.push(ChatMessage::text(Role::User, user_text));
                 if let Some(trace) = tool_trace {
                     history_tokens += est(&trace);
-                    history.push(ChatMessage { role: Role::Tool, content: trace });
+                    history.push(ChatMessage::text(Role::Tool, trace));
                 }
                 history_tokens += est(&reply);
-                history.push(ChatMessage { role: Role::Assistant, content: reply });
+                history.push(ChatMessage::text(Role::Assistant, reply));
                 // Drop oldest messages until we're back under budget.
                 while history_tokens > HISTORY_TOKEN_BUDGET && !history.is_empty() {
                     let m = history.remove(0);
@@ -2481,14 +2677,17 @@ async fn repl(cfg: Config) -> anyhow::Result<()> {
     // The REPL doesn't supervise anything; connect to actd once if it's up.
     let actd = connect_actd(&cfg, false).await;
     let shared = Arc::new(
-        Shared::open(&cfg.memory.db_path)?
+        Shared::open_with_embedder(&cfg.memory.db_path, build_embedder(&cfg))?
             .with_google(load_google(&cfg))
             .with_actd(actd)
             // In the terminal, confirmations are a y/N prompt.
             .with_confirmer(Arc::new(oracle_core::confirm::StdinConfirmer)),
     );
-    let llm = build_llm(&cfg);
-    let agent = Agent::new(llm, demo_registry(), shared, agent_config(&cfg));
+    report_stale_memory(&shared);
+    // The REPL has no supervisor, so neither tier has a child handle; it only
+    // needs the planner.
+    let tiers = oracle_core::tiers::LlmTiers::new(&cfg, None, None);
+    let agent = Agent::new(tiers.big(), demo_registry(), shared, agent_config(&cfg));
     let latency = Arc::new(LatencyRecorder::new());
 
     eprintln!("[oracle] REPL ready (Ctrl-D to exit).");
