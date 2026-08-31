@@ -169,6 +169,35 @@ impl TypedTool for KgTool {
 // Workspace + IoT stand-ins (deterministic; real clients in connectors::)
 // ---------------------------------------------------------------------------
 
+#[derive(Deserialize, JsonSchema)]
+pub struct CatchUpArgs {
+    /// How far back to look, in minutes. Defaults to 120.
+    #[serde(default)]
+    pub minutes: Option<i64>,
+}
+pub struct CatchUp;
+#[async_trait]
+impl TypedTool for CatchUp {
+    type Args = CatchUpArgs;
+    const NAME: &'static str = "briefing.catch_up";
+    const DESCRIPTION: &'static str =
+        "What happened on this machine recently: builds and programs that finished \
+         or failed. Use when the user asks what they missed, what happened while \
+         they were away, or to catch them up.";
+    async fn run(&self, a: CatchUpArgs, ctx: &ToolCtx) -> ToolOutcome {
+        let minutes = a.minutes.unwrap_or(120).clamp(1, 24 * 60);
+        let since = chrono::Utc::now().timestamp() - minutes * 60;
+        let events = ctx.shared.events.since(since);
+        ToolOutcome::Ok(json!({
+            "window_minutes": minutes,
+            "events": events,
+            // Say so explicitly. Handed an empty list a model tends to invent a
+            // plausible-sounding summary rather than report nothing.
+            "nothing_happened": events.is_empty(),
+        }))
+    }
+}
+
 // --- standing orders ---------------------------------------------------------
 
 #[derive(Deserialize, JsonSchema)]
@@ -493,6 +522,7 @@ pub fn register_all(reg: &mut super::ToolRegistry) {
     reg.register(Remember)
         .register(Recall)
         .register(KgTool)
+        .register(CatchUp)
         .register(RoutineAdd)
         .register(RoutineList)
         .register(RoutineRemove)
@@ -660,5 +690,37 @@ mod tests {
             matches!(out, ToolOutcome::Err(_)),
             "must not silently report success"
         );
+    }
+
+    #[tokio::test]
+    async fn catch_up_reports_recent_events_and_says_when_there_are_none() {
+        let ctx = ctx();
+        let out = CatchUp.run(CatchUpArgs { minutes: None }, &ctx).await;
+        let ToolOutcome::Ok(v) = out else {
+            panic!("catch_up should succeed on an empty log")
+        };
+        assert_eq!(
+            v["nothing_happened"], true,
+            "must not let the model invent one"
+        );
+
+        let now = chrono::Utc::now().timestamp();
+        ctx.shared.events.record(now, "cargo just finished.");
+        let ToolOutcome::Ok(v) = CatchUp.run(CatchUpArgs { minutes: Some(60) }, &ctx).await else {
+            panic!("should succeed")
+        };
+        assert_eq!(v["nothing_happened"], false);
+        assert_eq!(v["events"][0], "cargo just finished.");
+    }
+
+    #[tokio::test]
+    async fn catch_up_ignores_events_outside_the_window() {
+        let ctx = ctx();
+        let now = chrono::Utc::now().timestamp();
+        ctx.shared.events.record(now - 7200, "old build");
+        let ToolOutcome::Ok(v) = CatchUp.run(CatchUpArgs { minutes: Some(30) }, &ctx).await else {
+            panic!("should succeed")
+        };
+        assert_eq!(v["nothing_happened"], true);
     }
 }

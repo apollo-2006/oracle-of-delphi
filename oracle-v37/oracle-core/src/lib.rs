@@ -7,6 +7,7 @@
 
 pub mod agent;
 pub mod audio;
+pub mod briefing;
 pub mod browser;
 pub mod config;
 pub mod confirm;
@@ -41,6 +42,9 @@ pub struct Shared {
     pub graph: KnowledgeGraph,
     /// Standing orders the user has asked for. Same SQLite file as memory.
     pub routines: RoutineStore,
+    /// What happened on this machine recently, for the away briefing. In memory
+    /// only: a briefing is about the last few hours, not history.
+    pub events: briefing::EventLog,
     pub ha: connectors::homeassistant::EntityMirror,
     /// Live Google client, present only when Workspace auth is configured and
     /// a sealed token was loaded. `None` → the Gmail/Calendar tools return a
@@ -64,6 +68,7 @@ impl Shared {
         let graph = KnowledgeGraph::open(db_path, KnowledgeGraph::default_vocab())?;
         let routines = RoutineStore::open(db_path)?;
         Ok(Shared {
+            events: briefing::EventLog::new(),
             memory,
             graph,
             routines,

@@ -23,6 +23,8 @@ pub struct Config {
     #[serde(default)]
     pub proactive: ProactiveConfig,
     #[serde(default)]
+    pub briefing: BriefingConfig,
+    #[serde(default)]
     pub actd: ActdConfig,
     #[serde(default)]
     pub hud: HudConfig,
@@ -534,6 +536,54 @@ fn default_repeat_after() -> i64 {
 }
 fn default_max_per_hour() -> usize {
     4
+}
+
+/// "While you were away" catch-up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BriefingConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Only brief after an absence at least this long. Below it there is
+    /// nothing to catch up on and the pause is just rude.
+    #[serde(default = "default_brief_after")]
+    pub after_secs: i64,
+    /// Don't brief twice inside this window, however long the gaps are.
+    #[serde(default = "default_brief_cooldown")]
+    pub cooldown_secs: i64,
+    /// Include unread mail that arrived during the absence.
+    #[serde(default = "default_true")]
+    pub include_mail: bool,
+    /// Include calendar events starting within `lookahead_minutes`.
+    #[serde(default = "default_true")]
+    pub include_calendar: bool,
+    #[serde(default = "default_brief_lookahead")]
+    pub lookahead_minutes: i64,
+}
+
+impl Default for BriefingConfig {
+    fn default() -> Self {
+        BriefingConfig {
+            enabled: true,
+            after_secs: default_brief_after(),
+            cooldown_secs: default_brief_cooldown(),
+            include_mail: true,
+            include_calendar: true,
+            lookahead_minutes: default_brief_lookahead(),
+        }
+    }
+}
+
+/// 20 minutes: a coffee, a meeting, lunch. Shorter than this and you did not
+/// really go anywhere.
+fn default_brief_after() -> i64 {
+    1200
+}
+fn default_brief_cooldown() -> i64 {
+    1800
+}
+fn default_brief_lookahead() -> i64 {
+    120
 }
 
 impl Default for MemoryConfig {

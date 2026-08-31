@@ -858,6 +858,16 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // Arc so each HUD-driven turn can run on its own task.
     let google_for_proactive = shared.google.clone();
     let agent_shared = shared.clone();
+
+    // The away briefing. Shares the LLM handle with the agent -- one model,
+    // loaded once -- and reads the same event log the proactive loop writes.
+    let briefer = Arc::new(Briefer {
+        llm: build_llm(&cfg),
+        shared: agent_shared.clone(),
+        google: agent_shared.google.clone(),
+        cfg: cfg.briefing.clone(),
+        last_briefed: std::sync::atomic::AtomicI64::new(0),
+    });
     let agent = Arc::new(Agent::new(llm, demo_registry(), shared, agent_config(&cfg)));
 
     // Session restore (warm start).
@@ -956,6 +966,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             wake_cancel.clone(),
             llm_life.clone(),
             idle_tracker.clone(),
+            briefer.clone(),
         );
     }
     let mut current_wake = wake_on;
@@ -1207,6 +1218,87 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Everything the away briefing needs, in one place so the wake listener does
+/// not grow another six parameters.
+struct Briefer {
+    llm: Arc<dyn oracle_core::llm::Llm>,
+    shared: Arc<Shared>,
+    google: Option<Arc<oracle_core::connectors::google_api::GoogleClient>>,
+    cfg: oracle_core::config::BriefingConfig,
+    /// When we last spoke a briefing, so a flurry of short absences does not
+    /// produce one every time.
+    last_briefed: std::sync::atomic::AtomicI64,
+}
+
+impl Briefer {
+    /// Gather what happened and, if it is worth saying, compose it.
+    ///
+    /// Returns None on every ordinary path: too short an absence, still inside
+    /// the cooldown, or nothing to report. Only the last of those costs a model
+    /// call, and only after the facts are known to be non-empty.
+    async fn maybe_brief(&self, away_secs: i64, now: i64) -> Option<String> {
+        use std::sync::atomic::Ordering;
+
+        if !self.cfg.enabled || away_secs < self.cfg.after_secs {
+            return None;
+        }
+        let last = self.last_briefed.load(Ordering::SeqCst);
+        if last != 0 && now - last < self.cfg.cooldown_secs {
+            return None;
+        }
+
+        let since = now - away_secs;
+        let mut material = oracle_core::briefing::Material {
+            away_secs,
+            events: self.shared.events.since(since),
+            ..Default::default()
+        };
+
+        if let Some(g) = self.google.as_ref() {
+            if self.cfg.include_mail {
+                // Gmail has no epoch filter; hours is the coarsest unit that
+                // still brackets the absence without pulling in yesterday.
+                let hours = (away_secs / 3600).clamp(1, 72);
+                let q = format!("is:unread newer_than:{hours}h");
+                match g.gmail_search(&q, 5, now).await {
+                    Ok(m) => material.mail = m,
+                    Err(e) => tracing::warn!("[briefing] mail lookup failed: {e}"),
+                }
+            }
+            if self.cfg.include_calendar {
+                let t_min = chrono::Utc::now().to_rfc3339();
+                let t_max = (chrono::Utc::now()
+                    + chrono::Duration::minutes(self.cfg.lookahead_minutes.max(1)))
+                .to_rfc3339();
+                match g.calendar_events(&t_min, &t_max, now).await {
+                    Ok(e) => material.upcoming = e,
+                    Err(e) => tracing::warn!("[briefing] calendar lookup failed: {e}"),
+                }
+            }
+        }
+
+        if !material.is_worth_saying() {
+            tracing::info!(away_secs, "[briefing] nothing to report");
+            return None;
+        }
+
+        tracing::info!(
+            away_secs,
+            events = material.events.len(),
+            mail = material.mail.len(),
+            upcoming = material.upcoming.len(),
+            "[briefing] composing"
+        );
+        let out =
+            oracle_core::briefing::compose(self.llm.as_ref(), &material, CancellationToken::new())
+                .await;
+        if out.is_some() {
+            self.last_briefed.store(now, Ordering::SeqCst);
+        }
+        out
+    }
+}
+
 /// Fire due standing orders by injecting them into the normal command channel.
 ///
 /// Deliberately reuses the ordinary turn path rather than running the agent
@@ -1381,7 +1473,14 @@ fn spawn_proactive(
                                         .collect()
                                 })
                                 .unwrap_or_default();
-                            nudges.extend(processes.poll(&names));
+                            for n in processes.poll(&names) {
+                                // Record before the policy sees it. A nudge
+                                // suppressed by quiet hours still happened, and
+                                // the briefing is exactly where it should
+                                // surface later.
+                                shared.events.record(now, n.text.clone());
+                                nudges.push(n);
+                            }
                         }
                         Ok(_) => {}
                         Err(e) => tracing::warn!("[proactive] process poll failed: {e}"),
@@ -2085,6 +2184,7 @@ struct WakeState {
 /// Process one recognizer line: show it live, and drive the wake word — barge in
 /// on whatever she's saying, run "Delphi, <command>" directly, and for a bare
 /// "Delphi" acknowledge and open a short window for the follow-up command.
+#[allow(clippy::too_many_arguments)]
 async fn handle_wake_line(
     line: &str,
     publisher: &oracle_core::gateway::server::HudPublisher,
@@ -2093,6 +2193,7 @@ async fn handle_wake_line(
     st: &mut WakeState,
     llm_life: &Arc<oracle_core::idle::LlmLifecycle>,
     idle_tracker: &Arc<oracle_core::idle::IdleTracker>,
+    briefer: &Arc<Briefer>,
 ) {
     use std::time::{Duration, Instant};
     let Some(text) = clean_transcript_line(line) else {
@@ -2159,11 +2260,20 @@ async fn handle_wake_line(
             turn: uuid::Uuid::nil(),
             state: "listening".into(),
         });
-        let wav = synth_tts_async(voice.clone(), "Yes?".into())
+        // A bare "Delphi" after a real absence is the moment for the catch-up.
+        // Anything shorter, or nothing to report, falls through to "Yes?".
+        let now_unix = chrono::Utc::now().timestamp();
+        let away = idle_tracker.idle_secs(now_unix);
+        let greeting = match briefer.maybe_brief(away, now_unix).await {
+            Some(brief) => brief,
+            None => "Yes?".to_string(),
+        };
+
+        let wav = synth_tts_async(voice.clone(), greeting.clone())
             .await
             .map(encode_wav_b64);
         publisher.send_event(HudEvent::Speak {
-            text: "Yes?".into(),
+            text: greeting,
             wav_b64: wav,
         });
     } else {
@@ -2240,6 +2350,7 @@ fn spawn_wake_listener(
     shutdown: CancellationToken,
     llm_life: Arc<oracle_core::idle::LlmLifecycle>,
     idle_tracker: Arc<oracle_core::idle::IdleTracker>,
+    briefer: Arc<Briefer>,
 ) {
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -2334,7 +2445,7 @@ fn spawn_wake_listener(
                             Ok(Some(line)) => {
                                 handle_wake_line(
                                     &line, &publisher, &cmd_tx, &voice, &mut st,
-                                    &llm_life, &idle_tracker,
+                                    &llm_life, &idle_tracker, &briefer,
                                 )
                                 .await
                             }
@@ -2346,7 +2457,7 @@ fn spawn_wake_listener(
                             Ok(Some(line)) => {
                                 handle_wake_line(
                                     &line, &publisher, &cmd_tx, &voice, &mut st,
-                                    &llm_life, &idle_tracker,
+                                    &llm_life, &idle_tracker, &briefer,
                                 )
                                 .await
                             }

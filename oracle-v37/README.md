@@ -12,7 +12,7 @@ Every component builds, runs, and passes tests; the whole thing boots offline
 (mock LLM, hashing embedder, Null audio) so you can run it with no GPU, no model
 download, and no credentials, then swap in real backends behind traits.
 
-**Status: 282 Rust tests + 933 C++ checks passing. Clippy-clean, rustfmt-clean.
+**Status: 294 Rust tests + 933 C++ checks passing. Clippy-clean, rustfmt-clean.
 Two processes talk over a real authenticated socket; the HUD streams over a real
 WebSocket; OAuth, Home Assistant, and the audio ring are exercised end-to-end
 against mocks or real libraries.**
@@ -184,6 +184,51 @@ guess. The capability gate is unchanged either way: an unattended turn that
 reaches an irreversible action stops at the confirmer, and with nobody there to
 answer it times out and is denied. A routine can read your calendar at 08:30; it
 cannot quietly send mail on your behalf.
+
+## The away briefing
+
+Come back after a couple of hours, say "Delphi", and instead of "Yes?" you get:
+
+> *"Your build failed — borrow checker in dispatch.rs. Three emails, the one from
+> your advisor wants a reply by Friday. Your 3pm moved to 4."*
+
+This is the one proactive path where the model earns its keep, and the split is
+the point:
+
+* **Detection stays deterministic.** What happened is gathered by ordinary Rust —
+  processes that exited, mail that arrived, events on the calendar. No judgment,
+  nothing to get wrong.
+* **Interpretation is the model's job.** Turning three facts into the two that
+  matter is what a cron cannot do, and doing it over your own machine and mail is
+  what a cloud model cannot do privately.
+
+Every other nudge in this codebase would run identically with the LLM
+uninstalled. This one would not exist.
+
+The model gets **no tools** here — it receives facts and returns prose, so the
+boundary from [Proactive nudges](#proactive-nudges) holds: it cannot act, and the
+worst case is an awkward sentence.
+
+Machine events are recorded into a bounded in-memory log *before* the nudge
+policy sees them, so something that happened during quiet hours is still in the
+briefing even though it was never announced at the time.
+
+Nothing to report means silence, and the check happens **before** the model call —
+waking an 11 GB model to be told there is nothing to say is the opposite of the
+point.
+
+```toml
+[briefing]
+enabled = true
+after_secs = 1200        # only after a real absence; 20 min
+cooldown_secs = 1800     # not twice in half an hour
+include_mail = true
+include_calendar = true
+lookahead_minutes = 120
+```
+
+`briefing.catch_up` exposes the same machine events on demand ("what did I
+miss?"), and a routine can schedule one.
 
 ## Proactive nudges
 
