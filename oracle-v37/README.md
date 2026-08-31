@@ -3,16 +3,16 @@
 A fully-local autonomous voice assistant: sub-600ms bidirectional speech with
 barge-in, OS-level machine control, Google Workspace + Home Assistant
 automation, dual-layer persistent memory with a knowledge graph, and a WebGL
-holographic HUD. Targets **Linux and Windows** from one codebase (a Platform
-Abstraction Layer covers the OS-specific bits); GPU inference runs on **AMD
-ROCm/HIP** or any OpenAI-compatible llama.cpp server.
+holographic HUD. Targets **Linux, macOS and Windows** from one codebase (a
+Platform Abstraction Layer covers the OS-specific bits); GPU inference runs on
+**AMD ROCm/HIP**, **Apple Metal**, or any OpenAI-compatible llama.cpp server.
 
 This repository is a **working, buildable, tested system** — not a sketch.
 Every component builds, runs, and passes tests; the whole thing boots offline
 (mock LLM, hashing embedder, Null audio) so you can run it with no GPU, no model
 download, and no credentials, then swap in real backends behind traits.
 
-**Status: 134 Rust tests + 916 C++ checks passing. Clippy-clean, rustfmt-clean.
+**Status: 275 Rust tests + 933 C++ checks passing. Clippy-clean, rustfmt-clean.
 Two processes talk over a real authenticated socket; the HUD streams over a real
 WebSocket; OAuth, Home Assistant, and the audio ring are exercised end-to-end
 against mocks or real libraries.**
@@ -45,7 +45,7 @@ See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md).
 | `oracle-ipc` | Rust | Wire types; **length-framed async transport** (UDS + peer-cred auth); binary HUD frames | 10 |
 | `oracle-core` | Rust | ReAct agent loop; **parallel dependency-DAG dispatcher**; LLM backends (mock + llama-server SSE); SQLite episodic+vector+KG memory; **live WebSocket HUD gateway**; **OAuth2 PKCE loopback + AES-GCM vault**; **Home Assistant WS + MQTT clients**; config; observability + `doctor`; lifecycle/shutdown; prompt-injection hardening | 95 |
 | `oracle-actd` | Rust | Capability policy; **real UDS server**; anti-replay; confirmation flow; PAL (mock + `/proc` Linux); shell risk classifier; audit journal | 29 |
-| `oracle-audio` | C++20 | Lock-free SPSC ring; VAD/barge-in state machine; TTS flow control + heard-upto mapping; FIR decimator; **real ALSA capture backend** | 916 checks |
+| `oracle-audio` | C++20 | Lock-free SPSC ring; VAD/barge-in state machine; TTS flow control + heard-upto mapping; FIR decimator; **real ALSA / WASAPI / CoreAudio capture backends** | 933 checks |
 | `oracle-hud` | TS/Three.js | Instanced audio-reactive core; EffectComposer post chain; binary WS protocol; glass panels | tsc + vite |
 
 ## Quick start (offline, no GPU)
@@ -79,6 +79,171 @@ four tool calls, the dispatcher runs three in parallel and gates the draft on
 the email + calendar results via `$result.N` dependency edges, then speaks a
 summary — all real code paths, zero external dependencies.
 
+## Continuity
+
+Memory used to be reachable only through the `memory.remember` and
+`memory.recall` tools — that is, only when the *model chose* to call them. A 14B
+planner almost never does either unprompted, so nothing was written and nothing
+was read back: the store stayed empty and the assistant met you fresh every
+session. The infrastructure was all there; nothing was driving it.
+
+It is now automatic on both sides of every turn:
+
+* **Before planning**, the user's turn is embedded, the store is searched, and
+  anything clearing `memory.recall_min_score` is rendered into the system prompt
+  with a human-readable age ("3 days ago"). No tool call required.
+* **After the turn resolves**, the user's words and the reply are written back as
+  episodes, so the next turn has something to find. The user's half carries
+  higher salience — durable facts come from them, not from Pythia's restatement.
+* **An exact repeat reinforces** the existing episode instead of appending a
+  near-duplicate, so saying the same thing twice deepens a memory rather than
+  crowding the recall block with copies.
+
+Recalled text is framed in the prompt as **data, not instructions**. A memory can
+quote an email or a web page, so an injected instruction could otherwise reach
+the planner a session after it was first seen — the standing `DATA_RULE` has to
+cover memory, not just freshly fetched content.
+
+Tunable under `[memory]`; set `auto_recall`/`auto_record` false to return to the
+old tool-only behaviour:
+
+```toml
+[memory]
+auto_recall = true
+auto_record = true
+recall_limit = 5
+recall_min_score = 0.15
+```
+
+Retrieval quality is still bounded by the offline `HashEmbedder`, which matches
+on tokens rather than meaning. Swapping in BGE-small via ONNX behind the same
+`Embedder` trait is what makes recall semantic; the 384-d schema already matches,
+so there is no migration.
+
+## What it costs when you are not using it
+
+Nothing, by default. A 14B at Q4 holds 10-12 GB of VRAM, and a desktop assistant
+is overwhelmingly idle. The wake-word recognizer is a separate small process that
+does not need the model at all, so there is no reason for it to be resident
+between conversations.
+
+After ten minutes of silence the supervised `llama-server` is **killed**, not
+just ignored — releasing the VRAM is the whole point. Saying "Delphi" starts the
+reload immediately, while you are still talking, so the load overlaps with the
+rest of your sentence instead of being dead air after it. The turn then waits on
+`/health` before its request goes out, so the first ask after a lull is slow
+rather than a connection error.
+
+```toml
+[supervise]
+idle_unload_secs = 600        # 0 keeps the model resident
+llm_ready_timeout_secs = 90
+```
+
+## Ambient screen context
+
+The assistant used to be blind unless the model chose to call a screen tool
+first, which made "close this" and "what does this error mean" unanswerable. The
+focused window — and a few other open ones — now go into the system prompt every
+turn, the same way recalled memory does.
+
+The subtlety: when you talk through the HUD, **Oracle is the foreground window**.
+Reading that back is how a model starts describing Pythia's own UI as if it were
+your screen. Windows arrive in z-order, so the first real one behind us is what
+you were actually looking at.
+
+Window titles are attacker-controllable — a web page picks its own — so the block
+carries the same DATA-not-instructions framing as memory.
+
+```toml
+[agent]
+screen_context = true
+screen_other_windows = 6
+```
+
+## Standing orders
+
+Things you ask for once that should keep happening:
+
+> "Every weekday at half eight, tell me my first meeting."
+
+Stored in the same SQLite file as memory, managed by voice through
+`routine.add` / `routine.list` / `routine.remove`. The schedule vocabulary is
+deliberately tiny, because cron is unreadable out loud: `daily HH:MM`,
+`weekdays HH:MM`, `every Nm`, `every Nh`.
+
+A due routine is injected into the ordinary command channel, so it gets history,
+TTS, the HUD state machine and reload-on-demand for free, and behaves exactly as
+if you had typed it at that moment.
+
+### Why routines run the planner and nudges do not
+
+A nudge is a heuristic firing on its own; a routine is *your own instruction,
+time-shifted*. Running it executes a request you made rather than acting on a
+guess. The capability gate is unchanged either way: an unattended turn that
+reaches an irreversible action stops at the confirmer, and with nobody there to
+answer it times out and is denied. A routine can read your calendar at 08:30; it
+cannot quietly send mail on your behalf.
+
+## Proactive nudges
+
+Pythia can speak first: a calendar event about to start, or mail worth knowing
+about. Off by default — an assistant that begins talking on its own is something
+you opt into, not something you discover.
+
+```toml
+[proactive]
+enabled = true
+poll_secs = 60
+lead_minutes = 10          # announce an event this far ahead
+calendar = true
+mail = false               # opt-in on top
+mail_query = "is:unread is:starred"
+watch_processes = ["cargo", "MSBuild"]   # "your build finished"
+quiet_from_hour = 22       # local hours
+quiet_until_hour = 8
+repeat_after_secs = 21600  # don't say the same thing twice in 6h
+max_per_hour = 4
+```
+
+### The planner is deliberately not in this loop
+
+Every other path runs with the user present: they asked, they hear the answer,
+and an irreversible act stops for their sanction. A proactive turn breaks all
+three assumptions — it fires with nobody watching, possibly with nobody in the
+room.
+
+So there is no `Agent` and no tool registry in `oracle-core/src/proactive/`. A
+trigger is ordinary Rust that reads a source and returns a fully-phrased line;
+the loop's only output is speech. **The worst case for a bug here is Pythia
+saying something silly at the wrong moment, never taking an unattended action.**
+That is a boundary, not a default to relax.
+
+Phrasing through the LLM would sound better and could be done safely with an
+empty tool registry. It is not done yet — today's nudges are templated.
+
+### The local triggers are the ones that justify running this at all
+
+Calendar and mail are things your phone already does better. `watch_processes`
+is not: "your build finished" needs something living on the machine, watching the
+process table. The first poll only establishes a baseline, or every watched
+process that finished before Oracle started would be announced at launch.
+
+### The judgment is in the policy, not the triggers
+
+An assistant that interrupts badly is worse than one that never speaks. The
+triggers are trivial; `NudgePolicy` is where the work is:
+
+- **quiet hours**, wrapping midnight correctly (22 → 08 is not a range test)
+- **a per-nudge cooldown** keyed on the *event id*, never the time — the loop
+  re-polls every 60s and rediscovers the same meeting each cycle
+- **a rolling hourly ceiling**, so a misbehaving trigger cannot become a stream
+- **suppression while a real turn is in flight**, released through a `Drop` so a
+  panicking turn can't mute her permanently
+
+A suppressed nudge does not consume the hourly budget, or a trigger firing at
+03:00 would silently eat the morning's allowance.
+
 ## Going to production
 
 Everything offline swaps to real backends behind a trait — nothing is stubbed
@@ -88,10 +253,17 @@ Everything offline swaps to real backends behind a trait — nothing is stubbed
   backend (`-DGGML_HIP=ON`). The SSE + tool-call protocol is already spoken.
 - **Real embeddings:** implement `memory::Embedder` with BGE-small via ONNX
   Runtime — the 384-d schema already matches, no migration.
-- **Real audio:** build with `-DOracle_WITH_ALSA=ON` (verified to compile and
-  link against libasound); the ring/VAD/TTS logic is unchanged.
-- **Real OS control:** the actd `Platform` trait; the Linux `/proc` process
-  lister already works, window/input backends (x11rb, `/dev/uinput`) slot in.
+- **Real audio:** Windows (WASAPI) and macOS (CoreAudio/AUHAL) build their
+  backend automatically. On Linux pass `-DOracle_WITH_ALSA=ON`. A test now
+  asserts the factory returns the backend the build asked for, because that
+  silently regressed once: CMake defined `Oracle_WITH_ALSA` while the source
+  tested `ORACLE_WITH_ALSA`, so the flag linked libasound, compiled the Null
+  backend, and fed the VAD a 220Hz test tone instead of the microphone.
+- **Real OS control:** the actd `Platform` trait. Windows is complete (Win32 +
+  UI Automation). macOS is complete bar the caveats in
+  [`docs/MACOS.md`](docs/MACOS.md) (Accessibility API via `osascript`). On Linux
+  the `/proc` process lister works and the window/input backends (x11rb,
+  `/dev/uinput`) still slot in.
 - **Real Google/HA:** the OAuth PKCE loopback, AES-GCM vault, HA WebSocket, and
   MQTT clients are complete and tested against mocks — add your client id and
   tokens.
@@ -116,12 +288,12 @@ speak the real protocols); they are wired but not hardware-validated in CI.
 
 ```
 oracle-ipc/     shared wire types + async socket transport
-oracle-core/    orchestrator: agent, memory, connectors, gateway, config, observ
+oracle-core/    orchestrator: agent, memory, proactive, idle, connectors, gateway
 oracle-actd/    privileged actuator daemon
 oracle-audio/   C++ real-time audio engine
 oracle-hud/     Three.js holographic HUD
 deploy/         systemd units, container config
-docs/           DEPLOYMENT, THREAT_MODEL, RUNBOOK
+docs/           DEPLOYMENT, MACOS, THREAT_MODEL, RUNBOOK
 scripts/        build_all.sh
 oracle-architecture.md   the full design document
 ```

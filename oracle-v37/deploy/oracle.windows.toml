@@ -29,6 +29,15 @@ model_dir = "E:\\oracle-models"
 db_path = "C:\\Users\\apollo\\AppData\\Local\\oracle\\oracle.db"
 retrieve_limit = 6
 
+# Continuity: retrieve relevant memory into the prompt before planning, and write
+# each completed turn back afterwards. Without these, memory is only reachable
+# when the model chooses to call memory.recall/remember -- which it rarely does,
+# so nothing is stored and nothing is read back.
+auto_recall = true
+auto_record = true
+recall_limit = 5
+recall_min_score = 0.15
+
 [actd]
 # Named pipe on Windows (bare name; the daemon prefixes \\.\pipe\).
 socket = "oracle-actd"
@@ -42,6 +51,11 @@ enabled = true
 [agent]
 step_budget = 12
 
+# Put the focused window (and a few others) into the prompt each turn, so "close
+# this" and "what is this error" have a referent. Needs actd; degrades silently.
+screen_context = true
+screen_other_windows = 6
+
 [google]
 # Path to your Google Desktop-app credentials.json. Set this and run
 # `oracle-core auth --credentials <path> --account <email>` once; run/repl then
@@ -49,6 +63,23 @@ step_budget = 12
 credentials_path = "E:\\oracle-models\\credentials.json"
 # Must match the --account you passed to `auth` (your `auth` run used "default").
 account = "default"
+
+# Proactive nudges: Pythia speaking first. No planner runs in this loop -- the
+# triggers are plain Rust and the only output is speech.
+[proactive]
+enabled = false            # opt in; it changes how the assistant behaves
+poll_secs = 60
+calendar = true
+lead_minutes = 10
+mail = false
+mail_query = "is:unread is:starred"
+# Process names to announce when they finish, matched by substring. The trigger
+# a cloud assistant cannot have.
+watch_processes = []
+quiet_from_hour = 22
+quiet_until_hour = 8
+repeat_after_secs = 21600
+max_per_hour = 4
 
 [supervise]
 # One-click startup: `oracle-core run` launches these hidden and reaps them when
@@ -83,3 +114,10 @@ open_window = true
 # "edge", "chrome", a full path to a Chromium browser, or "default" for your
 # default browser (a normal tab).
 browser = "edge"
+
+# --- Idle unload ---
+# The model holds ~11GB of VRAM and a desktop assistant is mostly idle. After
+# this many seconds without activity the llama-server child is killed; the wake
+# word reloads it, starting as soon as you begin speaking. 0 keeps it resident.
+idle_unload_secs = 600
+llm_ready_timeout_secs = 180
