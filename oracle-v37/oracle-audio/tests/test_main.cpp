@@ -5,9 +5,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
+#include <string>
 #include <vector>
 
 #include "oracle/capture.hpp"
+#include "oracle/downmix.hpp"
 #include "oracle/resample.hpp"
 #include "oracle/spsc_ring.hpp"
 #include "oracle/tts_queue.hpp"
@@ -217,6 +219,86 @@ static void test_capture_feeds_ring() {
     CHECK(factory_backend->name() != nullptr);
 }
 
+
+// --- downmix (used by the CoreAudio backend; pure, so testable off a Mac) ----
+
+static void test_downmix_averages_channels() {
+    // Summing instead of averaging would double a stereo mic's amplitude and
+    // clip everything loud into a square wave.
+    const float stereo[2] = {0.5f, 0.5f};
+    CHECK(downmix_frame_f32(stereo, 2) == 16384);
+
+    const float opposed[2] = {0.5f, -0.5f};
+    CHECK(downmix_frame_f32(opposed, 2) == 0);
+
+    const float mono[1] = {0.25f};
+    CHECK(downmix_frame_f32(mono, 1) == 8192);
+}
+
+static void test_downmix_clamps_asymmetrically() {
+    // S16 runs -32768..32767, so the positive side saturates one lower. Getting
+    // this wrong wraps a full-scale positive sample around to negative -- an
+    // audible click on every loud transient.
+    const float hot[1] = {2.0f};
+    CHECK(downmix_frame_f32(hot, 1) == 32767);
+
+    const float cold[1] = {-2.0f};
+    CHECK(downmix_frame_f32(cold, 1) == -32768);
+
+    const float full_positive[1] = {1.0f};
+    CHECK(downmix_frame_f32(full_positive, 1) == 32767);
+
+    const float silence[1] = {0.0f};
+    CHECK(downmix_frame_f32(silence, 1) == 0);
+}
+
+static void test_downmix_handles_degenerate_input() {
+    // A device reporting zero channels must not divide by zero on the RT thread.
+    const float x[1] = {0.5f};
+    CHECK(downmix_frame_f32(x, 0) == 0);
+    CHECK(downmix_frame_f32(nullptr, 2) == 0);
+
+    int16_t out[4] = {1, 1, 1, 1};
+    CHECK(downmix_buffer_f32(nullptr, 4, 2, out) == 0);
+    CHECK(downmix_buffer_f32(x, 4, 2, nullptr) == 0);
+}
+
+static void test_downmix_buffer_deinterleaves_frames() {
+    // Four stereo frames -> four mono samples, in order.
+    const float in[8] = {1.0f, 1.0f, 0.5f, 0.5f, 0.0f, 0.0f, -0.5f, -0.5f};
+    int16_t out[4] = {};
+    CHECK(downmix_buffer_f32(in, 4, 2, out) == 4);
+    CHECK(out[0] == 32767);
+    CHECK(out[1] == 16384);
+    CHECK(out[2] == 0);
+    CHECK(out[3] == -16384);
+}
+
+
+// --- the factory actually selects the backend the build asked for ------------
+
+static void test_configured_backend_is_the_one_compiled_in() {
+    // This guards a bug that shipped silently: CMake defined `Oracle_WITH_ALSA`
+    // while the source tested `ORACLE_WITH_ALSA`. The names differ only in case,
+    // so -DOracle_WITH_ALSA=ON linked libasound, compiled the Null backend, and
+    // fed the VAD a 220Hz test tone instead of the microphone. Nothing failed --
+    // it just never heard anything.
+    CaptureConfig cfg;
+    auto backend = make_capture(cfg);
+    const char* got = backend->name();
+    std::printf("  capture backend: %s\n", got);
+
+#if defined(ORACLE_WITH_ALSA)
+    CHECK(std::string(got) == "alsa");
+#elif defined(_WIN32)
+    CHECK(std::string(got) == "wasapi");
+#elif defined(__APPLE__)
+    CHECK(std::string(got) == "coreaudio");
+#else
+    CHECK(std::string(got) == "null");
+#endif
+}
+
 int main() {
     std::printf("=== oracle-audio unit tests ===\n");
     test_ring_basic();
@@ -230,6 +312,11 @@ int main() {
     test_tts_bargein_heard_upto();
     test_decimator_downsamples();
     test_capture_feeds_ring();
+    test_downmix_averages_channels();
+    test_downmix_clamps_asymmetrically();
+    test_downmix_handles_degenerate_input();
+    test_downmix_buffer_deinterleaves_frames();
+    test_configured_backend_is_the_one_compiled_in();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures == 0) std::printf("ALL PASS\n");

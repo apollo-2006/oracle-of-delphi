@@ -111,7 +111,10 @@ std::unique_ptr<CaptureBackend> make_capture(CaptureConfig cfg) {
 
 }  // namespace oracle
 
-#elif !defined(_WIN32)  // no ALSA and not Windows → Null fallback (Linux w/o ALSA, etc.)
+#elif !defined(_WIN32) && !defined(__APPLE__)
+// No ALSA, not Windows, not macOS → Null fallback (e.g. Linux without libasound).
+// macOS is excluded because capture_coreaudio.cpp defines make_capture() there;
+// claiming it here too would be a duplicate symbol at link time.
 
 namespace oracle {
 std::unique_ptr<CaptureBackend> make_capture(CaptureConfig cfg) {
@@ -120,4 +123,5 @@ std::unique_ptr<CaptureBackend> make_capture(CaptureConfig cfg) {
 }  // namespace oracle
 
 #endif
-// On Windows without ALSA, make_capture() is provided by capture_wasapi.cpp.
+// Elsewhere make_capture() comes from capture_wasapi.cpp (Windows) or
+// capture_coreaudio.cpp (macOS).

@@ -5,8 +5,9 @@
 //! `decode` alone, since the framing is orthogonal.
 //!
 //! Transport is Unix domain sockets on unix and named pipes on windows. The
-//! server verifies the peer's credentials (`SO_PEERCRED`) so only the same-user
-//! core process can drive the privileged daemon.
+//! server verifies the peer's credentials so only the same-user core process
+//! can drive the privileged daemon (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED`
+//! on macOS and the BSDs; tokio abstracts both behind `peer_cred`).
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -83,8 +84,10 @@ pub mod unix {
             let _ = std::fs::remove_file(path);
         }
         let listener = UnixListener::bind(path)?;
-        // Tighten perms: only the owning user may connect.
-        #[cfg(target_os = "linux")]
+        // Tighten perms: only the owning user may connect. This applies to every
+        // unix target, not just Linux -- macOS honours socket file permissions
+        // the same way, and gating it on Linux left the socket world-accessible
+        // there.
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
@@ -92,8 +95,8 @@ pub mod unix {
         Ok(listener)
     }
 
-    /// Verify the connected peer is the same uid as us (SO_PEERCRED). Returns
-    /// the peer uid on success.
+    /// Verify the connected peer is the same uid as us. Returns the peer uid on
+    /// success.
     pub fn verify_peer(stream: &UnixStream) -> io::Result<u32> {
         let creds = stream.peer_cred()?;
         let me = current_uid();
@@ -110,8 +113,30 @@ pub mod unix {
         UnixStream::connect(path).await
     }
 
+    /// The real uid of this process.
+    ///
+    /// This used to read `/proc/self/status` unconditionally to avoid a libc
+    /// dependency. There is no `/proc` on macOS or the BSDs, so the read failed
+    /// and the `unwrap_or(0)` handed back uid 0 -- which never matches the real
+    /// peer uid, so *every* connection was rejected and actd was unreachable on
+    /// those platforms.
+    ///
+    /// `/proc` stays the fast path on Linux; everywhere else falls back to the
+    /// `id -ur` shell-out, which is POSIX and needs no new dependency.
     fn current_uid() -> u32 {
-        // Avoids a libc dependency: read the real uid from /proc/self/status.
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(uid) = proc_uid() {
+                return uid;
+            }
+        }
+        // Nothing left to try: fall back to a value that cannot match a real
+        // peer, so the check fails closed rather than authenticating anyone.
+        posix_uid().unwrap_or(u32::MAX)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn proc_uid() -> Option<u32> {
         std::fs::read_to_string("/proc/self/status")
             .ok()
             .and_then(|s| {
@@ -120,7 +145,21 @@ pub mod unix {
                     .and_then(|l| l.split_whitespace().nth(1))
                     .and_then(|u| u.parse().ok())
             })
-            .unwrap_or(0)
+    }
+
+    /// Test hook: `current_uid` is private, but its correctness is the whole
+    /// basis of peer authentication, so it needs direct coverage.
+    #[cfg(test)]
+    pub(crate) fn current_uid_for_test() -> u32 {
+        current_uid()
+    }
+
+    fn posix_uid() -> Option<u32> {
+        let out = std::process::Command::new("id").arg("-ur").output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8(out.stdout).ok()?.trim().parse().ok()
     }
 }
 
@@ -274,5 +313,33 @@ mod tests {
         assert!(reply.msg.starts_with("uid="));
         server.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod uid_tests {
+    /// The uid must resolve on every unix, not just Linux. A wrong answer here
+    /// is not a degraded feature: verify_peer compares against it, so a bad uid
+    /// rejects every connection and the daemon is simply unreachable.
+    #[test]
+    fn current_uid_matches_the_shell() {
+        let listener_uid = super::unix::current_uid_for_test();
+        let expected: u32 = String::from_utf8(
+            std::process::Command::new("id")
+                .arg("-ur")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+        assert_eq!(listener_uid, expected);
+        assert_ne!(
+            listener_uid,
+            u32::MAX,
+            "uid resolution fell through to fail-closed"
+        );
     }
 }

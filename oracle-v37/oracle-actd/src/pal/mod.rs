@@ -1,7 +1,8 @@
 //! Platform Abstraction Layer (architecture §3.1).
 //!
 //! One trait, multiple OS backends. The real Linux backend uses x11rb/EWMH +
-//! `/dev/uinput`; the Windows backend uses `EnumWindows`/`SendInput`. To keep
+//! `/dev/uinput`; the Windows backend uses `EnumWindows`/`SendInput`; the macOS
+//! backend reaches the Accessibility API through `osascript`. To keep
 //! the reference build hermetic and cross-platform-testable, this ships a
 //! `MockPlatform` that models the same semantics in memory. The daemon is
 //! generic over [`Platform`], so the same policy/RPC/audit code runs on any
@@ -13,6 +14,14 @@ pub mod mock;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
+
+// Compiled on every platform, selected only on macOS (see actd's main).
+// Nothing in it touches a macOS-only API -- it drives `osascript`, `ps` and
+// `open` through std::process -- so building it everywhere lets the fiddly,
+// bug-prone half (id packing, AppleScript escaping, TCC error classification,
+// tab-separated element parsing) be unit-tested in ordinary Linux CI instead of
+// only on a Mac.
+pub mod macos;
 
 #[cfg(windows)]
 pub mod windows;

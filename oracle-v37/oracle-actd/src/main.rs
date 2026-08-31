@@ -103,7 +103,15 @@ async fn serve_mode(
         use oracle_actd::pal::linux::LinuxPlatform;
         LinuxPlatform::new()
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    let platform = {
+        // Real window/process/input control via the Accessibility API.
+        // This arm used to fall into the mock below, so on macOS the daemon
+        // reported success for actions it never performed.
+        use oracle_actd::pal::macos::MacosPlatform;
+        MacosPlatform::new()
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let platform = MockPlatform::new();
 
     let daemon = Arc::new(Daemon::new(platform, audit));
