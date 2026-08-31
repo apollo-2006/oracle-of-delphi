@@ -12,7 +12,7 @@ Every component builds, runs, and passes tests; the whole thing boots offline
 (mock LLM, hashing embedder, Null audio) so you can run it with no GPU, no model
 download, and no credentials, then swap in real backends behind traits.
 
-**Status: 277 Rust tests + 933 C++ checks passing. Clippy-clean, rustfmt-clean.
+**Status: 282 Rust tests + 933 C++ checks passing. Clippy-clean, rustfmt-clean.
 Two processes talk over a real authenticated socket; the HUD streams over a real
 WebSocket; OAuth, Home Assistant, and the audio ring are exercised end-to-end
 against mocks or real libraries.**

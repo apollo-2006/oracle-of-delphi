@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
         }
         "auth" => {
             let cfg = load_config(&args)?;
-            init_tracing(&cfg.general.log_level);
+            init_tracing(&cfg.general.log_level, Some(&cfg.general.runtime_dir));
             auth(cfg, &args).await
         }
         "run" => {
@@ -69,26 +69,59 @@ async fn main() -> anyhow::Result<()> {
             if args.iter().any(|a| a == "--no-window") {
                 cfg.supervise.open_window = false;
             }
-            init_tracing(&cfg.general.log_level);
+            init_tracing(&cfg.general.log_level, Some(&cfg.general.runtime_dir));
             run(cfg).await
         }
         // "repl" and any unrecognized command fall through to the REPL.
         _ => {
             let cfg = load_config(&args)?;
-            init_tracing(&cfg.general.log_level);
+            init_tracing(&cfg.general.log_level, Some(&cfg.general.runtime_dir));
             repl(cfg).await
         }
     }
 }
 
-fn init_tracing(level: &str) {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| format!("oracle_core={level}").into()),
-        )
-        .with_target(false)
-        .try_init();
+/// Initialize logging to stdout AND to `<runtime_dir>/oracle.log`.
+///
+/// The file half is not a nicety. The native shell spawns core with
+/// CREATE_NO_WINDOW, which means there is no console attached and every line
+/// written to stdout is discarded. Anyone launching the packaged app therefore
+/// had no way to see whether actd connected, whether the LLM autostarted, or
+/// why the assistant came up inert -- llm.log and actd.log existed, but core's
+/// own log, the one that says what it decided, went nowhere.
+fn init_tracing(level: &str, runtime_dir: Option<&str>) {
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| format!("oracle_core={level}").into());
+
+    // Append so a restart does not discard the previous run's evidence.
+    let file = runtime_dir.and_then(|dir| {
+        let _ = std::fs::create_dir_all(dir);
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(std::path::Path::new(dir).join("oracle.log"))
+            .ok()
+    });
+
+    match file {
+        Some(f) => {
+            // No ANSI in the file: escape codes make a log unreadable in Notepad.
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(std::io::stdout.and(std::sync::Arc::new(f)))
+                .try_init();
+        }
+        None => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .try_init();
+        }
+    }
 }
 
 fn load_config(args: &[String]) -> anyhow::Result<Config> {
@@ -709,8 +742,47 @@ fn build_llm(cfg: &Config) -> Arc<dyn Llm> {
     }
 }
 
+/// Describe the proactive watchers in one line for the system prompt.
+///
+/// Returns None when nothing is on, so a disabled loop adds no tokens and the
+/// model never claims a capability it does not have.
+fn proactive_summary(p: &oracle_core::config::ProactiveConfig) -> Option<String> {
+    if !p.enabled {
+        return None;
+    }
+    let mut watching = Vec::new();
+    if p.calendar {
+        watching.push(format!(
+            "upcoming calendar events (announced {} minutes ahead)",
+            p.lead_minutes
+        ));
+    }
+    if p.mail {
+        watching.push(format!("new mail matching \"{}\"", p.mail_query));
+    }
+    if !p.watch_processes.is_empty() {
+        watching.push(format!(
+            "these programs finishing: {}",
+            p.watch_processes.join(", ")
+        ));
+    }
+    if watching.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "You also speak up on your own, without being asked, about: {}. You stay \
+         quiet between {:02}:00 and {:02}:00. Say so plainly if asked what you do \
+         proactively; for anything scheduled that the user set up themselves, call \
+         routine.list.",
+        watching.join("; "),
+        p.quiet_from_hour,
+        p.quiet_until_hour
+    ))
+}
+
 fn agent_config(cfg: &Config) -> AgentConfig {
     AgentConfig {
+        proactive_summary: proactive_summary(&cfg.proactive),
         screen_context: cfg.agent.screen_context,
         screen_other_windows: cfg.agent.screen_other_windows,
         auto_recall: cfg.memory.auto_recall,
@@ -2537,5 +2609,57 @@ mod proactive_wiring_tests {
             assert!(busy.load(Ordering::SeqCst));
         }
         assert!(!busy.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod proactive_summary_tests {
+    use super::proactive_summary;
+    use oracle_core::config::ProactiveConfig;
+
+    #[test]
+    fn a_disabled_loop_adds_nothing_to_the_prompt() {
+        // Otherwise the model claims a capability it does not have.
+        let p = ProactiveConfig {
+            enabled: false,
+            ..ProactiveConfig::default()
+        };
+        assert!(proactive_summary(&p).is_none());
+    }
+
+    #[test]
+    fn enabled_but_watching_nothing_also_adds_nothing() {
+        let p = ProactiveConfig {
+            enabled: true,
+            calendar: false,
+            mail: false,
+            watch_processes: vec![],
+            ..ProactiveConfig::default()
+        };
+        assert!(proactive_summary(&p).is_none());
+    }
+
+    #[test]
+    fn it_names_each_watcher_and_the_quiet_hours() {
+        let p = ProactiveConfig {
+            enabled: true,
+            calendar: true,
+            lead_minutes: 10,
+            mail: false,
+            watch_processes: vec!["cargo".into(), "MSBuild".into()],
+            quiet_from_hour: 22,
+            quiet_until_hour: 8,
+            ..ProactiveConfig::default()
+        };
+        let s = proactive_summary(&p).expect("should describe itself");
+        assert!(s.contains("calendar"), "got: {s}");
+        assert!(s.contains("10 minutes ahead"), "got: {s}");
+        assert!(s.contains("cargo, MSBuild"), "got: {s}");
+        assert!(s.contains("22:00") && s.contains("08:00"), "got: {s}");
+        assert!(!s.contains("mail"), "mail is off; must not be claimed");
+        assert!(
+            s.contains("routine.list"),
+            "should point at the tool for schedules"
+        );
     }
 }

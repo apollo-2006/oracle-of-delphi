@@ -188,7 +188,11 @@ impl TypedTool for RoutineAdd {
     type Args = RoutineAddArgs;
     const NAME: &'static str = "routine.add";
     const DESCRIPTION: &'static str =
-        "Create a standing order that runs on a schedule. schedule is one of: \
+        "Set up something to happen automatically on a schedule -- a routine, a \
+         recurring reminder, a daily briefing, anything the user wants done \
+         'every morning', 'every weekday', 'every N minutes' without asking again. \
+         Use this whenever they say remind me, every day, each morning, weekdays, \
+         recurring, on a schedule, or from now on. schedule is one of: \
          'daily HH:MM', 'weekdays HH:MM', 'every Nm', 'every Nh'. Re-using a name \
          replaces that routine.";
     const SIDE_EFFECT: SideEffect = SideEffect::Reversible;
@@ -229,7 +233,11 @@ pub struct RoutineList;
 impl TypedTool for RoutineList {
     type Args = RoutineListArgs;
     const NAME: &'static str = "routine.list";
-    const DESCRIPTION: &'static str = "List the standing orders currently set.";
+    const DESCRIPTION: &'static str =
+        "List what is set to happen automatically: the user's routines, standing \
+         orders, scheduled tasks and recurring reminders. Use this whenever they \
+         ask what you do on a schedule, what routines or reminders they have, or \
+         what you do proactively / automatically / on your own.";
     async fn run(&self, _a: RoutineListArgs, ctx: &ToolCtx) -> ToolOutcome {
         match ctx.shared.routines.list() {
             Ok(rs) => ToolOutcome::Ok(json!({
@@ -258,7 +266,9 @@ pub struct RoutineRemove;
 impl TypedTool for RoutineRemove {
     type Args = RoutineRemoveArgs;
     const NAME: &'static str = "routine.remove";
-    const DESCRIPTION: &'static str = "Delete a standing order by name.";
+    const DESCRIPTION: &'static str =
+        "Stop a routine from running: delete a scheduled task, standing order or \
+         recurring reminder by its name. Use for 'stop reminding me about X'.";
     const SIDE_EFFECT: SideEffect = SideEffect::Reversible;
     async fn run(&self, a: RoutineRemoveArgs, ctx: &ToolCtx) -> ToolOutcome {
         match ctx.shared.routines.remove(a.name.trim()) {
