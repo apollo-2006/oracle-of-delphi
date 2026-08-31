@@ -169,6 +169,111 @@ impl TypedTool for KgTool {
 // Workspace + IoT stand-ins (deterministic; real clients in connectors::)
 // ---------------------------------------------------------------------------
 
+// --- standing orders ---------------------------------------------------------
+
+#[derive(Deserialize, JsonSchema)]
+pub struct RoutineAddArgs {
+    /// Short label for the routine, used to change or remove it later
+    /// (e.g. "morning briefing").
+    pub name: String,
+    /// What to do when it fires, phrased as an instruction to yourself
+    /// (e.g. "tell me my first meeting today").
+    pub prompt: String,
+    /// When to run: "daily 08:30", "weekdays 17:00", "every 45m", "every 2h".
+    pub schedule: String,
+}
+pub struct RoutineAdd;
+#[async_trait]
+impl TypedTool for RoutineAdd {
+    type Args = RoutineAddArgs;
+    const NAME: &'static str = "routine.add";
+    const DESCRIPTION: &'static str =
+        "Create a standing order that runs on a schedule. schedule is one of: \
+         'daily HH:MM', 'weekdays HH:MM', 'every Nm', 'every Nh'. Re-using a name \
+         replaces that routine.";
+    const SIDE_EFFECT: SideEffect = SideEffect::Reversible;
+    async fn run(&self, a: RoutineAddArgs, ctx: &ToolCtx) -> ToolOutcome {
+        let Some(schedule) = crate::proactive::routines::Schedule::parse(&a.schedule) else {
+            return ToolOutcome::Err(ToolError::invalid(
+                "schedule",
+                &format!("could not understand the schedule {:?}", a.schedule),
+                "use 'daily HH:MM', 'weekdays HH:MM', 'every Nm' or 'every Nh'",
+            ));
+        };
+        if a.name.trim().is_empty() || a.prompt.trim().is_empty() {
+            return ToolOutcome::Err(ToolError::invalid(
+                "name",
+                "a routine needs both a name and something to do",
+                "give a short name and the instruction to run",
+            ));
+        }
+        match ctx
+            .shared
+            .routines
+            .upsert(a.name.trim(), a.prompt.trim(), schedule)
+        {
+            Ok(id) => ToolOutcome::Ok(json!({
+                "id": id,
+                "name": a.name.trim(),
+                "schedule": schedule.render(),
+            })),
+            Err(e) => ToolOutcome::Err(ToolError::transient(&e.to_string())),
+        }
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct RoutineListArgs {}
+pub struct RoutineList;
+#[async_trait]
+impl TypedTool for RoutineList {
+    type Args = RoutineListArgs;
+    const NAME: &'static str = "routine.list";
+    const DESCRIPTION: &'static str = "List the standing orders currently set.";
+    async fn run(&self, _a: RoutineListArgs, ctx: &ToolCtx) -> ToolOutcome {
+        match ctx.shared.routines.list() {
+            Ok(rs) => ToolOutcome::Ok(json!({
+                "routines": rs
+                    .iter()
+                    .map(|r| json!({
+                        "name": r.name,
+                        "prompt": r.prompt,
+                        "schedule": r.schedule.render(),
+                        "enabled": r.enabled,
+                    }))
+                    .collect::<Vec<_>>()
+            })),
+            Err(e) => ToolOutcome::Err(ToolError::transient(&e.to_string())),
+        }
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct RoutineRemoveArgs {
+    /// The routine's name, as given when it was created.
+    pub name: String,
+}
+pub struct RoutineRemove;
+#[async_trait]
+impl TypedTool for RoutineRemove {
+    type Args = RoutineRemoveArgs;
+    const NAME: &'static str = "routine.remove";
+    const DESCRIPTION: &'static str = "Delete a standing order by name.";
+    const SIDE_EFFECT: SideEffect = SideEffect::Reversible;
+    async fn run(&self, a: RoutineRemoveArgs, ctx: &ToolCtx) -> ToolOutcome {
+        match ctx.shared.routines.remove(a.name.trim()) {
+            Ok(true) => ToolOutcome::Ok(json!({ "removed": a.name.trim() })),
+            // Not an error the model should retry: say so plainly instead.
+            Ok(false) => ToolOutcome::Err(ToolError::invalid(
+                "name",
+                &format!("there is no routine called {:?}", a.name.trim()),
+                "call routine.list to see what is set",
+            )),
+            Err(e) => ToolOutcome::Err(ToolError::transient(&e.to_string())),
+        }
+    }
+}
+
 #[derive(Deserialize, JsonSchema)]
 pub struct GmailSearchArgs {
     /// Gmail search query, e.g. "from:advisor is:unread".
@@ -378,6 +483,9 @@ pub fn register_all(reg: &mut super::ToolRegistry) {
     reg.register(Remember)
         .register(Recall)
         .register(KgTool)
+        .register(RoutineAdd)
+        .register(RoutineList)
+        .register(RoutineRemove)
         .register(GmailSearch)
         .register(FreeSlots)
         .register(CreateDraft)
@@ -472,5 +580,75 @@ mod tests {
             }
             _ => panic!("kg neighbors failed"),
         }
+    }
+
+    #[tokio::test]
+    async fn routine_add_list_remove_round_trips() {
+        let ctx = ctx();
+        let out = RoutineAdd
+            .run(
+                RoutineAddArgs {
+                    name: "morning".into(),
+                    prompt: "tell me my first meeting".into(),
+                    schedule: "weekdays 08:30".into(),
+                },
+                &ctx,
+            )
+            .await;
+        assert!(matches!(out, ToolOutcome::Ok(_)), "add should succeed");
+
+        let listed = RoutineList.run(RoutineListArgs {}, &ctx).await;
+        let ToolOutcome::Ok(v) = listed else {
+            panic!("list should succeed")
+        };
+        let rs = v["routines"].as_array().unwrap();
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs[0]["name"], "morning");
+        assert_eq!(rs[0]["schedule"], "weekdays 08:30");
+
+        let removed = RoutineRemove
+            .run(
+                RoutineRemoveArgs {
+                    name: "morning".into(),
+                },
+                &ctx,
+            )
+            .await;
+        assert!(matches!(removed, ToolOutcome::Ok(_)));
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_schedule_is_rejected_with_a_hint() {
+        let out = RoutineAdd
+            .run(
+                RoutineAddArgs {
+                    name: "x".into(),
+                    prompt: "do a thing".into(),
+                    schedule: "whenever i feel like it".into(),
+                },
+                &ctx(),
+            )
+            .await;
+        let ToolOutcome::Err(e) = out else {
+            panic!("should reject nonsense schedules")
+        };
+        assert_eq!(e.field.as_deref(), Some("schedule"));
+        assert!(e.hint.is_some(), "the model needs to know the vocabulary");
+    }
+
+    #[tokio::test]
+    async fn removing_a_routine_that_does_not_exist_says_so() {
+        let out = RoutineRemove
+            .run(
+                RoutineRemoveArgs {
+                    name: "nope".into(),
+                },
+                &ctx(),
+            )
+            .await;
+        assert!(
+            matches!(out, ToolOutcome::Err(_)),
+            "must not silently report success"
+        );
     }
 }

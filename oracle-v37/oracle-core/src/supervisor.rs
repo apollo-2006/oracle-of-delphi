@@ -11,12 +11,18 @@
 //! The supervisor is deliberately dumb: it does not know what a "healthy" child
 //! is beyond "still running". Readiness (e.g. the LLM server accepting requests)
 //! is the caller's concern — core simply retries its own connections.
+//!
+//! Children can also be paused and resumed at runtime via [`ChildHandle`], which
+//! is what lets the LLM server be unloaded while idle and brought back on the
+//! next wake word. A paused child is killed, not merely stopped being watched:
+//! the whole point is to give its VRAM back.
 
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
 use tokio::process::Command;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -37,6 +43,51 @@ pub struct ChildSpec {
     pub log_path: PathBuf,
 }
 
+/// A runtime control for one supervised child.
+///
+/// Cloneable and cheap: it is a handle on a watch channel the child's own loop
+/// is listening to. Dropping every clone does NOT stop the child — only the
+/// supervisor's cancellation does that — so a caller can hold one for as long
+/// as it likes without owning the child's lifetime.
+#[derive(Clone)]
+pub struct ChildHandle {
+    name: String,
+    desired_running: watch::Sender<bool>,
+}
+
+impl ChildHandle {
+    /// Kill the child and keep it down until [`start`](Self::start).
+    ///
+    /// Returns true if this actually changed the desired state, so callers can
+    /// avoid logging "unloading" every time an idle timer ticks.
+    pub fn stop(&self) -> bool {
+        let changed = *self.desired_running.borrow();
+        if changed {
+            let _ = self.desired_running.send(false);
+        }
+        changed
+    }
+
+    /// Bring the child back up if it is down. Returns true if it was down.
+    pub fn start(&self) -> bool {
+        let was_down = !*self.desired_running.borrow();
+        if was_down {
+            let _ = self.desired_running.send(true);
+        }
+        was_down
+    }
+
+    /// Whether the child is *meant* to be running. Not a health check: a child
+    /// that just crashed still reads true while it waits to be restarted.
+    pub fn is_running(&self) -> bool {
+        *self.desired_running.borrow()
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 /// Supervises a set of children until a shared cancellation token fires.
 pub struct Supervisor {
     cancel: CancellationToken,
@@ -51,10 +102,27 @@ impl Supervisor {
         }
     }
 
-    /// Start supervising a child immediately.
-    pub fn supervise(&mut self, spec: ChildSpec) {
+    /// Start supervising a child immediately. The returned handle can pause and
+    /// resume it later; ignoring it just means the child runs until shutdown.
+    pub fn supervise(&mut self, spec: ChildSpec) -> ChildHandle {
+        self.supervise_with_state(spec, true)
+    }
+
+    /// Supervise a child that starts out paused — registered and controllable,
+    /// but not launched until someone calls [`ChildHandle::start`].
+    pub fn supervise_paused(&mut self, spec: ChildSpec) -> ChildHandle {
+        self.supervise_with_state(spec, false)
+    }
+
+    fn supervise_with_state(&mut self, spec: ChildSpec, running: bool) -> ChildHandle {
         let cancel = self.cancel.clone();
-        self.tasks.push(tokio::spawn(run_child(spec, cancel)));
+        let (tx, rx) = watch::channel(running);
+        let handle = ChildHandle {
+            name: spec.name.clone(),
+            desired_running: tx,
+        };
+        self.tasks.push(tokio::spawn(run_child(spec, cancel, rx)));
+        handle
     }
 
     /// True if nothing is being supervised.
@@ -72,11 +140,25 @@ impl Supervisor {
 }
 
 /// Keep one child alive: (re)spawn it until cancelled, then kill it.
-async fn run_child(spec: ChildSpec, cancel: CancellationToken) {
+async fn run_child(spec: ChildSpec, cancel: CancellationToken, mut desired: watch::Receiver<bool>) {
     let mut backoff = Duration::from_millis(500);
     let max_backoff = Duration::from_secs(15);
 
     while !cancel.is_cancelled() {
+        // Park while the child is meant to be down. `borrow()` is scoped tightly
+        // because its guard is not Send and must not be held across an await.
+        while !*desired.borrow() {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                changed = desired.changed() => {
+                    // The sender is gone: nothing can ever resume us.
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+
         match spawn_one(&spec) {
             Ok(mut child) => {
                 let pid = child.id();
@@ -89,6 +171,23 @@ async fn run_child(spec: ChildSpec, cancel: CancellationToken) {
                         let _ = child.wait().await;
                         info!(name = %spec.name, "supervised process stopped");
                         return;
+                    }
+                    changed = desired.changed() => {
+                        if changed.is_err() {
+                            let _ = child.start_kill();
+                            let _ = child.wait().await;
+                            return;
+                        }
+                        if !*desired.borrow() {
+                            // Paused: kill it now. Releasing the resources IS the
+                            // feature, so this must not wait for a natural exit.
+                            let _ = child.start_kill();
+                            let _ = child.wait().await;
+                            info!(name = %spec.name, "supervised process paused");
+                        }
+                        // Either way, loop back: the park above re-checks state,
+                        // and a resume simply falls through to a fresh spawn.
+                        continue;
                     }
                     status = child.wait() => {
                         if cancel.is_cancelled() {
@@ -215,6 +314,140 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), sup.shutdown())
             .await
             .expect("shutdown during backoff must not hang");
+    }
+
+    /// Count how many times a child has (re)started by having it append to a
+    /// file. More reliable than watching process tables.
+    fn appender(marker: &std::path::Path) -> (String, Vec<String>) {
+        let m = marker.to_string_lossy().to_string();
+        if cfg!(windows) {
+            (
+                "cmd".into(),
+                vec![
+                    "/C".into(),
+                    format!("echo x >> \"{m}\" & ping 127.0.0.1 -n 30 > NUL"),
+                ],
+            )
+        } else {
+            (
+                "sh".into(),
+                vec!["-c".into(), format!("echo x >> '{m}'; sleep 30")],
+            )
+        }
+    }
+
+    fn launches(marker: &std::path::Path) -> usize {
+        std::fs::read_to_string(marker)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn a_paused_child_is_killed_and_a_resumed_one_relaunches() {
+        // This is the whole basis of idle unload: pausing must actually release
+        // the process, and resuming must bring a fresh one back.
+        let marker = tmp_log("pauseresume");
+        let _ = std::fs::remove_file(&marker);
+        let (program, args) = appender(&marker);
+
+        let cancel = CancellationToken::new();
+        let mut sup = Supervisor::new(cancel.clone());
+        let handle = sup.supervise(ChildSpec {
+            name: "pausable".into(),
+            program,
+            args,
+            log_path: tmp_log("pauseresume-log"),
+        });
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(launches(&marker), 1, "should have launched once");
+        assert!(handle.is_running());
+
+        assert!(handle.stop(), "stop should report a state change");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!handle.is_running());
+        assert_eq!(
+            launches(&marker),
+            1,
+            "a paused child must not be restarted by the supervise loop"
+        );
+
+        assert!(handle.start(), "start should report it was down");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(launches(&marker), 2, "resuming must spawn a fresh child");
+
+        tokio::time::timeout(Duration::from_secs(5), sup.shutdown())
+            .await
+            .expect("shutdown must not hang");
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[tokio::test]
+    async fn stop_and_start_are_idempotent() {
+        let cancel = CancellationToken::new();
+        let mut sup = Supervisor::new(cancel.clone());
+        let (program, args) = sleeper("30");
+        let handle = sup.supervise(ChildSpec {
+            name: "idem".into(),
+            program,
+            args,
+            log_path: tmp_log("idem"),
+        });
+        assert!(handle.stop(), "first stop changes state");
+        assert!(!handle.stop(), "second stop is a no-op");
+        assert!(handle.start(), "first start changes state");
+        assert!(!handle.start(), "second start is a no-op");
+        tokio::time::timeout(Duration::from_secs(5), sup.shutdown())
+            .await
+            .expect("shutdown must not hang");
+    }
+
+    #[tokio::test]
+    async fn a_child_supervised_paused_never_launches_until_started() {
+        let marker = tmp_log("startpaused");
+        let _ = std::fs::remove_file(&marker);
+        let (program, args) = appender(&marker);
+
+        let cancel = CancellationToken::new();
+        let mut sup = Supervisor::new(cancel.clone());
+        let handle = sup.supervise_paused(ChildSpec {
+            name: "lazy".into(),
+            program,
+            args,
+            log_path: tmp_log("startpaused-log"),
+        });
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(launches(&marker), 0, "must not launch while paused");
+        assert!(!handle.is_running());
+
+        handle.start();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(launches(&marker), 1);
+
+        tokio::time::timeout(Duration::from_secs(5), sup.shutdown())
+            .await
+            .expect("shutdown must not hang");
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[tokio::test]
+    async fn shutdown_is_prompt_while_a_child_is_paused() {
+        // The park loop must wake on cancellation, not only on a resume.
+        let cancel = CancellationToken::new();
+        let mut sup = Supervisor::new(cancel.clone());
+        let (program, args) = sleeper("30");
+        let handle = sup.supervise(ChildSpec {
+            name: "parked".into(),
+            program,
+            args,
+            log_path: tmp_log("parked"),
+        });
+        handle.stop();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::timeout(Duration::from_secs(5), sup.shutdown())
+            .await
+            .expect("shutdown must not hang on a parked child");
     }
 
     #[tokio::test]

@@ -21,6 +21,8 @@ pub struct Config {
     #[serde(default)]
     pub memory: MemoryConfig,
     #[serde(default)]
+    pub proactive: ProactiveConfig,
+    #[serde(default)]
     pub actd: ActdConfig,
     #[serde(default)]
     pub hud: HudConfig,
@@ -135,6 +137,20 @@ pub struct LlmConfig {
 pub struct MemoryConfig {
     pub db_path: String,
     pub retrieve_limit: usize,
+    /// Inject relevant memory into the prompt automatically each turn, instead
+    /// of waiting for the model to call `memory.recall` itself.
+    #[serde(default = "default_true")]
+    pub auto_recall: bool,
+    /// Write each completed turn to memory automatically.
+    #[serde(default = "default_true")]
+    pub auto_record: bool,
+    /// How many recalled episodes to inject at most.
+    #[serde(default = "default_recall_limit")]
+    pub recall_limit: usize,
+    /// Minimum retrieval score worth injecting; weak matches cost context and
+    /// invite spurious connections.
+    #[serde(default = "default_recall_min_score")]
+    pub recall_min_score: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +175,13 @@ pub struct HudConfig {
 #[serde(deny_unknown_fields)]
 pub struct AgentSettings {
     pub step_budget: u32,
+    /// Put the focused window (and a few other open ones) into the prompt each
+    /// turn, so "close this" and "what is this error" have a referent.
+    #[serde(default = "default_true")]
+    pub screen_context: bool,
+    /// How many non-focused windows to list alongside it.
+    #[serde(default = "default_screen_other_windows")]
+    pub screen_other_windows: usize,
 }
 
 /// Self-supervision: what `oracle-core run` should launch and manage on its own
@@ -191,6 +214,16 @@ pub struct SuperviseConfig {
     /// Chromium-based browser, or "default"/"" to just open the default browser.
     #[serde(default = "default_browser")]
     pub browser: String,
+    /// Unload the supervised LLM after this many seconds with no activity, and
+    /// reload it on the next turn. 0 disables it (the model stays resident).
+    ///
+    /// The wake-word recognizer is a separate, small process, so nothing is
+    /// lost by dropping the model between conversations -- only the VRAM.
+    #[serde(default = "default_idle_unload_secs")]
+    pub idle_unload_secs: i64,
+    /// How long to wait for llama-server to report healthy after a reload.
+    #[serde(default = "default_llm_ready_timeout_secs")]
+    pub llm_ready_timeout_secs: u64,
 }
 
 impl Default for SuperviseConfig {
@@ -203,6 +236,8 @@ impl Default for SuperviseConfig {
             actd_program: String::new(),
             open_window: true,
             browser: default_browser(),
+            idle_unload_secs: default_idle_unload_secs(),
+            llm_ready_timeout_secs: default_llm_ready_timeout_secs(),
         }
     }
 }
@@ -210,8 +245,34 @@ impl Default for SuperviseConfig {
 fn default_true() -> bool {
     true
 }
+fn default_screen_other_windows() -> usize {
+    6
+}
+fn default_recall_limit() -> usize {
+    5
+}
+fn default_recall_min_score() -> f32 {
+    0.15
+}
+/// Which Chromium-based browser hosts the chromeless HUD window by default.
+///
+/// Edge ships with Windows, so it is the one browser guaranteed present there.
+/// It is a rarity on macOS and Linux, where Chrome is far likelier to exist, so
+/// defaulting to Edge everywhere meant the first candidate never resolved.
+/// Ten minutes: long enough to cover a pause mid-task, short enough that an
+/// afternoon away gives the GPU back.
+fn default_idle_unload_secs() -> i64 {
+    600
+}
+fn default_llm_ready_timeout_secs() -> u64 {
+    90
+}
 fn default_browser() -> String {
-    "edge".into()
+    if cfg!(windows) {
+        "edge".into()
+    } else {
+        "chrome".into()
+    }
 }
 
 /// Server-side text-to-speech. When enabled and a program is set, `oracle-core`
@@ -390,11 +451,100 @@ impl Default for LlmConfig {
         }
     }
 }
+/// Whether and when Pythia may speak unprompted.
+///
+/// Off by default: an assistant that starts talking on its own is a behaviour
+/// change the user should opt into, not discover.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProactiveConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// How often to poll the triggers, in seconds.
+    #[serde(default = "default_poll_secs")]
+    pub poll_secs: u64,
+    /// Announce a calendar event this many minutes before it starts.
+    #[serde(default = "default_lead_minutes")]
+    pub lead_minutes: i64,
+    /// Watch the calendar for upcoming events.
+    #[serde(default = "default_true")]
+    pub calendar: bool,
+    /// Watch for unread mail matching `mail_query`.
+    #[serde(default)]
+    pub mail: bool,
+    /// Gmail search syntax. Deliberately narrow by default: every inbox message
+    /// is noise, a starred one from a real person is not.
+    #[serde(default = "default_mail_query")]
+    pub mail_query: String,
+    /// Local hour quiet hours begin (0-23).
+    #[serde(default = "default_quiet_from")]
+    pub quiet_from_hour: u32,
+    /// Local hour quiet hours end (0-23).
+    #[serde(default = "default_quiet_until")]
+    pub quiet_until_hour: u32,
+    /// Don't repeat the same nudge within this many seconds.
+    #[serde(default = "default_repeat_after")]
+    pub repeat_after_secs: i64,
+    /// Ceiling on nudges spoken in any rolling hour.
+    #[serde(default = "default_max_per_hour")]
+    pub max_per_hour: usize,
+    /// Process names to announce when they finish, matched case-insensitively
+    /// by substring (e.g. ["cargo", "MSBuild", "ffmpeg"]). Needs actd.
+    ///
+    /// This is the trigger class a cloud assistant cannot have.
+    #[serde(default)]
+    pub watch_processes: Vec<String>,
+}
+
+impl Default for ProactiveConfig {
+    fn default() -> Self {
+        ProactiveConfig {
+            enabled: false,
+            poll_secs: default_poll_secs(),
+            lead_minutes: default_lead_minutes(),
+            calendar: true,
+            mail: false,
+            mail_query: default_mail_query(),
+            quiet_from_hour: default_quiet_from(),
+            quiet_until_hour: default_quiet_until(),
+            repeat_after_secs: default_repeat_after(),
+            max_per_hour: default_max_per_hour(),
+            watch_processes: Vec::new(),
+        }
+    }
+}
+
+fn default_poll_secs() -> u64 {
+    60
+}
+fn default_lead_minutes() -> i64 {
+    10
+}
+fn default_mail_query() -> String {
+    "is:unread is:starred".into()
+}
+fn default_quiet_from() -> u32 {
+    22
+}
+fn default_quiet_until() -> u32 {
+    8
+}
+fn default_repeat_after() -> i64 {
+    6 * 3600
+}
+fn default_max_per_hour() -> usize {
+    4
+}
+
 impl Default for MemoryConfig {
     fn default() -> Self {
         MemoryConfig {
             db_path: "oracle.db".into(),
             retrieve_limit: 6,
+            auto_recall: true,
+            auto_record: true,
+            recall_limit: default_recall_limit(),
+            recall_min_score: default_recall_min_score(),
         }
     }
 }
@@ -417,7 +567,11 @@ impl Default for HudConfig {
 }
 impl Default for AgentSettings {
     fn default() -> Self {
-        AgentSettings { step_budget: 12 }
+        AgentSettings {
+            step_budget: 12,
+            screen_context: true,
+            screen_other_windows: default_screen_other_windows(),
+        }
     }
 }
 fn default_runtime_dir() -> String {
@@ -596,5 +750,37 @@ mod tests {
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.agent.step_budget, 12);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(test)]
+    mod proactive_config_tests {
+        use super::*;
+
+        #[test]
+        fn proactive_is_off_unless_asked_for() {
+            // Speaking unprompted is a behaviour change the user opts into, not
+            // one they discover.
+            assert!(!ProactiveConfig::default().enabled);
+        }
+
+        #[test]
+        fn a_config_without_a_proactive_section_still_parses() {
+            // Existing oracle.toml files predate this section.
+            let cfg: Config = toml::from_str("").expect("empty config should parse");
+            assert!(!cfg.proactive.enabled);
+            assert_eq!(cfg.proactive.quiet_from_hour, 22);
+            assert_eq!(cfg.proactive.max_per_hour, 4);
+        }
+
+        #[test]
+        fn partial_proactive_section_keeps_the_other_defaults() {
+            let cfg: Config = toml::from_str("[proactive]\nenabled = true\nmax_per_hour = 1\n")
+                .expect("partial section should parse");
+            assert!(cfg.proactive.enabled);
+            assert_eq!(cfg.proactive.max_per_hour, 1);
+            assert_eq!(cfg.proactive.quiet_until_hour, 8, "untouched default");
+            assert!(cfg.proactive.calendar);
+            assert!(!cfg.proactive.mail, "mail is opt-in on top of proactive");
+        }
     }
 }

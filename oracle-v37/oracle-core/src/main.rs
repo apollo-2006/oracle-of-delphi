@@ -255,9 +255,10 @@ async fn already_running(bind: &str) -> bool {
 
 /// Build and start the process supervisor from config: the LLM server and the
 /// actd daemon, each launched hidden and kept alive until core shuts down.
-fn start_supervisor(cfg: &Config) -> Supervisor {
+fn start_supervisor(cfg: &Config) -> (Supervisor, Option<oracle_core::supervisor::ChildHandle>) {
     let mut sup = Supervisor::new(CancellationToken::new());
     let rt = PathBuf::from(&cfg.general.runtime_dir);
+    let mut llm_handle = None;
 
     if cfg.supervise.autostart_llm {
         if cfg.supervise.llm_program.trim().is_empty() {
@@ -270,12 +271,12 @@ fn start_supervisor(cfg: &Config) -> Supervisor {
                 cfg.supervise.llm_program,
                 cfg.supervise.llm_args.join(" ")
             );
-            sup.supervise(ChildSpec {
+            llm_handle = Some(sup.supervise(ChildSpec {
                 name: "llm".into(),
                 program: cfg.supervise.llm_program.clone(),
                 args: cfg.supervise.llm_args.clone(),
                 log_path: rt.join("llm.log"),
-            });
+            }));
         }
     } else {
         println!(
@@ -316,7 +317,7 @@ fn start_supervisor(cfg: &Config) -> Supervisor {
     if !sup.is_empty() {
         tracing::info!("supervisor managing the LLM server and/or actd daemon");
     }
-    sup
+    (sup, llm_handle)
 }
 
 /// Reap any orphaned `oracle-actd` still holding the named pipe, so the fresh
@@ -481,7 +482,89 @@ fn browser_candidates(browser: &str) -> Vec<String> {
     }
 }
 
-#[cfg(not(windows))]
+/// macOS ships browsers as app bundles, so the executable is buried inside
+/// `.app/Contents/MacOS/` and is never a bare name on PATH. Falling through to
+/// the Linux names below meant no candidate ever resolved and the HUD always
+/// degraded to an ordinary browser tab instead of a chromeless app window.
+#[cfg(target_os = "macos")]
+fn browser_candidates(browser: &str) -> Vec<String> {
+    macos_browser_candidates(browser, &std::env::var("HOME").unwrap_or_default())
+}
+
+/// The macOS candidate list, as a pure function of the browser and `$HOME`.
+///
+/// Split out and compiled on every target so it can be unit-tested off a Mac;
+/// the `cfg`-gated wrapper above is the only macOS-only part.
+#[allow(dead_code)]
+fn macos_browser_candidates(browser: &str, home: &str) -> Vec<String> {
+    // A user-local install under ~/Applications takes precedence over the
+    // system-wide one, matching how macOS itself resolves apps.
+    let bundled = |name: &str, exe: &str| {
+        vec![
+            format!("{home}/Applications/{name}.app/Contents/MacOS/{exe}"),
+            format!("/Applications/{name}.app/Contents/MacOS/{exe}"),
+        ]
+    };
+    match browser {
+        "chrome" => {
+            let mut v = bundled("Google Chrome", "Google Chrome");
+            v.extend(bundled("Chromium", "Chromium"));
+            v.extend(bundled("Brave Browser", "Brave Browser"));
+            v
+        }
+        "edge" => bundled("Microsoft Edge", "Microsoft Edge"),
+        other => vec![other.to_string()],
+    }
+}
+
+#[cfg(test)]
+mod macos_browser_tests {
+    use super::macos_browser_candidates;
+
+    #[test]
+    fn candidates_are_bundle_executables_not_bare_names() {
+        // try_app_window skips any candidate containing a separator that does
+        // not exist on disk, and spawns bare names directly. A bare "chrome"
+        // on macOS would report a phantom launch, so every candidate here must
+        // be a real absolute path into a bundle.
+        for c in macos_browser_candidates("chrome", "/Users/abir") {
+            assert!(c.starts_with('/'), "not absolute: {c}");
+            assert!(c.contains(".app/Contents/MacOS/"), "not a bundle exe: {c}");
+        }
+    }
+
+    #[test]
+    fn user_applications_outrank_system_ones() {
+        let c = macos_browser_candidates("chrome", "/Users/abir");
+        let user = c.iter().position(|p| p.starts_with("/Users/abir")).unwrap();
+        let system = c
+            .iter()
+            .position(|p| p.starts_with("/Applications"))
+            .unwrap();
+        assert!(user < system, "a user-local install must be preferred");
+    }
+
+    #[test]
+    fn chrome_falls_back_through_chromium_and_brave() {
+        let c = macos_browser_candidates("chrome", "/Users/abir").join(" ");
+        assert!(c.contains("Google Chrome.app"));
+        assert!(c.contains("Chromium.app"));
+        assert!(c.contains("Brave Browser.app"));
+    }
+
+    #[test]
+    fn an_explicit_path_is_passed_through_untouched() {
+        assert_eq!(
+            macos_browser_candidates(
+                "/Applications/Custom.app/Contents/MacOS/Custom",
+                "/Users/abir"
+            ),
+            vec!["/Applications/Custom.app/Contents/MacOS/Custom"]
+        );
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn browser_candidates(browser: &str) -> Vec<String> {
     match browser {
         "chrome" => vec![
@@ -604,6 +687,12 @@ fn build_llm(cfg: &Config) -> Arc<dyn Llm> {
 
 fn agent_config(cfg: &Config) -> AgentConfig {
     AgentConfig {
+        screen_context: cfg.agent.screen_context,
+        screen_other_windows: cfg.agent.screen_other_windows,
+        auto_recall: cfg.memory.auto_recall,
+        auto_record: cfg.memory.auto_record,
+        recall_limit: cfg.memory.recall_limit,
+        recall_min_score: cfg.memory.recall_min_score,
         step_budget: cfg.agent.step_budget,
         max_tokens: cfg.llm.max_tokens,
         temperature: cfg.llm.temperature,
@@ -629,12 +718,24 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
 
     // Self-supervision: bring up the LLM server and actd as hidden background
     // children so the whole assistant starts from one launch, no terminals.
-    let supervisor = start_supervisor(&cfg);
+    let (supervisor, llm_child) = start_supervisor(&cfg);
+
+    // Idle unload: give the GPU back between conversations. See oracle_core::idle.
+    let llm_life = Arc::new(oracle_core::idle::LlmLifecycle::new(
+        llm_child,
+        &cfg.llm.backend,
+        std::time::Duration::from_secs(cfg.supervise.llm_ready_timeout_secs),
+    ));
+    let idle_tracker = Arc::new(oracle_core::idle::IdleTracker::new(
+        chrono::Utc::now().timestamp(),
+        cfg.supervise.idle_unload_secs,
+    ));
 
     // Bring up the local TTS server (Kokoro) out-of-band: launch once if it isn't
     // already answering, then poll until it's warm. Decoupled from the supervisor
     // so the container outlives core restarts instead of being killed with it.
-    if !cfg.voice.tts_server_program.trim().is_empty() && !cfg.voice.tts_http_url.trim().is_empty() {
+    if !cfg.voice.tts_server_program.trim().is_empty() && !cfg.voice.tts_http_url.trim().is_empty()
+    {
         let voice = cfg.voice.clone();
         let log_path = PathBuf::from(&cfg.general.runtime_dir).join("tts.log");
         tokio::spawn(async move { ensure_tts_server(voice, log_path).await });
@@ -659,6 +760,8 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     );
     let llm = build_llm(&cfg);
     // Arc so each HUD-driven turn can run on its own task.
+    let google_for_proactive = shared.google.clone();
+    let agent_shared = shared.clone();
     let agent = Arc::new(Agent::new(llm, demo_registry(), shared, agent_config(&cfg)));
 
     // Session restore (warm start).
@@ -755,6 +858,8 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             wake_rx,
             followup_rx,
             wake_cancel.clone(),
+            llm_life.clone(),
+            idle_tracker.clone(),
         );
     }
     let mut current_wake = wake_on;
@@ -766,6 +871,51 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         tts: tts_on,
         wake: current_wake,
     });
+
+    let mut idle_watch_stop: Option<CancellationToken> = None;
+    // Idle watcher: unload the model once the lull passes the threshold. Polls
+    // rather than sleeping to the deadline so a `touch` mid-wait is honoured.
+    if !llm_life.is_inert() && cfg.supervise.idle_unload_secs > 0 {
+        let life = llm_life.clone();
+        let tracker = idle_tracker.clone();
+        let stop = CancellationToken::new();
+        let watcher_stop = stop.clone();
+        idle_watch_stop = Some(stop);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = watcher_stop.cancelled() => return,
+                }
+                if tracker.is_idle(chrono::Utc::now().timestamp()) && life.unload() {
+                    tracing::info!("[idle] no activity; unloaded the LLM and freed its VRAM");
+                }
+            }
+        });
+    }
+
+    // Shared "a real conversation is in flight" signal, so the proactive loop
+    // never talks over the user.
+    let turn_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let proactive_stop = CancellationToken::new();
+    spawn_routine_watcher(
+        agent_shared.clone(),
+        gateway.command_sender(),
+        turn_busy.clone(),
+        proactive_stop.clone(),
+    );
+    if cfg.proactive.enabled {
+        spawn_proactive(
+            cfg.proactive.clone(),
+            google_for_proactive,
+            agent_shared.clone(),
+            publisher.clone(),
+            voice_cfg.clone(),
+            turn_busy.clone(),
+            proactive_stop.clone(),
+        );
+    }
 
     // Handle inbound HUD commands until shutdown. A typed message starts a
     // conversation turn whose events stream back to the HUD; Interrupt cancels
@@ -844,6 +994,9 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
                             voice_cfg.clone(),
                             reply_tx.clone(),
                             followup_tx.clone(),
+                            turn_busy.clone(),
+                            llm_life.clone(),
+                            idle_tracker.clone(),
                         );
                     }
                     Some(HudCommand::Confirm { request_id, allow }) => {
@@ -875,6 +1028,9 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
                                     voice_cfg.clone(),
                                     reply_tx.clone(),
                                     followup_tx.clone(),
+                                    turn_busy.clone(),
+                                    llm_life.clone(),
+                                    idle_tracker.clone(),
                                 );
                             }
                             _ => {
@@ -945,12 +1101,232 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let _ = snap.save(&session_path);
     let _ = agent; // kept alive until here
 
+    proactive_stop.cancel();
+    if let Some(t) = idle_watch_stop.take() {
+        t.cancel();
+    }
     // Reap the supervised children (LLM server, actd) so nothing is orphaned.
     supervisor.shutdown().await;
     info!("shutdown complete");
     Ok(())
 }
 
+/// Fire due standing orders by injecting them into the normal command channel.
+///
+/// Deliberately reuses the ordinary turn path rather than running the agent
+/// directly: a routine then gets history, the busy flag, LLM reload-on-demand,
+/// TTS and the HUD state machine for free, and behaves exactly as if the user
+/// had typed it at that moment -- which is precisely what a standing order is.
+///
+/// Unlike the nudge triggers in `oracle_core::proactive`, this DOES run the
+/// planner. The distinction is authorship: a nudge is a heuristic firing on its
+/// own, a routine is the user's own instruction, time-shifted. The capability
+/// gate is unchanged, so an unattended turn that reaches an irreversible action
+/// still stops at the confirmer and is denied when nobody answers.
+fn spawn_routine_watcher(
+    shared: Arc<Shared>,
+    cmd_tx: tokio::sync::mpsc::Sender<HudCommand>,
+    busy: Arc<std::sync::atomic::AtomicBool>,
+    shutdown: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = shutdown.cancelled() => return,
+            }
+
+            // Never start a routine on top of a live conversation; it will be
+            // due again on the next tick.
+            if busy.load(std::sync::atomic::Ordering::SeqCst) {
+                continue;
+            }
+
+            let now_unix = chrono::Utc::now().timestamp();
+            let local = chrono::Local::now().naive_local();
+            let due = match shared.routines.due(local, now_unix) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("[routine] could not read routines: {e}");
+                    continue;
+                }
+            };
+
+            for r in due {
+                tracing::info!(name = %r.name, "[routine] firing");
+                // Mark BEFORE running. A routine whose turn is slow, or which
+                // fails outright, must not fire again on the next 30s tick.
+                if let Err(e) = shared.routines.mark_fired(r.id, now_unix) {
+                    tracing::warn!(name = %r.name, "[routine] could not mark fired: {e}");
+                    continue;
+                }
+                if cmd_tx
+                    .send(HudCommand::UserText {
+                        text: r.prompt.clone(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return; // the run loop is gone
+                }
+                // One at a time: several routines due at once should not race
+                // each other into overlapping turns.
+                break;
+            }
+        }
+    });
+}
+
+/// The proactive loop: poll the triggers, gate each nudge through the policy,
+/// and speak whatever survives.
+///
+/// Deliberately has no `Agent` and no tool registry. Its only capabilities are
+/// reading Google and emitting speech, so the worst a bug here can do is say
+/// something at a bad moment -- see `oracle_core::proactive` for why that
+/// boundary is drawn this way.
+#[allow(clippy::too_many_arguments)]
+fn spawn_proactive(
+    cfg: oracle_core::config::ProactiveConfig,
+    google: Option<Arc<oracle_core::connectors::google_api::GoogleClient>>,
+    shared: Arc<Shared>,
+    publisher: oracle_core::gateway::server::HudPublisher,
+    voice: Arc<oracle_core::config::VoiceConfig>,
+    busy: Arc<std::sync::atomic::AtomicBool>,
+    shutdown: CancellationToken,
+) {
+    use oracle_core::proactive::{triggers, NudgePolicy, PolicyConfig};
+    use std::sync::atomic::Ordering;
+
+    let mut processes = triggers::ProcessWatcher::new(cfg.watch_processes.clone());
+    let watches_local = !processes.is_empty() && shared.actd.is_some();
+
+    // Google-backed triggers are optional; the local ones stand on their own.
+    if google.is_none() && !watches_local {
+        tracing::info!(
+            "[proactive] enabled but nothing to watch: Google is not authorized and no \
+             watch_processes are set (or actd is not connected)."
+        );
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut policy = NudgePolicy::new(PolicyConfig {
+            quiet_from_hour: cfg.quiet_from_hour,
+            quiet_until_hour: cfg.quiet_until_hour,
+            repeat_after_secs: cfg.repeat_after_secs,
+            max_per_hour: cfg.max_per_hour,
+        });
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(cfg.poll_secs.max(10)));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        tracing::info!(
+            poll_secs = cfg.poll_secs,
+            calendar = cfg.calendar,
+            mail = cfg.mail,
+            "[proactive] watching"
+        );
+
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = shutdown.cancelled() => {
+                    tracing::info!("[proactive] stopping");
+                    return;
+                }
+            }
+
+            let now = chrono::Utc::now().timestamp();
+            let mut nudges = Vec::new();
+
+            if let Some(google) = google.as_ref() {
+                if cfg.calendar {
+                    // Only look as far ahead as we would announce.
+                    let t_min = chrono::Utc::now().to_rfc3339();
+                    let t_max = (chrono::Utc::now()
+                        + chrono::Duration::minutes(cfg.lead_minutes.max(1)))
+                    .to_rfc3339();
+                    match google.calendar_events(&t_min, &t_max, now).await {
+                        Ok(events) => {
+                            nudges.extend(triggers::calendar_nudges(&events, now, cfg.lead_minutes))
+                        }
+                        // A transient network failure must not kill the loop.
+                        Err(e) => tracing::warn!("[proactive] calendar poll failed: {e}"),
+                    }
+                }
+
+                if cfg.mail {
+                    match google.gmail_search(&cfg.mail_query, 5, now).await {
+                        Ok(mail) => nudges.extend(triggers::mail_nudges(&mail)),
+                        Err(e) => tracing::warn!("[proactive] mail poll failed: {e}"),
+                    }
+                }
+            }
+
+            // Local: what is running on this machine right now.
+            if watches_local {
+                if let Some(actd) = shared.actd.clone() {
+                    match actd
+                        .call(
+                            uuid::Uuid::new_v4(),
+                            oracle_ipc::actd::ActRequest::ListProcesses,
+                        )
+                        .await
+                    {
+                        Ok(oracle_ipc::actd::ActResponse::Ok { data }) => {
+                            let names: Vec<String> = data
+                                .get("processes")
+                                .and_then(|p| p.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|p| p.get("name").and_then(|n| n.as_str()))
+                                        .map(|n| n.to_string())
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            nudges.extend(processes.poll(&names));
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!("[proactive] process poll failed: {e}"),
+                    }
+                }
+            }
+
+            for nudge in nudges {
+                let local_hour = {
+                    use chrono::Timelike as _;
+                    chrono::Local::now().hour()
+                };
+                let in_flight = busy.load(Ordering::SeqCst);
+                match policy.admit(&nudge, now, local_hour, in_flight) {
+                    Ok(()) => {
+                        tracing::info!(kind = nudge.kind.as_str(), key = %nudge.key, "[proactive] speaking");
+                        let wav = synth_tts_async(voice.clone(), nudge.text.clone())
+                            .await
+                            .map(encode_wav_b64);
+                        publisher.send_event(HudEvent::Speak {
+                            text: nudge.text,
+                            wav_b64: wav,
+                        });
+                    }
+                    Err(reason) => {
+                        tracing::debug!(key = %nudge.key, ?reason, "[proactive] suppressed");
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Clears a flag when dropped, so the "a turn is in flight" signal is released
+/// on every exit path -- including a panic inside the turn task.
+struct FlagGuard(Arc<std::sync::atomic::AtomicBool>);
+impl Drop for FlagGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 /// Run one HUD-driven conversation turn on its own task, mapping the agent's
 /// events onto HUD events so the browser shows the transcript, tool activity,
 /// and the streaming reply.
@@ -965,8 +1341,16 @@ fn spawn_hud_turn(
     voice: Arc<oracle_core::config::VoiceConfig>,
     reply_tx: mpsc::Sender<(String, Option<String>, String)>,
     followup_tx: mpsc::Sender<std::time::Duration>,
+    busy: Arc<std::sync::atomic::AtomicBool>,
+    llm_life: Arc<oracle_core::idle::LlmLifecycle>,
+    idle_tracker: Arc<oracle_core::idle::IdleTracker>,
 ) {
     tokio::spawn(async move {
+        // Tell the proactive loop a real conversation is happening, so it does
+        // not talk over it. Cleared on every exit path below, including errors.
+        busy.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _busy_guard = FlagGuard(busy.clone());
+        idle_tracker.touch(chrono::Utc::now().timestamp());
         let turn = uuid::Uuid::new_v4();
         // Keep a copy of the user's message to report back for history.
         let user_text = text.clone();
@@ -979,6 +1363,20 @@ fn spawn_hud_turn(
             turn,
             state: "thinking".into(),
         });
+
+        // The model may have been unloaded while idle. Bring it back and wait
+        // for it to answer /health before the request goes out, so the first
+        // turn after a lull is slow rather than a bare connection error.
+        if !llm_life.ensure_ready().await {
+            publisher.send_event(HudEvent::Caption {
+                text: "the model is still loading — try again in a moment.".into(),
+            });
+            publisher.send_event(HudEvent::State {
+                turn,
+                state: "idle".into(),
+            });
+            return;
+        }
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
         let run = agent.run_turn_with_history(history, text, tx, cancel);
@@ -1597,6 +1995,8 @@ async fn handle_wake_line(
     cmd_tx: &tokio::sync::mpsc::Sender<HudCommand>,
     voice: &Arc<oracle_core::config::VoiceConfig>,
     st: &mut WakeState,
+    llm_life: &Arc<oracle_core::idle::LlmLifecycle>,
+    idle_tracker: &Arc<oracle_core::idle::IdleTracker>,
 ) {
     use std::time::{Duration, Instant};
     let Some(text) = clean_transcript_line(line) else {
@@ -1607,6 +2007,18 @@ async fn handle_wake_line(
         return;
     }
     publisher.send_event(HudEvent::Interim { text: text.clone() });
+
+    // Speech means the user is here: hold off the idle unloader, and if the
+    // model is already down start reloading NOW rather than when they finish
+    // talking. The load then overlaps with the rest of the sentence instead of
+    // being dead air after it.
+    idle_tracker.touch(chrono::Utc::now().timestamp());
+    if !llm_life.is_inert() {
+        let life = llm_life.clone();
+        tokio::spawn(async move {
+            let _ = life.ensure_ready().await;
+        });
+    }
     let now = Instant::now();
 
     // 1) Already gathering a command → this segment is a continuation. Fold it in
@@ -1722,6 +2134,7 @@ async fn barge_in(
 
 /// Run the streaming recognizer while `active`, forwarding its transcript to the
 /// HUD (live "what I'm hearing") and injecting a turn when it hears "Delphi".
+#[allow(clippy::too_many_arguments)]
 fn spawn_wake_listener(
     voice: Arc<oracle_core::config::VoiceConfig>,
     publisher: oracle_core::gateway::server::HudPublisher,
@@ -1729,6 +2142,8 @@ fn spawn_wake_listener(
     mut active_rx: tokio::sync::watch::Receiver<bool>,
     mut followup_rx: tokio::sync::mpsc::Receiver<std::time::Duration>,
     shutdown: CancellationToken,
+    llm_life: Arc<oracle_core::idle::LlmLifecycle>,
+    idle_tracker: Arc<oracle_core::idle::IdleTracker>,
 ) {
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -1821,7 +2236,11 @@ fn spawn_wake_listener(
                     l = async { out_lines.as_mut().unwrap().next_line().await }, if !out_done => {
                         match l {
                             Ok(Some(line)) => {
-                                handle_wake_line(&line, &publisher, &cmd_tx, &voice, &mut st).await
+                                handle_wake_line(
+                                    &line, &publisher, &cmd_tx, &voice, &mut st,
+                                    &llm_life, &idle_tracker,
+                                )
+                                .await
                             }
                             _ => out_done = true,
                         }
@@ -1829,7 +2248,11 @@ fn spawn_wake_listener(
                     l = async { err_lines.as_mut().unwrap().next_line().await }, if !err_done => {
                         match l {
                             Ok(Some(line)) => {
-                                handle_wake_line(&line, &publisher, &cmd_tx, &voice, &mut st).await
+                                handle_wake_line(
+                                    &line, &publisher, &cmd_tx, &voice, &mut st,
+                                    &llm_life, &idle_tracker,
+                                )
+                                .await
                             }
                             _ => err_done = true,
                         }
@@ -1950,10 +2373,7 @@ mod tts_tests {
             "http://127.0.0.1:8880"
         );
         assert_eq!(tts_origin("http://localhost:8880"), "http://localhost:8880");
-        assert_eq!(
-            tts_origin("https://host/v1/x"),
-            "https://host"
-        );
+        assert_eq!(tts_origin("https://host/v1/x"), "https://host");
         // No scheme → returned as-is (defensive).
         assert_eq!(tts_origin("127.0.0.1:8880"), "127.0.0.1:8880");
     }
@@ -2029,5 +2449,39 @@ mod wake_tests {
             clean_transcript_line("turn up the volume").as_deref(),
             Some("turn up the volume")
         );
+    }
+}
+
+#[cfg(test)]
+mod proactive_wiring_tests {
+    use super::FlagGuard;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn the_in_flight_flag_clears_even_if_the_turn_panics() {
+        // The proactive loop stays silent while this flag is set. A turn task
+        // that panicked without clearing it would mute Pythia permanently, so
+        // the release has to be a Drop, not a line at the end of the happy path.
+        let busy = Arc::new(AtomicBool::new(false));
+        let b = busy.clone();
+        let result = std::panic::catch_unwind(move || {
+            b.store(true, Ordering::SeqCst);
+            let _guard = FlagGuard(b.clone());
+            panic!("turn blew up");
+        });
+        assert!(result.is_err());
+        assert!(!busy.load(Ordering::SeqCst), "flag must be released");
+    }
+
+    #[test]
+    fn the_flag_is_set_for_the_life_of_the_guard() {
+        let busy = Arc::new(AtomicBool::new(false));
+        {
+            busy.store(true, Ordering::SeqCst);
+            let _guard = FlagGuard(busy.clone());
+            assert!(busy.load(Ordering::SeqCst));
+        }
+        assert!(!busy.load(Ordering::SeqCst));
     }
 }

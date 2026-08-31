@@ -12,15 +12,18 @@ pub mod config;
 pub mod confirm;
 pub mod connectors;
 pub mod gateway;
+pub mod idle;
 pub mod lifecycle;
 pub mod llm;
 pub mod memory;
 pub mod observ;
+pub mod proactive;
 pub mod security;
 pub mod supervisor;
 pub mod tools;
 
 use memory::{HashEmbedder, KnowledgeGraph, MemoryStore};
+use proactive::routines::RoutineStore;
 use std::sync::Arc;
 
 /// The stream type the actd client uses on this platform: a Unix domain socket
@@ -36,6 +39,8 @@ pub type ActdStream = tokio::net::TcpStream;
 pub struct Shared {
     pub memory: MemoryStore,
     pub graph: KnowledgeGraph,
+    /// Standing orders the user has asked for. Same SQLite file as memory.
+    pub routines: RoutineStore,
     pub ha: connectors::homeassistant::EntityMirror,
     /// Live Google client, present only when Workspace auth is configured and
     /// a sealed token was loaded. `None` → the Gmail/Calendar tools return a
@@ -57,14 +62,18 @@ impl Shared {
     pub fn open(db_path: &str) -> anyhow::Result<Self> {
         let memory = MemoryStore::open(db_path, Box::new(HashEmbedder::default()))?;
         let graph = KnowledgeGraph::open(db_path, KnowledgeGraph::default_vocab())?;
+        let routines = RoutineStore::open(db_path)?;
         Ok(Shared {
             memory,
             graph,
+            routines,
             ha: connectors::homeassistant::EntityMirror::new(),
             google: None,
             actd: None,
             confirmer: Arc::new(confirm::DenyConfirmer),
-            browser: Arc::new(browser::BrowserHandle::new(browser::BrowserConfig::default())),
+            browser: Arc::new(browser::BrowserHandle::new(
+                browser::BrowserConfig::default(),
+            )),
         })
     }
 
