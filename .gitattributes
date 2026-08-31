@@ -1,0 +1,44 @@
+# Line-ending policy.
+#
+# This repo is developed in WSL and built on Windows, which is exactly the
+# situation that produces phantom diffs: a Windows checkout rewrites files to
+# CRLF, git then reports every line of every file as changed, and a commit from
+# that side turns a one-line fix into a thousand-line diff.
+#
+# `text=auto eol=lf` normalizes text to LF in the repository and checks it out
+# as LF everywhere. Windows tooling (MSVC, Node, Rust, PowerShell) all handle LF
+# fine; the exceptions below are the files that genuinely want CRLF.
+
+* text=auto eol=lf
+
+# Windows scripts are read by cmd.exe/PowerShell, which want CRLF.
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# Shell scripts must stay LF or bash fails with "\r: command not found".
+*.sh   text eol=lf
+
+# Third-party data that git must never translate. espeak-ng's voice files were
+# the source of 31 phantom "modified" entries on the Windows checkout: identical
+# content, CRLF instead of LF. Marking them binary freezes them as committed.
+piper/espeak-ng-data/** -text
+
+# Models and other binaries.
+*.bin    -text
+*.gguf   -text
+*.onnx   -text
+*.pdb    -text
+*.exe    -text
+*.dll    -text
+*.so     -text
+*.dylib  -text
+*.png    -text
+*.jpg    -text
+*.ico    -text
+*.wav    -text
+*.ppm    -text
+
+# Generated: keep them out of diffs and language stats.
+Cargo.lock        linguist-generated
+package-lock.json linguist-generated
