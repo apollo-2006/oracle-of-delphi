@@ -142,6 +142,13 @@ step_budget = 12
 screen_context = true
 screen_other_windows = 6
 
+# How many recent ambient observations go into the prompt each turn, and how old
+# one may be and still count as "current". This is what lets "what am I looking
+# at?" be answered from context instead of by calling a browser tool to re-fetch
+# a page the vision model already read. Does nothing until [ambient] is on.
+screen_observations = 3
+observation_max_age_secs = 1800
+
 [google]
 # Path to your Google Desktop-app credentials.json. Set this and run
 # `oracle-core auth --credentials <path> --account <email>` once; run/repl then
@@ -199,8 +206,15 @@ small_llm_args = [
   "--mmproj", "E:\\oracle-models\\mmproj-qwen3-vl-2b-f16.gguf",
   "--host", "127.0.0.1", "--port", "8081",
   "-ngl", "999",
-  # A small context: this tier sees one window at a time, not a conversation.
-  "-c", "4096",
+  # Qwen-VL warns at load that it wants at least 1024 image tokens. It matters
+  # here: a 1024x576 frame tokenizes to roughly 180 tokens after 2x2 merging,
+  # nowhere near that, and the symptom of starving it is not an error -- it is
+  # small text coming back wrong or as "nothing legible", which reads like the
+  # index being broken rather than under-resolved.
+  "--image-min-tokens", "1024",
+  # Context has to fit an image at that budget plus the instruction. 4096 was
+  # sized for ~180-token frames and would now be mostly image.
+  "-c", "8192",
 ]
 small_llm_ready_timeout_secs = 60
 

@@ -214,6 +214,96 @@ async fn an_interpreted_frame_becomes_a_searchable_memory() {
 }
 
 #[tokio::test]
+async fn the_sampler_never_targets_pythias_own_window() {
+    // The bug: the sampler asked for `window_id: None`, which resolves to the
+    // FOREGROUND window -- and right after the user speaks, that is the HUD. The
+    // index would store a description of Pythia's own UI as a memory of what the
+    // user was looking at. The prompt's window block already avoided this; the
+    // sampler was written without it.
+    let (tx, handle, dir, sock) = boot_actd().await;
+    let client = ActdClient::connect(&sock).await.expect("connect");
+
+    let data = match client
+        .call(uuid::Uuid::new_v4(), ActRequest::ListWindows)
+        .await
+        .unwrap()
+    {
+        ActResponse::Ok { data } => data,
+        other => panic!("{other:?}"),
+    };
+    let mut windows = data["windows"].as_array().unwrap().clone();
+
+    // Put our own window frontmost, exactly as it is after a voice turn.
+    windows.insert(
+        0,
+        serde_json::json!({
+            "id": 999_999_u64,
+            "title": "Oracle of Delphi",
+            "pid": 1,
+            "focused": true,
+            "minimized": false
+        }),
+    );
+
+    let picked = oracle_core::screen::pick_target(&windows).expect("something behind us");
+    assert_ne!(picked.0, 999_999, "must not target our own HUD");
+    assert!(!picked.1.to_lowercase().contains("oracle of delphi"));
+
+    // And the id it picked must actually be capturable.
+    let resp = client
+        .call(
+            uuid::Uuid::new_v4(),
+            ActRequest::CaptureWindow {
+                window_id: Some(picked.0),
+                max_width: Some(256),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(resp, ActResponse::Ok { .. }));
+
+    shutdown(tx, handle, dir, &sock, client).await;
+}
+
+#[tokio::test]
+async fn an_oversized_capture_is_resized_before_it_would_reach_the_model() {
+    // macOS returns native size and ignores max_width -- on Retina, twice the
+    // points asked for. The contract said the caller resizes; until this was
+    // wired, nothing did, and the whole frame went to the vision model.
+    let big = {
+        let mut rgba = Vec::new();
+        for y in 0..600u32 {
+            for x in 0..2400u32 {
+                rgba.extend_from_slice(&[(x % 256) as u8, (y % 256) as u8, 128, 255]);
+            }
+        }
+        let mut out = Vec::new();
+        let mut enc = png::Encoder::new(&mut out, 2400, 600);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut wr = enc.write_header().unwrap();
+        wr.write_image_data(&rgba).unwrap();
+        drop(wr);
+        out
+    };
+
+    let resized = frame::fit_to_width(&big, 1024)
+        .expect("decodes")
+        .expect("must resize");
+    assert!(
+        resized.len() < big.len(),
+        "resized {} bytes vs original {}",
+        resized.len(),
+        big.len()
+    );
+    assert_eq!(
+        u32::from_be_bytes(resized[16..20].try_into().unwrap()),
+        1024
+    );
+    assert!(frame::ahash_png(&resized).is_some());
+}
+
+#[tokio::test]
 async fn frames_are_dropped_rather_than_queued_without_bound() {
     // Interpretation is slower than capture whenever the GPU is busy. The queue
     // must shed load instead of growing until the process dies -- and it must

@@ -203,6 +203,36 @@ fn the_two_windows_profiles_differ_only_in_what_is_switched_on() {
 }
 
 #[test]
+fn the_vision_tier_is_given_enough_image_tokens() {
+    // Qwen-VL warns about this at load, and starving it does not error -- it
+    // degrades small text into "nothing legible", which looks like a broken
+    // index rather than an under-resolved one.
+    for profile in ["oracle.windows.toml", "oracle.windows.ambient.toml"] {
+        let cfg = Config::load(&deploy(profile)).expect("loads");
+        let args = cfg.supervise.small_llm_args.join(" ");
+        assert!(
+            args.contains("--image-min-tokens 1024"),
+            "{profile}: {args}"
+        );
+        // And the context must have room for an image that size plus the
+        // instruction.
+        assert!(args.contains("-c 8192"), "{profile}: {args}");
+    }
+}
+
+#[test]
+fn the_profiles_put_recent_observations_in_the_prompt() {
+    for profile in ["oracle.windows.toml", "oracle.windows.ambient.toml"] {
+        let cfg = Config::load(&deploy(profile)).expect("loads");
+        assert!(
+            cfg.agent.screen_observations > 0,
+            "{profile}: without this, screen questions route to a browser tool"
+        );
+        assert!(cfg.agent.observation_max_age_secs > 0, "{profile}");
+    }
+}
+
+#[test]
 fn enabling_the_shipped_small_tier_still_validates() {
     // The interesting case: the user flips `enabled = true` and nothing else.
     // Every small-tier rule must pass on the values as shipped, or that edit

@@ -208,6 +208,14 @@ impl KnowledgeGraph {
     }
 
     /// Add an alias to an existing node (accumulates over time, §5.3).
+    /// How many edges the graph holds. Zero after consolidation has run means
+    /// the pass found nothing durable, which is a different problem from the
+    /// pass not running at all.
+    pub fn edge_count(&self) -> anyhow::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row("SELECT COUNT(*) FROM kg_edge", [], |r| r.get(0))?)
+    }
+
     /// Where an edge came from, if it exists.
     ///
     /// Provenance is recorded on every assertion but deliberately not returned

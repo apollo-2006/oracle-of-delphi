@@ -434,6 +434,21 @@ pub struct AgentSettings {
     /// How many non-focused windows to list alongside it.
     #[serde(default = "default_screen_other_windows")]
     pub screen_other_windows: usize,
+    /// How many recent ambient observations to put in the prompt each turn.
+    ///
+    /// This is what lets "what am I looking at?" be answered from context
+    /// instead of by calling a browser tool to re-fetch a page the vision model
+    /// already read. 0 disables it; it does nothing unless `[ambient]` is on and
+    /// has produced observations.
+    #[serde(default = "default_screen_observations")]
+    pub screen_observations: usize,
+    /// How old an observation may be and still be offered as "recent".
+    ///
+    /// Beyond this it is history, not current context — describing a window the
+    /// user closed at lunch as what is on screen now is worse than saying
+    /// nothing. Similarity recall still finds older ones by topic.
+    #[serde(default = "default_observation_max_age_secs")]
+    pub observation_max_age_secs: i64,
 }
 
 /// Self-supervision: what `oracle-core run` should launch and manage on its own
@@ -575,6 +590,12 @@ fn default_foreign_vram_budget_mb() -> u64 {
 }
 fn default_own_vram_mb() -> u64 {
     3_000
+}
+fn default_screen_observations() -> usize {
+    3
+}
+fn default_observation_max_age_secs() -> i64 {
+    1800
 }
 fn default_sample_secs() -> u64 {
     45
@@ -972,6 +993,8 @@ impl Default for AgentSettings {
             step_budget: 12,
             screen_context: true,
             screen_other_windows: default_screen_other_windows(),
+            screen_observations: default_screen_observations(),
+            observation_max_age_secs: default_observation_max_age_secs(),
         }
     }
 }
@@ -1064,6 +1087,23 @@ impl Config {
     /// Rules for `[consolidate]`.
     fn validate_consolidate(&self) -> Result<(), ConfigError> {
         let c = &self.consolidate;
+
+        // Checked BEFORE the early return, because the case that loses the most
+        // data is consolidation being off entirely. Guarding this behind
+        // `c.enabled` meant the warning could only fire in the one arrangement
+        // where something was already promoting facts.
+        if self.ambient.enabled
+            && self.ambient.retain_days > 0
+            && (!c.enabled || !c.from_observations)
+        {
+            tracing::warn!(
+                "[config] ambient observations expire after {} days and nothing will promote \
+                 them first — enable [consolidate] (with from_observations) or set \
+                 ambient.retain_days = 0 to keep them",
+                self.ambient.retain_days
+            );
+        }
+
         if !c.enabled {
             return Ok(());
         }
@@ -1085,15 +1125,6 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "consolidate.batch_size above 100 will not fit a small model's context".into(),
             ));
-        }
-        // The pairing that quietly loses data: observations expire on a timer,
-        // and if nothing promotes them first they are simply gone.
-        if self.ambient.enabled && self.ambient.retain_days > 0 && !c.from_observations {
-            tracing::warn!(
-                "[config] ambient observations expire after {} days but \
-                 consolidate.from_observations is false — nothing will promote them first",
-                self.ambient.retain_days
-            );
         }
         Ok(())
     }

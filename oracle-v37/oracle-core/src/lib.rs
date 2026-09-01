@@ -21,6 +21,7 @@ pub mod llm;
 pub mod memory;
 pub mod observ;
 pub mod proactive;
+pub mod screen;
 pub mod security;
 pub mod supervisor;
 pub mod tiers;

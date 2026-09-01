@@ -513,10 +513,24 @@ end tell
         // occupies instead.
         //
         // The honest limitation: `-R` captures the SCREEN region, so anything
-        // overlapping the target is included. For the focused window (the
+        // overlapping the target is included. For the frontmost window (the
         // ambient index's only real caller) that is almost always nothing, but
         // it is a region grab wearing a window grab's name and should be read
         // that way.
+        //
+        // Two more things that bite and do not announce themselves:
+        //
+        //  * **Screen Recording (TCC) may fail SILENTLY.** Without the grant,
+        //    modern macOS can still return a PNG -- of the desktop, with window
+        //    contents blanked -- rather than erroring. The symptom is every
+        //    observation describing wallpaper. If that is what you see, the
+        //    grant is missing; the empty-file path below only catches the case
+        //    where nothing is written at all.
+        //  * **Retina returns twice the size you asked for.** `-R` takes points,
+        //    the PNG comes back in pixels, so a 1440pt window yields a 2880px
+        //    image. `max_width` is not applied here (see below); the caller
+        //    resizes, which it must, or the vision model receives a frame far
+        //    larger than its context was sized for.
         let (rect, title) = self.window_rect(window_id)?;
         let (x, y, w, h) = rect;
         if w <= 0 || h <= 0 {

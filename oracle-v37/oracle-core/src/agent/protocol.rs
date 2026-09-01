@@ -29,7 +29,10 @@ pub enum ModelAction {
 pub fn parse_action(text: &str) -> Option<ModelAction> {
     let v: Value = serde_json::from_str(text.trim()).ok()?;
     if let Some(tool) = v.get("tool").and_then(|t| t.as_str()) {
-        let args = v.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
+        let args = v
+            .get("args")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
         return Some(ModelAction::Call {
             tool: tool.to_string(),
             args,
@@ -124,7 +127,8 @@ mod tests {
 
     #[test]
     fn parses_tool_call() {
-        let a = parse_action(r#"{"tool":"os.window","args":{"action":"minimize","query":"spotify"}}"#);
+        let a =
+            parse_action(r#"{"tool":"os.window","args":{"action":"minimize","query":"spotify"}}"#);
         match a {
             Some(ModelAction::Call { tool, args }) => {
                 assert_eq!(tool, "os.window");

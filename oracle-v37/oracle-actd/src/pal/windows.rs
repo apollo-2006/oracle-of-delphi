@@ -437,7 +437,11 @@ impl Platform for WindowsPlatform {
     ) -> Result<CapturedImage, PalError> {
         let hwnd = match window_id {
             Some(id) => {
-                let h = id as HWND;
+                // Mirror how enum_proc produces ids (`hwnd as usize as u64`).
+                // Going straight from u64 to a pointer does not round-trip on a
+                // 32-bit target and is a different cast than the one that made
+                // the value.
+                let h = id as usize as HWND;
                 // Re-resolve rather than trusting the id: a stale handle passed
                 // to GDI is not an error, it is undefined behaviour.
                 if !self.list_windows()?.iter().any(|w| w.id == id) {

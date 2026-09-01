@@ -241,8 +241,32 @@ pub fn spawn_sampler(
                 continue;
             };
 
+            // Resolve the target explicitly rather than letting the backend
+            // take the foreground window. When the user has just spoken, the
+            // HUD IS the foreground window, and capturing it means indexing
+            // Pythia's own UI as a memory of what the user was looking at --
+            // the same trap the prompt's window block already avoids. Windows
+            // arrive in z-order, so the first user-facing one behind us is what
+            // they were actually reading.
+            let windows = match actd
+                .call(Uuid::new_v4(), oracle_ipc::actd::ActRequest::ListWindows)
+                .await
+            {
+                Ok(oracle_ipc::actd::ActResponse::Ok { data }) => data,
+                _ => continue,
+            };
+            let Some(target) = windows
+                .get("windows")
+                .and_then(|w| w.as_array())
+                .and_then(|w| crate::screen::pick_target(w))
+            else {
+                // Nothing on screen but us. Not an error, and not a reason to
+                // fall back to the foreground window.
+                continue;
+            };
+
             let req = oracle_ipc::actd::ActRequest::CaptureWindow {
-                window_id: None,
+                window_id: Some(target.0),
                 max_width: Some(cfg.max_width),
             };
             let data = match actd.call(Uuid::new_v4(), req).await {
@@ -267,6 +291,23 @@ pub fn spawn_sampler(
             let Ok(png) = base64_decode(&img.png_b64) else {
                 continue;
             };
+
+            // Honour max_width on backends that could not do it during capture.
+            // macOS returns native size -- and on a Retina display that is twice
+            // the requested point size -- so without this the model receives a
+            // frame several times larger than it was launched to handle.
+            let (png, png_b64) = match frame::fit_to_width(&png, cfg.max_width) {
+                Ok(Some(resized)) => {
+                    let b64 = base64_encode(&resized);
+                    (resized, b64)
+                }
+                Ok(None) => (png, img.png_b64),
+                Err(e) => {
+                    tracing::debug!(error = %e, "[ambient] frame would not decode");
+                    continue;
+                }
+            };
+
             let Some(hash) = frame::ahash_png(&png) else {
                 continue;
             };
@@ -277,8 +318,10 @@ pub fn spawn_sampler(
 
             queue.push(PendingFrame {
                 captured_at: chrono::Utc::now().timestamp(),
+                // The title actd reported for the window we asked for; the
+                // z-order pick above already excluded our own.
                 title: img.title,
-                png_b64: img.png_b64,
+                png_b64,
             });
         }
     });
@@ -291,6 +334,11 @@ fn data_image(data: &serde_json::Value) -> Option<oracle_ipc::actd::CapturedImag
 fn base64_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.decode(s)
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 /// The interpretation half: drain the queue through the vision model.

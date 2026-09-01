@@ -7,6 +7,7 @@
 //!                                       authorize Google Workspace (OAuth)
 //!   oracle-core doctor                  print the latency budget report
 //!   oracle-core write-config [PATH]     emit a fully-populated oracle.toml
+//!   oracle-core memory-status           what memory actually contains
 //!
 //! `run` wires config → HUD gateway → agent, installs signal handlers, restores
 //! any session snapshot, and drains gracefully on SIGINT/SIGTERM. Without a
@@ -41,6 +42,10 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         "doctor" => doctor(),
+        "memory-status" => {
+            let cfg = load_config(&args)?;
+            memory_status(&cfg)
+        }
         "check-config" => {
             let path = arg_value(&args, "--config")
                 .map(PathBuf::from)
@@ -798,6 +803,57 @@ fn open_in_browser(url: &str) {
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
+/// Print what memory actually contains, without opening SQLite by hand.
+///
+/// Exists because every question worth asking while bringing this stack up --
+/// "is the ambient index writing anything?", "did consolidation run?", "are my
+/// old rows in the wrong vector space?" -- otherwise needs a sqlite3 client and
+/// knowledge of the schema.
+fn memory_status(cfg: &Config) -> anyhow::Result<()> {
+    let shared = Shared::open_with_embedder(&cfg.memory.db_path, build_embedder(cfg))?;
+    let now = chrono::Utc::now().timestamp();
+
+    println!("db:            {}", cfg.memory.db_path);
+    println!("episodes:      {}", shared.memory.count()?);
+
+    let stale = shared.memory.stale_space_count()?;
+    if stale > 0 {
+        println!("  {stale} in another vector space (keyword-reachable, not semantic)");
+    }
+
+    // The ambient index. A zero here with [ambient] on is the first thing to
+    // look at, and the age of the newest row says whether it is still running
+    // or stopped at some point.
+    let recent = shared.memory.recent_observations(5, 0)?;
+    println!("observations:  {}", recent.len().min(5));
+    match recent.first() {
+        Some(e) => {
+            println!("  newest is {}", humanize_status_age(now - e.t_unix));
+            for e in recent.iter().take(3) {
+                let text: String = e.text.chars().take(100).collect();
+                println!("  - [{}] {}", humanize_status_age(now - e.t_unix), text);
+            }
+        }
+        None => println!("  (none yet — is [ambient] on, and has the screen changed?)"),
+    }
+
+    println!(
+        "pending consolidation: {}",
+        shared.memory.unconsolidated_count()?
+    );
+    println!("knowledge graph edges: {}", shared.graph.edge_count()?);
+    Ok(())
+}
+
+fn humanize_status_age(secs: i64) -> String {
+    match secs.max(0) {
+        s if s < 60 => format!("{s}s ago"),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86_400),
+    }
+}
+
 /// Choose the embedder: the BGE sidecar when configured, else the offline
 /// hash embedder.
 ///
@@ -883,6 +939,8 @@ fn agent_config(cfg: &Config) -> AgentConfig {
         proactive_summary: proactive_summary(&cfg.proactive),
         screen_context: cfg.agent.screen_context,
         screen_other_windows: cfg.agent.screen_other_windows,
+        screen_observations: cfg.agent.screen_observations,
+        observation_max_age_secs: cfg.agent.observation_max_age_secs,
         auto_recall: cfg.memory.auto_recall,
         auto_record: cfg.memory.auto_record,
         recall_limit: cfg.memory.recall_limit,

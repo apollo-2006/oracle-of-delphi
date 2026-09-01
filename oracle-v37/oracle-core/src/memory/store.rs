@@ -267,6 +267,33 @@ impl MemoryStore {
         )?)
     }
 
+    /// The most recent screen observations, newest first.
+    ///
+    /// Deliberately a **recency** query, not a similarity one. "What am I
+    /// looking at right now" is answered by the latest observation regardless of
+    /// how its wording scores against the question — embedding similarity ranks
+    /// by topic, and the topic of the current screen is exactly what the user
+    /// does not know yet. Similarity recall handles "what was I reading on
+    /// Tuesday"; this handles "right now".
+    pub fn recent_observations(&self, limit: usize, since: i64) -> anyhow::Result<Vec<Episode>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, text, t_unix, salience FROM episode \
+             WHERE kind = 'observation' AND t_unix >= ? AND text <> '[forgotten]' \
+             ORDER BY t_unix DESC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![since, limit as i64], |r| {
+            Ok(Episode {
+                id: r.get(0)?,
+                kind: EpisodeKind::Observation,
+                text: r.get(2)?,
+                t_unix: r.get(3)?,
+                salience: r.get::<_, f64>(4)? as f32,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Delete observation episodes older than `cutoff` (unix seconds).
     ///
     /// Scoped to `observation` on purpose. Conversation memories are things the
@@ -649,6 +676,54 @@ mod tests {
         }
         let s = MemoryStore::open(db, Box::new(HashEmbedder::default())).unwrap();
         assert_eq!(s.unconsolidated_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn recent_observations_come_back_newest_first() {
+        let s = store();
+        let a = s
+            .insert(EpisodeKind::Observation, "older screen", 0.2)
+            .unwrap();
+        let b = s
+            .insert(EpisodeKind::Observation, "newer screen", 0.2)
+            .unwrap();
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute("UPDATE episode SET t_unix = 100 WHERE id = ?", params![a])
+                .unwrap();
+            conn.execute("UPDATE episode SET t_unix = 200 WHERE id = ?", params![b])
+                .unwrap();
+        }
+        let recent = s.recent_observations(5, 0).unwrap();
+        assert_eq!(recent[0].id, b, "newest first");
+        assert_eq!(recent[1].id, a);
+    }
+
+    #[test]
+    fn recent_observations_respect_the_age_cutoff() {
+        // A screen from three hours ago is not what "right now" means, and
+        // offering it as current context is how the assistant confidently
+        // describes a window you closed at lunch.
+        let s = store();
+        let a = s
+            .insert(EpisodeKind::Observation, "stale screen", 0.2)
+            .unwrap();
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute("UPDATE episode SET t_unix = 100 WHERE id = ?", params![a])
+                .unwrap();
+        }
+        assert!(s.recent_observations(5, 1_000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn recent_observations_exclude_conversations_and_tombstones() {
+        let s = store();
+        s.insert(EpisodeKind::Conversation, "the user said something", 0.8)
+            .unwrap();
+        let obs = s.insert(EpisodeKind::Observation, "a screen", 0.2).unwrap();
+        s.tombstone(obs).unwrap();
+        assert!(s.recent_observations(5, 0).unwrap().is_empty());
     }
 
     #[test]

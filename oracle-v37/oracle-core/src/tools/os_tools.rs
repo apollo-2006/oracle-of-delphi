@@ -570,14 +570,15 @@ async fn frontmost_readable_window(ctx: &ToolCtx) -> Option<(u64, String)> {
     let windows = data.get("windows").and_then(|w| w.as_array())?;
     for w in windows {
         let title = w.get("title").and_then(|t| t.as_str()).unwrap_or_default();
-        let low = title.to_lowercase();
+
         let minimized = w
             .get("minimized")
             .and_then(|m| m.as_bool())
             .unwrap_or(false);
         // Skip: our own window, untitled shells, and minimized windows (real, but
-        // not what the user is looking at right now).
-        if title.trim().is_empty() || low.contains("oracle of delphi") || minimized {
+        // not what the user is looking at right now). Shared with the prompt's
+        // window block and the ambient sampler -- see crate::screen.
+        if !crate::screen::is_user_facing(title, minimized) {
             continue;
         }
         if let Some(id) = w.get("id").and_then(|v| v.as_u64()) {
