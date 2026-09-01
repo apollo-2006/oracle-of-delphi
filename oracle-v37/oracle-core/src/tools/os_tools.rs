@@ -401,7 +401,8 @@ async fn find_window(ctx: &ToolCtx, query: &str) -> Result<(u64, String), ToolOu
     //    document/track — Spotify becomes "Artist – Song" while playing, so
     //    "spotify" never matches the title. The process is still "Spotify.exe",
     //    so match the owning process name too.
-    if let ToolOutcome::Ok(pdata) = call_actd(ctx, ActRequest::ListProcesses, "list processes").await
+    if let ToolOutcome::Ok(pdata) =
+        call_actd(ctx, ActRequest::ListProcesses, "list processes").await
     {
         if let Some(procs) = pdata.get("processes").and_then(|p| p.as_array()) {
             let name_of = |pid: u64| -> String {
@@ -542,10 +543,7 @@ impl TypedTool for LockScreen {
 /// Resolve an optional window-title query to a concrete window id. Empty/None
 /// means "the foreground window" (`None`); a non-empty query is matched against
 /// open window titles.
-async fn resolve_window(
-    ctx: &ToolCtx,
-    query: &Option<String>,
-) -> Result<Option<u64>, ToolOutcome> {
+async fn resolve_window(ctx: &ToolCtx, query: &Option<String>) -> Result<Option<u64>, ToolOutcome> {
     match query {
         Some(q) if !q.trim().is_empty() => {
             let (id, _title) = find_window(ctx, q).await?;

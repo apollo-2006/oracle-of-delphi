@@ -243,3 +243,146 @@ fn enabling_the_shipped_small_tier_still_validates() {
     cfg.validate()
         .expect("the shipped small-tier values must validate once enabled");
 }
+
+// --- macOS ------------------------------------------------------------------
+//
+// The macOS profile is not a translated copy of the Windows one: the actd link
+// is a filesystem socket with a hard length limit, the planner is smaller
+// because unified memory is shared with everything else, and the llama-server
+// path has no .exe. Each of those is a thing that can silently drift back.
+
+#[test]
+fn the_macos_profile_loads_and_validates() {
+    let path = deploy("oracle.macos.toml");
+    let cfg = Config::load(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    cfg.validate()
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+}
+
+#[test]
+fn the_macos_actd_socket_fits_sun_path() {
+    // sockaddr_un.sun_path is 104 bytes on macOS. Over it, actd fails at bind
+    // with "path must be shorter than SUN_LEN" — at run time, naming no config
+    // key. Validation refuses it at load; this pins the shipped value well
+    // clear of the limit so an edit has room before it breaks.
+    let cfg = Config::load(&deploy("oracle.macos.toml")).expect("loads");
+    assert!(
+        cfg.actd.socket.len() < 80,
+        "shipped socket path is {} bytes, too close to the 104-byte limit: {}",
+        cfg.actd.socket.len(),
+        cfg.actd.socket
+    );
+    assert!(
+        cfg.actd.socket.starts_with('/'),
+        "macOS uses a filesystem socket, not a named pipe: {}",
+        cfg.actd.socket
+    );
+}
+
+#[test]
+fn the_macos_profile_uses_three_distinct_ports() {
+    let cfg = Config::load(&deploy("oracle.macos.toml")).expect("loads");
+    let mut ports = vec![
+        cfg.llm.backend.clone(),
+        cfg.llm.small.backend.clone(),
+        cfg.memory.embedder.backend.clone(),
+    ];
+    ports.sort();
+    ports.dedup();
+    assert_eq!(ports.len(), 3, "each llama.cpp server needs its own port");
+}
+
+#[test]
+fn the_macos_profile_points_at_a_unix_llama_server() {
+    // The Windows path (build\bin\Release\llama-server.exe) does not exist on
+    // a CMake Unix Makefiles build, and a wrong program shows up only as a
+    // supervised child that restart-loops in llm.log.
+    let cfg = Config::load(&deploy("oracle.macos.toml")).expect("loads");
+    let p = &cfg.supervise.llm_program;
+    assert!(!p.ends_with(".exe"), "not a Windows binary: {p}");
+    assert!(p.ends_with("llama-server"), "{p}");
+    assert!(!p.contains('\\'), "unix paths use forward slashes: {p}");
+}
+
+#[test]
+fn the_macos_planner_is_sized_for_unified_memory() {
+    // A 14B at Q4 wants 10-12 GB of a pool that is also the OS's, the vision
+    // tier's, and the user's. Shipping one here would make the profile look
+    // right and swap the machine to death on the first turn.
+    let cfg = Config::load(&deploy("oracle.macos.toml")).expect("loads");
+    let args = cfg.supervise.llm_args.join(" ");
+    assert!(
+        !args.contains("14b") && !cfg.llm.model.contains("14b"),
+        "the macOS profile must not ship a 14B planner: {} / {args}",
+        cfg.llm.model
+    );
+    assert!(args.contains("--jinja"), "no tool calls without it: {args}");
+}
+
+#[test]
+fn the_macos_profile_ships_its_optional_tiers_off() {
+    // Same contract as Windows: present and correct, so turning one on is a
+    // one-word edit rather than a research project.
+    let cfg = Config::load(&deploy("oracle.macos.toml")).expect("loads");
+    assert!(!cfg.llm.small.enabled);
+    assert!(!cfg.memory.embedder.enabled);
+    assert!(!cfg.ambient.enabled);
+    assert!(!cfg.consolidate.enabled);
+    assert!(!cfg.proactive.enabled);
+}
+
+#[test]
+fn enabling_the_macos_stack_still_validates() {
+    let mut cfg = Config::load(&deploy("oracle.macos.toml")).expect("loads");
+    cfg.llm.small.enabled = true;
+    cfg.supervise.autostart_small_llm = true;
+    cfg.memory.embedder.enabled = true;
+    cfg.supervise.autostart_embedder = true;
+    cfg.ambient.enabled = true;
+    cfg.consolidate.enabled = true;
+    cfg.validate()
+        .expect("the whole macOS stack must validate together");
+}
+
+#[test]
+fn the_macos_voice_stack_does_not_point_at_windows_binaries() {
+    // The whisper/ and piper/ directories vendored at the repo root hold .exe
+    // and .dll files. Pointing macOS at those produces "not executable" from a
+    // child process, one layer below anything that reports it usefully.
+    let cfg = Config::load(&deploy("oracle.macos.toml")).expect("loads");
+    for (label, program) in [
+        ("tts_program", &cfg.voice.tts_program),
+        ("stt_program", &cfg.voice.stt_program),
+        ("wake_program", &cfg.voice.wake_program),
+    ] {
+        assert!(
+            !program.ends_with(".exe"),
+            "{label} is a Windows binary: {program}"
+        );
+    }
+    // whisper-stream must keep timestamps: -nt makes it redraw one line with
+    // carriage returns, which never splits into the lines core parses.
+    assert!(
+        !cfg.voice.wake_args.iter().any(|a| a == "-nt"),
+        "wake_args must not pass -nt: {:?}",
+        cfg.voice.wake_args
+    );
+}
+
+#[test]
+fn the_macos_and_windows_profiles_agree_on_the_things_that_are_not_platform() {
+    // Ports, model names and tuning constants are not platform-specific. If
+    // they drift apart it is because one file was edited and the other was
+    // forgotten, which is exactly the bug this catches.
+    let win = Config::load(&deploy("oracle.windows.toml")).expect("loads");
+    let mac = Config::load(&deploy("oracle.macos.toml")).expect("loads");
+    assert_eq!(win.llm.backend, mac.llm.backend);
+    assert_eq!(win.llm.small.backend, mac.llm.small.backend);
+    assert_eq!(win.memory.embedder.backend, mac.memory.embedder.backend);
+    assert_eq!(win.llm.small.model, mac.llm.small.model);
+    assert_eq!(win.memory.embedder.dim, mac.memory.embedder.dim);
+    assert_eq!(win.ambient.sample_secs, mac.ambient.sample_secs);
+    assert_eq!(win.ambient.retain_days, mac.ambient.retain_days);
+    assert_eq!(win.agent.step_budget, mac.agent.step_budget);
+    assert_eq!(win.agent.screen_observations, mac.agent.screen_observations);
+}

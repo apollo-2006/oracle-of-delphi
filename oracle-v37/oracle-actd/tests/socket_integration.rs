@@ -19,9 +19,14 @@ use oracle_ipc::transport::{read_msg, unix, write_msg};
 use tokio::sync::watch;
 use uuid::Uuid;
 
+/// A socket path short enough for `sockaddr_un.sun_path` on every unix.
+///
+/// That field is 104 bytes on macOS/BSD and 108 on Linux, and over it `bind`
+/// and `connect` fail outright. `std::env::temp_dir()` is `/tmp/` on Linux but
+/// the ~49-byte `$TMPDIR` on macOS, so this path used to come out at 105 bytes
+/// and the whole end-to-end security boundary went untested on a Mac.
 fn temp_socket() -> (std::path::PathBuf, String) {
-    let dir = std::env::temp_dir().join(format!("oracle-it-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = unix::scratch_socket_dir("oracle-it").unwrap();
     let path = dir.join("actd.sock");
     let s = path.to_str().unwrap().to_string();
     (dir, s)

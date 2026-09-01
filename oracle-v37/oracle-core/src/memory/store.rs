@@ -437,9 +437,13 @@ fn f32_to_bytes(v: &[f32]) -> Vec<u8> {
 }
 
 fn bytes_to_f32(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+    // `as_chunks::<4>()` over `chunks_exact(4)`: the chunk size is a constant,
+    // so this yields `&[u8; 4]` and `from_le_bytes` takes it directly, with no
+    // per-element indexing and no bounds checks. Clippy's
+    // `chunks_exact_to_as_chunks` (new in 1.98) flags the old form, and CI runs
+    // with `-D warnings`.
+    let (chunks, _remainder) = b.as_chunks::<4>();
+    chunks.iter().copied().map(f32::from_le_bytes).collect()
 }
 
 /// Cheap keyword overlap: fraction of query tokens present in the text.

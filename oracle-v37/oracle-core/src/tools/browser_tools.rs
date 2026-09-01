@@ -41,7 +41,11 @@ impl TypedTool for WebOpen {
     }
     fn validate(a: &OpenArgs) -> Result<(), ToolError> {
         if a.url.trim().is_empty() {
-            return Err(ToolError::invalid("url", "no url given", "pass a URL to open"));
+            return Err(ToolError::invalid(
+                "url",
+                "no url given",
+                "pass a URL to open",
+            ));
         }
         Ok(())
     }

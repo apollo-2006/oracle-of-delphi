@@ -1077,10 +1077,54 @@ impl Config {
                 "llm.backend must be \"mock\" or an http(s) URL".into(),
             ));
         }
+        self.validate_actd_socket()?;
         self.validate_small_tier()?;
         self.validate_embedder()?;
         self.validate_ambient()?;
         self.validate_consolidate()?;
+        Ok(())
+    }
+
+    /// Rules for `[actd] socket`.
+    ///
+    /// On unix the socket path is copied into `sockaddr_un.sun_path`, a fixed
+    /// char array: 104 bytes on macOS and the BSDs, 108 on Linux. Exceeding it
+    /// is not truncation — `bind` and `connect` both fail with the opaque
+    /// "path must be shorter than SUN_LEN", at run time, from inside tokio,
+    /// with nothing naming the config key that caused it.
+    ///
+    /// macOS is where this actually bites. The natural per-user runtime
+    /// directory there is `$TMPDIR`, which is not `/tmp` but a hashed path like
+    /// `/var/folders/jj/cvft_wmn3cs4cl2pywmqvb3w0000gn/T/` — 49 bytes spent
+    /// before the config has said anything. A path that is comfortably legal on
+    /// Linux can therefore be illegal on a Mac, which is exactly the class of
+    /// difference a cross-platform port is supposed to catch at load.
+    ///
+    /// Windows is exempt: `[actd] socket` is a named-pipe name there, not a
+    /// filesystem path, and has no such limit.
+    fn validate_actd_socket(&self) -> Result<(), ConfigError> {
+        if cfg!(windows) {
+            return Ok(());
+        }
+        let path = self.actd.socket.trim();
+        if path.is_empty() {
+            return Err(ConfigError::Invalid(
+                "actd.socket must not be empty on unix — it is the filesystem path \
+                 core and the actuator daemon meet on"
+                    .into(),
+            ));
+        }
+        // The smaller of the two limits, so a config that loads on Linux also
+        // loads on macOS. A portable config is worth more than the four bytes.
+        const SUN_PATH_MAX: usize = 104;
+        if path.len() >= SUN_PATH_MAX {
+            return Err(ConfigError::Invalid(format!(
+                "actd.socket is {} bytes; a unix socket path must be under {SUN_PATH_MAX} \
+                 (sun_path is 104 bytes on macOS/BSD, 108 on Linux). Shorten it — \
+                 /tmp/oracle/actd.sock always fits. Got: {path}",
+                path.len()
+            )));
+        }
         Ok(())
     }
 
@@ -1403,6 +1447,37 @@ mod tests {
             assert!(!cfg.proactive.enabled);
             assert_eq!(cfg.proactive.quiet_from_hour, 22);
             assert_eq!(cfg.proactive.max_per_hour, 4);
+        }
+
+        #[test]
+        fn an_actd_socket_path_that_cannot_fit_sun_path_is_refused() {
+            // The failure this replaces: tokio raising "path must be shorter
+            // than SUN_LEN" from inside the accept loop at run time, naming no
+            // config key. macOS reaches this far sooner than Linux because
+            // $TMPDIR there is a ~49-byte hashed path, not /tmp.
+            let mut cfg = Config::default();
+            cfg.actd.socket = format!("/tmp/{}/actd.sock", "x".repeat(110));
+            let err = cfg.validate().expect_err("must not validate");
+            let msg = format!("{err}");
+            assert!(msg.contains("actd.socket"), "{msg}");
+            assert!(msg.contains("sun_path"), "{msg}");
+        }
+
+        #[test]
+        fn a_short_actd_socket_path_validates_on_every_platform() {
+            let mut cfg = Config::default();
+            cfg.actd.socket = "/tmp/oracle/actd.sock".into();
+            cfg.validate().expect("a short path is fine");
+        }
+
+        #[test]
+        fn the_default_actd_socket_fits_sun_path_here() {
+            // The default is derived from the environment ($XDG_RUNTIME_DIR, or
+            // /tmp), so it is worth asserting that whatever this machine hands
+            // back is actually bindable rather than assuming it.
+            Config::default()
+                .validate()
+                .expect("the shipped default must be usable on the host it runs on");
         }
 
         #[test]

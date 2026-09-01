@@ -75,10 +75,68 @@ pub mod unix {
     use super::*;
     use tokio::net::{UnixListener, UnixStream};
 
+    /// The largest usable unix socket path, in bytes.
+    ///
+    /// The kernel copies the path into `sockaddr_un.sun_path`, a fixed char
+    /// array: **104 bytes on macOS and the BSDs**, 108 on Linux. We use the
+    /// smaller of the two everywhere, so a path that works on one platform
+    /// works on all of them.
+    ///
+    /// This is not a soft limit and it does not truncate. Over it, `bind` and
+    /// `connect` both fail with `InvalidInput: path must be shorter than
+    /// SUN_LEN` — an error that names neither the path nor the limit, which is
+    /// why [`check_path_len`] rewrites it below.
+    pub const SUN_PATH_MAX: usize = 104;
+
+    /// Reject an over-long socket path with an error that says what is wrong.
+    ///
+    /// macOS is where this matters. `std::env::temp_dir()` is `/tmp/` on Linux
+    /// but `$TMPDIR` on macOS, which is a per-user hashed path such as
+    /// `/var/folders/jj/cvft_wmn3cs4cl2pywmqvb3w0000gn/T/` — 49 bytes spent
+    /// before the caller has contributed anything. A socket path assembled from
+    /// it plus a UUID is comfortably legal on Linux and illegal on a Mac.
+    pub fn check_path_len(path: &str) -> io::Result<()> {
+        if path.len() >= SUN_PATH_MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unix socket path is {} bytes; the limit is {SUN_PATH_MAX} \
+                     (sun_path is 104 bytes on macOS/BSD, 108 on Linux). \
+                     Use a shorter directory — /tmp/oracle always fits. Path: {path}",
+                    path.len()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// A short-enough private directory to put a socket in, created on demand.
+    ///
+    /// Deliberately rooted at `/tmp` rather than [`std::env::temp_dir`]: `/tmp`
+    /// is four bytes on every unix, while `temp_dir()` on macOS is the ~49-byte
+    /// `$TMPDIR` that pushes any socket beyond [`SUN_PATH_MAX`]. The directory
+    /// is created 0700, so it is private to this user the same way
+    /// `$XDG_RUNTIME_DIR` would be.
+    ///
+    /// The suffix is eight hex digits rather than a full 36-character UUID:
+    /// still unique enough to keep concurrent runs apart, and 28 bytes cheaper
+    /// against a budget that is already tight on macOS.
+    pub fn scratch_socket_dir(prefix: &str) -> io::Result<std::path::PathBuf> {
+        let unique = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        let dir = std::path::PathBuf::from("/tmp").join(format!("{prefix}-{unique}"));
+        std::fs::create_dir_all(&dir)?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+        Ok(dir)
+    }
+
     /// Bind a UDS listener, removing any stale socket file first. The socket is
     /// created with 0600 perms via a umask-safe path (parent dir should be user
     /// private, e.g. `$XDG_RUNTIME_DIR/oracle/`).
     pub fn bind(path: &str) -> io::Result<UnixListener> {
+        check_path_len(path)?;
         // Remove a stale socket from a previous crash.
         if std::path::Path::new(path).exists() {
             let _ = std::fs::remove_file(path);
@@ -110,6 +168,7 @@ pub mod unix {
     }
 
     pub async fn connect(path: &str) -> io::Result<UnixStream> {
+        check_path_len(path)?;
         UnixStream::connect(path).await
     }
 
@@ -272,11 +331,43 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
+    #[test]
+    fn an_over_long_socket_path_is_refused_with_a_useful_error() {
+        use super::unix;
+        let long = format!("/tmp/{}/actd.sock", "x".repeat(120));
+        let err = unix::check_path_len(&long).expect_err("must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        // The whole point is that the message says what the kernel's does not:
+        // how long the path is, what the limit is, and which path it was.
+        assert!(msg.contains("sun_path"), "{msg}");
+        assert!(msg.contains(&long.len().to_string()), "{msg}");
+        assert!(msg.contains(&long), "{msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_scratch_socket_dir_leaves_room_for_a_socket_name() {
+        use super::unix;
+        let dir = unix::scratch_socket_dir("oracle-len-test").unwrap();
+        let sock = dir.join("actd.sock");
+        let path = sock.to_str().unwrap();
+        unix::check_path_len(path).expect("a scratch dir must fit a socket path on every platform");
+        // Real headroom, not a value that only just squeaks under the limit on
+        // this machine: the caller may use a longer prefix than this test does.
+        assert!(
+            path.len() < unix::SUN_PATH_MAX / 2,
+            "{} bytes leaves too little room: {path}",
+            path.len()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn uds_client_server_roundtrip_with_peer_check() {
         use super::unix;
-        let dir = std::env::temp_dir().join(format!("oracle-uds-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = unix::scratch_socket_dir("oracle-uds").unwrap();
         let path = dir.join("sock");
         let path_str = path.to_str().unwrap().to_string();
 

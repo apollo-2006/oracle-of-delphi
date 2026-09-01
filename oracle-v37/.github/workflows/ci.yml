@@ -2,7 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # This repository's default branch is `master`. When this said `[main]`,
+    # the push job matched nothing and CI only ever ran on pull requests --
+    # which, for a repo developed by pushing straight to the default branch,
+    # meant it never ran at all. Both are listed so a future rename is not a
+    # silent regression back to that.
+    branches: [master, main]
   pull_request:
 
 jobs:
@@ -57,3 +62,36 @@ jobs:
         run: |
           docker run --rm oracle:ci doctor
           docker run --rm oracle:ci write-config /tmp/j.toml
+
+  macos:
+    name: macOS (Apple Silicon — build + test + CoreAudio)
+    runs-on: macos-14      # arm64 runner; macos-13 is Intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # macOS is the only target where the actd link is a filesystem socket
+      # subject to sun_path's 104-byte limit, and the only one where the
+      # CoreAudio backend compiles at all. Both were unverified while CI was
+      # Linux-only: eight tests failed on a Mac and nothing reported it.
+      - name: Test
+        run: cargo test --all
+
+      - name: Configure + build (CoreAudio)
+        run: |
+          cmake -B oracle-audio/build -S oracle-audio -DCMAKE_BUILD_TYPE=Release
+          cmake --build oracle-audio/build -j3
+
+      # The test binary prints the backend it selected. Asserting on it catches
+      # the failure mode the ALSA option already had once: the platform library
+      # links, the #ifdef does not match, and the null backend is built instead
+      # -- so capture silently produces a test tone rather than audio.
+      - name: Run audio tests and assert the real backend was compiled
+        run: |
+          ./oracle-audio/build/oracle-audio-tests | tee audio.log
+          grep -q "capture backend: coreaudio" audio.log \
+            || { echo "::error::CoreAudio backend was not compiled in"; exit 1; }
+
+      - name: The shipped macOS profile must load
+        run: cargo run -p oracle-core -- check-config --config deploy/oracle.macos.toml

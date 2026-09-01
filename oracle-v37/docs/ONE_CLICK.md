@@ -1,6 +1,6 @@
 # Oracle of Delphi — one-click startup (no terminals)
 
-This is the recommended way to run the Oracle. There is **no Tauri app to build**
+This is the recommended way to run the Oracle. There is **no desktop shell to build**
 and **no PowerShell windows to keep open**. You double-click one thing; the whole
 assistant comes up hidden in the background and its face opens in a chromeless
 window. Double-click it again and it just summons the existing instance.
@@ -77,10 +77,18 @@ button in the HUD to mute/unmute, and the `◼ Interrupt` button stops speech
 mid-sentence. Because the window is real Edge/Chrome, speech recognition works as
 well — click `🎙 Voice` to talk.
 
-## What about the Tauri app?
+## What about the native window?
 
-It still exists under `oracle-app/`, but it's now **optional**. Everything it did
-— hosting the HUD, supervising the daemons, a summon hotkey — either lives in
-`oracle-core` now or is a small follow-up (a global summon hotkey + wake word,
-which belong in core so they work while the window is closed). For the "just run
-it" experience, use `Oracle.vbs`; you don't need to build Tauri at all.
+There is one — [`oracle-shell/`](../oracle-shell/README.md) — and it is
+**optional**. It is built on bare tao + wry, not Tauri; the `oracle-app/` Tauri
+project some older notes refer to was replaced and never existed in this
+repository.
+
+Everything the shell adds beyond this page is the window itself: a real taskbar
+entry, a tray sun, and a global `Ctrl+Alt+O` summon hotkey. Hosting the HUD and
+supervising the daemons both live in `oracle-core` now, which is why the
+one-click path above needs no shell at all.
+
+For the "just run it" experience use `Oracle.vbs` on Windows, or
+`cargo run -p oracle-core -- run` anywhere. Build the shell only when you want
+the window.

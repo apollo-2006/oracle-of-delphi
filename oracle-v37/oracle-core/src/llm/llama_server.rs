@@ -132,27 +132,57 @@ impl Llm for LlamaServer {
         // Line-buffer the SSE stream into text deltas. `done` guards a single
         // terminal `Done`.
         let state = (byte_stream, String::new(), cancel, false);
-        let s = stream::unfold(state, move |(mut bytes, mut buf, cancel, mut done)| async move {
-            loop {
-                if done {
-                    return None;
-                }
-                if cancel.is_cancelled() {
-                    done = true;
-                    return Some((
-                        LlmDelta::Done {
-                            stop_reason: StopReason::Cancelled,
-                        },
-                        (bytes, buf, cancel, done),
-                    ));
-                }
-                // Consume one complete SSE line if present.
-                if let Some(pos) = buf.find('\n') {
-                    let line = buf[..pos].trim().to_string();
-                    buf.drain(..=pos);
-                    if let Some(data) = line.strip_prefix("data:") {
-                        let data = data.trim();
-                        if data == "[DONE]" {
+        let s = stream::unfold(
+            state,
+            move |(mut bytes, mut buf, cancel, mut done)| async move {
+                loop {
+                    if done {
+                        return None;
+                    }
+                    if cancel.is_cancelled() {
+                        done = true;
+                        return Some((
+                            LlmDelta::Done {
+                                stop_reason: StopReason::Cancelled,
+                            },
+                            (bytes, buf, cancel, done),
+                        ));
+                    }
+                    // Consume one complete SSE line if present.
+                    if let Some(pos) = buf.find('\n') {
+                        let line = buf[..pos].trim().to_string();
+                        buf.drain(..=pos);
+                        if let Some(data) = line.strip_prefix("data:") {
+                            let data = data.trim();
+                            if data == "[DONE]" {
+                                done = true;
+                                return Some((
+                                    LlmDelta::Done {
+                                        stop_reason: StopReason::Stop,
+                                    },
+                                    (bytes, buf, cancel, done),
+                                ));
+                            }
+                            let (text, stop) = parse_sse_chunk(data);
+                            if let Some(t) = text {
+                                return Some((LlmDelta::Text(t), (bytes, buf, cancel, done)));
+                            }
+                            if let Some(reason) = stop {
+                                done = true;
+                                return Some((
+                                    LlmDelta::Done {
+                                        stop_reason: reason,
+                                    },
+                                    (bytes, buf, cancel, done),
+                                ));
+                            }
+                        }
+                        continue;
+                    }
+                    // Need more bytes.
+                    match bytes.next().await {
+                        Some(Ok(chunk)) => buf.push_str(&String::from_utf8_lossy(&chunk)),
+                        Some(Err(_)) | None => {
                             done = true;
                             return Some((
                                 LlmDelta::Done {
@@ -161,35 +191,10 @@ impl Llm for LlamaServer {
                                 (bytes, buf, cancel, done),
                             ));
                         }
-                        let (text, stop) = parse_sse_chunk(data);
-                        if let Some(t) = text {
-                            return Some((LlmDelta::Text(t), (bytes, buf, cancel, done)));
-                        }
-                        if let Some(reason) = stop {
-                            done = true;
-                            return Some((
-                                LlmDelta::Done { stop_reason: reason },
-                                (bytes, buf, cancel, done),
-                            ));
-                        }
-                    }
-                    continue;
-                }
-                // Need more bytes.
-                match bytes.next().await {
-                    Some(Ok(chunk)) => buf.push_str(&String::from_utf8_lossy(&chunk)),
-                    Some(Err(_)) | None => {
-                        done = true;
-                        return Some((
-                            LlmDelta::Done {
-                                stop_reason: StopReason::Stop,
-                            },
-                            (bytes, buf, cancel, done),
-                        ));
                     }
                 }
-            }
-        })
+            },
+        )
         .boxed();
         Ok(s)
     }
@@ -272,7 +277,10 @@ mod tests {
 
     #[test]
     fn keepalive_is_ignored() {
-        assert_eq!(parse_sse_chunk(r#"{"choices":[{"delta":{}}]}"#), (None, None));
+        assert_eq!(
+            parse_sse_chunk(r#"{"choices":[{"delta":{}}]}"#),
+            (None, None)
+        );
     }
 
     #[test]

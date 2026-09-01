@@ -19,6 +19,7 @@ use oracle_core::connectors::actd_client::ActdClient;
 use oracle_core::tools::{ToolCtx, ToolOutcome};
 use oracle_core::Shared;
 use oracle_ipc::actd::Capability;
+use oracle_ipc::transport::unix;
 use tokio::sync::watch;
 
 /// A test confirmer that always sanctions — stands in for a user clicking
@@ -31,9 +32,14 @@ impl Confirmer for AlwaysAllow {
     }
 }
 
+/// A socket path short enough for `sockaddr_un.sun_path` on every unix.
+///
+/// `std::env::temp_dir()` is `/tmp/` on Linux but the ~49-byte `$TMPDIR` on
+/// macOS, so the old path (temp_dir + a full UUID + "/actd.sock") was 108 bytes
+/// and every test here failed to connect on a Mac. `scratch_socket_dir` is the
+/// shared answer, next to the limit it respects.
 fn temp_socket() -> (std::path::PathBuf, String) {
-    let dir = std::env::temp_dir().join(format!("oracle-os-it-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = unix::scratch_socket_dir("oracle-os-it").unwrap();
     let path = dir.join("actd.sock");
     (dir.clone(), path.to_str().unwrap().to_string())
 }

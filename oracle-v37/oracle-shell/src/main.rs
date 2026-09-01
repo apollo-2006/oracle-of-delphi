@@ -283,11 +283,7 @@ fn toggle(window: &tao::window::Window) {
 /// `oracle-core.exe`, then `oracle-core` on PATH.
 fn spawn_core() -> Option<Child> {
     let exe = core_exe_path();
-    let config = std::env::var("ORACLE_CONFIG").unwrap_or_else(|_| {
-        // %APPDATA%\oracle\oracle.toml by default.
-        let appdata = std::env::var("APPDATA").unwrap_or_default();
-        format!(r"{appdata}\oracle\oracle.toml")
-    });
+    let config = std::env::var("ORACLE_CONFIG").unwrap_or_else(|_| default_config_path());
 
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("run")
@@ -310,6 +306,33 @@ fn spawn_core() -> Option<Child> {
         Err(e) => {
             eprintln!("[oracle-shell] could not launch core '{exe}': {e} — is oracle-core.exe next to this app, or ORACLE_CORE_EXE set?");
             None
+        }
+    }
+}
+
+/// Where `oracle.toml` lives when `ORACLE_CONFIG` is unset.
+///
+/// This used to be `%APPDATA%\oracle\oracle.toml` on every platform. `APPDATA`
+/// is unset outside Windows, so `unwrap_or_default()` made it the empty string
+/// and the shell launched core with the literal path `\oracle\oracle.toml` —
+/// which exists nowhere, so core silently fell back to its built-in defaults
+/// (mock LLM, no Google, no voice) and the app came up looking broken in a way
+/// that pointed at core rather than at the launcher.
+///
+/// `core_exe_path` below already handled the non-Windows case; this did not.
+fn default_config_path() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if cfg!(windows) {
+        let appdata = std::env::var("APPDATA").unwrap_or_default();
+        format!(r"{appdata}\oracle\oracle.toml")
+    } else if cfg!(target_os = "macos") {
+        // The macOS convention, and where docs/MACOS.md tells you to put it.
+        format!("{home}/Library/Application Support/oracle/oracle.toml")
+    } else {
+        // XDG: $XDG_CONFIG_HOME, else ~/.config.
+        match std::env::var("XDG_CONFIG_HOME") {
+            Ok(x) if !x.trim().is_empty() => format!("{x}/oracle/oracle.toml"),
+            _ => format!("{home}/.config/oracle/oracle.toml"),
         }
     }
 }
@@ -368,4 +391,28 @@ fn load_tray_icon() -> tray_icon::Icon {
         .into_rgba8();
     let (w, h) = img.dimensions();
     tray_icon::Icon::from_rgba(img.into_raw(), w, h).expect("tray icon rgba")
+}
+
+
+#[cfg(test)]
+mod config_path_tests {
+    use super::default_config_path;
+
+    #[test]
+    fn the_default_config_path_is_absolute_and_platform_shaped() {
+        let p = default_config_path();
+        assert!(p.ends_with("oracle.toml"), "{p}");
+        // The bug this pins: on a Mac the old code produced "\\oracle\\oracle.toml",
+        // a path with no root and no home, which core could never find.
+        if cfg!(unix) {
+            assert!(p.starts_with('/'), "not absolute: {p}");
+            assert!(!p.contains('\\'), "windows separators on unix: {p}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_uses_application_support() {
+        assert!(default_config_path().contains("Library/Application Support/oracle"));
+    }
 }

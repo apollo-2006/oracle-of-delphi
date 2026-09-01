@@ -499,7 +499,9 @@ Everything offline swaps to real backends behind a trait — nothing is stubbed
 - **Real OS control:** the actd `Platform` trait. Windows is complete (Win32 +
   UI Automation + GDI capture). macOS is complete bar the caveats in
   [`docs/MACOS.md`](docs/MACOS.md) (Accessibility API via `osascript`; capture
-  additionally needs the Screen Recording grant). On Linux the `/proc` process
+  additionally needs the Screen Recording grant; the `whisper/` and `piper/`
+  binaries vendored here are Windows-only and must be rebuilt for arm64 before
+  the voice stack works). On Linux the `/proc` process
   lister works, the window/input backends (x11rb, `/dev/uinput`) still slot in,
   and `capture_window` returns `Unsupported` until an X11 or Wayland backend
   exists.
@@ -543,8 +545,9 @@ oracle-core/    orchestrator: agent, memory, ambient, consolidate, tiers,
 oracle-actd/    privileged actuator daemon
 oracle-audio/   C++ real-time audio engine
 oracle-hud/     Three.js holographic HUD
-deploy/         systemd units, container config
-docs/           DEPLOYMENT, MACOS, THREAT_MODEL, RUNBOOK
+oracle-shell/   native window (tao + wry); outside the cargo workspace
+deploy/         systemd units, container config, Windows + macOS profiles
+docs/           DEPLOYMENT, MACOS, WINDOWS, ONE_CLICK, THREAT_MODEL, RUNBOOK
 scripts/        build_all.sh
 oracle-architecture.md   the full design document
 ```

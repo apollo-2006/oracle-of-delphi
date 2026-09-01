@@ -1,0 +1,258 @@
+# macOS (Apple Silicon) profile for Oracle of Delphi.
+#
+# Place at ~/Library/Application Support/oracle/oracle.toml, or pass --config.
+# Check it before launching:
+#   cargo run -p oracle-core -- check-config --config deploy/oracle.macos.toml
+#
+# This is the Windows profile's counterpart, with four things genuinely
+# different rather than merely re-spelled:
+#
+#   1. The actd link is a real unix socket, not a named pipe — and its path is
+#      length-limited (see [actd] below). This is the one macOS-specific trap
+#      that fails at run time rather than at load.
+#   2. The inference backend is Metal, not ROCm/Vulkan. `-ngl 99` on unified
+#      memory is not a GPU-offload decision the way it is on a discrete card.
+#   3. The planner is an 8B, not a 14B. On 16 GB of unified memory a 14B at Q4
+#      wants 10-12 GB and leaves nothing for the OS, the vision tier, or your
+#      actual work. On a 32 GB Mac, raise it.
+#   4. Two TCC permissions must be granted by hand before actuation or the
+#      microphone work at all. See docs/MACOS.md §1 and §3.
+#
+# Paths below are absolute because TOML does not expand `~` or `$HOME`. If your
+# checkout is not at ~/projects/oracle-of-delphi, the paths are what you edit.
+
+[general]
+# macOS has no XDG_RUNTIME_DIR, so this is stated rather than defaulted. Logs
+# for the supervised children land here as {oracle,llm,actd}.log.
+runtime_dir = "/Users/abirdeol/Library/Application Support/oracle/run"
+log_level = "info"
+
+[audio]
+sample_rate = 48000
+vad_onset_fast = 0.85
+vad_release = 0.35
+hangover_ms = 200
+tts_voice = "kokoro"
+# Empty = the system default input/output device. CoreAudio binds the default
+# device at its native rate and the decimator resamples to 16k, so unlike
+# Windows there is usually no reason to name a device here.
+input_device = ""
+output_device = ""
+
+[llm]
+backend = "http://127.0.0.1:8080"
+model = "qwen2.5-7b-instruct-q4_k_m"
+max_tokens = 1024
+temperature = 0.7
+model_dir = "/Users/abirdeol/projects/oracle-of-delphi/oracle-models"
+
+# --- The small/vision tier ---
+# A second llama-server on a second port, holding a ~2.5 GB VLM resident so the
+# continuous work (reading the screen, folding episodes into the graph) has a
+# model that is always there. Sharing port 8080 with the planner is rejected at
+# config load, because otherwise the small tier's requests get quietly answered
+# by the planner and only the memory usage looks wrong.
+#
+# On 16 GB this is the tier to watch: 8B planner + 2B vision is roughly 8 GB
+# resident. It fits, but leave the planner's idle_unload_secs on.
+[llm.small]
+enabled = false                      # the GGUF is already in oracle-models/
+backend = "http://127.0.0.1:8081"
+model = "qwen3-vl-2b-instruct-q4_k_m"
+max_tokens = 512
+temperature = 0.2
+resident = true
+
+[memory]
+db_path = "/Users/abirdeol/Library/Application Support/oracle/oracle.db"
+retrieve_limit = 6
+auto_recall = true
+auto_record = true
+recall_limit = 5
+recall_min_score = 0.15
+
+[memory.embedder]
+enabled = false
+backend = "http://127.0.0.1:8082"    # a third port; not shared with either LLM
+model = "bge-small-en-v1.5"
+dim = 384
+
+[ambient]
+# Off by default and deliberately so: an assistant that reads your screen on a
+# timer is something you switch on, not something you discover. Requires
+# [llm.small]. Frames never touch disk; only the text persists.
+enabled = false
+sample_secs = 45
+interpret_poll_secs = 5
+max_width = 1024
+change_threshold = 6
+queue_len = 24
+interpret_while_active = true
+max_tokens = 120
+salience = 0.25
+retain_days = 21
+
+# --- When background work may use the GPU ---
+# On Apple Silicon the GPU shares one memory pool with everything else, so
+# "foreign VRAM pressure" is really memory pressure. The budget is higher than
+# the Windows profile's because WindowServer and a browser legitimately hold
+# more of a unified pool than a discrete card's compositor does.
+[workwindow]
+after_secs = 900
+foreign_vram_budget_mb = 3072
+own_vram_mb = 3000
+
+[consolidate]
+enabled = false
+poll_secs = 300
+batch_size = 12
+max_tokens = 400
+from_observations = true
+
+[actd]
+# A filesystem path on macOS, not a named pipe — and it must stay SHORT.
+#
+# The kernel copies this into sockaddr_un.sun_path, which is 104 bytes on
+# macOS/BSD (108 on Linux). The obvious per-user choice, $TMPDIR, is a hashed
+# path like /var/folders/jj/cvft_.../T/ that spends 49 bytes before this file
+# says anything, so a socket under it can overrun the limit and fail at bind
+# with "path must be shorter than SUN_LEN". Config validation now refuses an
+# over-long path at load instead, but the fix is the same: keep it short.
+#
+# The parent directory is created by actd and the socket itself is chmod 0600
+# with a peer-uid check on every connection, so /tmp is safe here.
+socket = "/tmp/oracle/actd.sock"
+grant_sensitive = false
+
+[hud]
+bind = "127.0.0.1:8770"
+token = ""
+enabled = true
+
+[agent]
+step_budget = 12
+screen_context = true
+screen_other_windows = 6
+screen_observations = 3
+observation_max_age_secs = 1800
+
+[google]
+credentials_path = ""
+account = "default"
+
+[proactive]
+enabled = false
+poll_secs = 60
+calendar = true
+lead_minutes = 10
+mail = false
+mail_query = "is:unread is:starred"
+watch_processes = []
+quiet_from_hour = 22
+quiet_until_hour = 8
+repeat_after_secs = 21600
+max_per_hour = 4
+
+# --- Voice ---
+# Both whisper.cpp and piper must be built for arm64; the binaries vendored at
+# the repo root are Windows .exe/.dll and will not run here. docs/MACOS.md §4
+# has the two build commands. Left off until those exist, because a missing
+# program degrades to browser speech rather than erroring loudly.
+[voice]
+tts_enabled = false
+tts_program = "/Users/abirdeol/projects/oracle-of-delphi/piper/piper"
+tts_args = [
+  "--model", "/Users/abirdeol/projects/oracle-of-delphi/piper/en_US-amy-medium.onnx",
+  "--output_file", "{out}",
+]
+
+stt_enabled = false
+stt_program = "/Users/abirdeol/projects/oracle-of-delphi/whisper/whisper-cli"
+stt_args = [
+  "-m", "/Users/abirdeol/projects/oracle-of-delphi/whisper/ggml-base.en.bin",
+  "-f", "{in}",
+  "-nt",
+  "-np",
+]
+
+# Always-on wake word. Note the absence of -nt: whisper-stream WITH timestamps
+# prints one newline-terminated line per utterance, which core parses; -nt makes
+# it redraw a single line with carriage returns that never split into lines.
+wake_enabled = false
+wake_program = "/Users/abirdeol/projects/oracle-of-delphi/whisper/whisper-stream"
+wake_args = [
+  "-m", "/Users/abirdeol/projects/oracle-of-delphi/whisper/ggml-base.en.bin",
+  "-t", "6",
+  "--step", "0",
+  "--length", "5000",
+  "-vth", "0.6",
+]
+
+[supervise]
+# --- Local LLM server ---
+# Built with -DGGML_METAL=ON; see docs/MACOS.md §2. No .exe suffix, and the
+# binary is at build/bin/llama-server rather than build/bin/Release/.
+autostart_llm = true
+llm_program = "/Users/abirdeol/projects/oracle-of-delphi/llama.cpp/build/bin/llama-server"
+llm_args = [
+  "-m", "/Users/abirdeol/projects/oracle-of-delphi/oracle-models/qwen2.5-7b-instruct-q4_k_m.gguf",
+  "--host", "127.0.0.1", "--port", "8080",
+  # Unified memory: every layer is "on the GPU" in the sense that matters, and
+  # 99 simply means "all of them".
+  "-ngl", "99",
+  # --jinja uses the model's own chat template, which is what actually injects
+  # the tool definitions into the prompt. Without it the model never sees its
+  # tools and apologizes instead of calling them.
+  "--jinja",
+  "-c", "8192",
+]
+
+# --- Small/vision tier server ---
+# Same binary, different model, different port. Empty program = reuse llm_program.
+autostart_small_llm = false
+small_llm_program = ""
+small_llm_args = [
+  "-m", "/Users/abirdeol/projects/oracle-of-delphi/oracle-models/qwen3-vl-2b-instruct-q4_k_m.gguf",
+  "--mmproj", "/Users/abirdeol/projects/oracle-of-delphi/oracle-models/mmproj-qwen3-vl-2b-f16.gguf",
+  "--host", "127.0.0.1", "--port", "8081",
+  "-ngl", "99",
+  # A VLM starved of image tokens does not error; it returns small text as
+  # "nothing legible", which reads like a broken index rather than an
+  # under-resolved one.
+  "--image-min-tokens", "1024",
+  "-c", "8192",
+]
+small_llm_ready_timeout_secs = 60
+
+# --- Embedding sidecar ---
+# --pooling mean is what BGE expects. Without it the vectors are subtly wrong
+# rather than absent, so retrieval keeps working and keeps being mediocre.
+autostart_embedder = false
+embedder_program = ""
+embedder_args = [
+  "-m", "/Users/abirdeol/projects/oracle-of-delphi/oracle-models/bge-small-en-v1.5-q8_0.gguf",
+  "--host", "127.0.0.1", "--port", "8082",
+  "--embedding",
+  "--pooling", "mean",
+  "-ngl", "99",
+  "-c", "512",
+]
+
+# --- Actuator daemon ---
+# Auto-detected next to oracle-core. Remember that the TCC grants attach to
+# whichever binary actually runs (your terminal in a dev run), not to actd.
+autostart_actd = true
+actd_program = ""
+
+# --- The face ---
+open_window = true
+# macOS ships browsers as .app bundles, so "chrome" resolves to
+# /Applications/Google Chrome.app/Contents/MacOS/Google Chrome (with Chromium
+# and Brave as fallbacks). "default" opens an ordinary tab instead.
+browser = "chrome"
+
+# --- Idle unload ---
+# More important here than on a discrete-GPU box: the planner's memory is the
+# same memory your editor and browser are using. The wake word reloads it.
+idle_unload_secs = 600
+llm_ready_timeout_secs = 180

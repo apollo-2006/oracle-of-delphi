@@ -92,8 +92,9 @@ impl BrowserHandle {
         if self.is_up().await {
             return Ok(());
         }
-        let exe = resolve_chrome(&self.cfg.chrome_path)
-            .ok_or_else(|| anyhow!("could not find Chrome; set [browser] chrome_path in oracle.toml"))?;
+        let exe = resolve_chrome(&self.cfg.chrome_path).ok_or_else(|| {
+            anyhow!("could not find Chrome; set [browser] chrome_path in oracle.toml")
+        })?;
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg(format!("--remote-debugging-port={}", self.cfg.port))
             .arg(format!("--user-data-dir={}", self.cfg.user_data_dir))
@@ -309,7 +310,11 @@ async fn cdp_call(ws_url: &str, method: &str, params: Value) -> Result<Value> {
 /// Add a scheme if the user/model gave a bare host ("youtube.com" → https://…).
 fn normalize_url(url: &str) -> String {
     let u = url.trim();
-    if u.starts_with("http://") || u.starts_with("https://") || u.starts_with("about:") || u.starts_with("file:") {
+    if u.starts_with("http://")
+        || u.starts_with("https://")
+        || u.starts_with("about:")
+        || u.starts_with("file:")
+    {
         u.to_string()
     } else {
         format!("https://{u}")
@@ -405,11 +410,17 @@ mod tests {
         let view = b.open(&page).await.expect("open");
         assert!(view.text.contains("Hello Oracle"), "text: {}", view.text);
         assert!(
-            view.links.iter().any(|l| l.text.contains("Watch This Video")),
+            view.links
+                .iter()
+                .any(|l| l.text.contains("Watch This Video")),
             "links: {:?}",
             view.links
         );
         let after = b.click("Watch This Video").await.expect("click");
-        assert!(after.url.contains("example.com"), "navigated to: {}", after.url);
+        assert!(
+            after.url.contains("example.com"),
+            "navigated to: {}",
+            after.url
+        );
     }
 }
