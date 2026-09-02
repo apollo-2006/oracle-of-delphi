@@ -382,11 +382,17 @@ mod tests {
     fn appender(marker: &std::path::Path) -> (String, Vec<String>) {
         let m = marker.to_string_lossy().to_string();
         if cfg!(windows) {
+            // The path is deliberately NOT quoted. Command::args escapes an
+            // embedded `"` as `\"` following the C runtime's rules, but cmd.exe
+            // does not read `\"` as an escape -- it keeps the backslash, so the
+            // redirect target became a garbage filename and the marker was
+            // never written. (This needs temp_dir() to be space-free, which it
+            // is on Windows: C:\Users\<name>\AppData\Local\Temp.)
             (
                 "cmd".into(),
                 vec![
                     "/C".into(),
-                    format!("echo x >> \"{m}\" & ping 127.0.0.1 -n 30 > NUL"),
+                    format!("echo x >> {m} & ping 127.0.0.1 -n 30 > NUL"),
                 ],
             )
         } else {

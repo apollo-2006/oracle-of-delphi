@@ -1,7 +1,7 @@
 # Windows-native profile for Oracle of Delphi
 # Place at %APPDATA%\oracle\oracle.toml (or pass --config).
-# Uses a named pipe for the actd link, the E:\oracle-models store, and the
-# specific capture/output devices on this machine.
+# Uses a named pipe for the actd link, the ${ORACLE_ROOT}/oracle-models store,
+# and the specific capture/output devices on this machine.
 
 [general]
 # On Windows, a writable per-user runtime dir. %LOCALAPPDATA%\oracle works well.

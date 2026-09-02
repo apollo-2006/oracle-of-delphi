@@ -303,7 +303,19 @@ fn the_macos_profile_points_at_a_unix_llama_server() {
     let p = &cfg.supervise.llm_program;
     assert!(!p.ends_with(".exe"), "not a Windows binary: {p}");
     assert!(p.ends_with("llama-server"), "{p}");
-    assert!(!p.contains('\\'), "unix paths use forward slashes: {p}");
+
+    // Separator check against the profile's own text, not the expanded value:
+    // ${ORACLE_ROOT} expands to the checkout, so on Windows the root half is
+    // C:\Users\... and contributes backslashes this test never meant to police.
+    let raw = std::fs::read_to_string(deploy("oracle.macos.toml")).expect("readable");
+    let line = raw
+        .lines()
+        .find(|l| l.trim_start().starts_with("llm_program"))
+        .expect("the profile sets llm_program");
+    assert!(
+        !line.contains('\\'),
+        "unix paths use forward slashes: {line}"
+    );
 }
 
 #[test]

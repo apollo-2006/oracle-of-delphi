@@ -46,7 +46,7 @@ const VK_MEDIA_PLAY_PAUSE: u16 = 0xB3;
 
 /// Magic tag stamped into synthetic input's dwExtraInfo so our own events are
 /// recognizable to the physical-input watcher.
-const Oracle_INPUT_TAG: usize = 0x4A_41_52_56; // "JARV"
+const ORACLE_INPUT_TAG: usize = 0x4A_41_52_56; // "JARV"
 
 #[derive(Default)]
 pub struct WindowsPlatform;
@@ -170,7 +170,7 @@ unsafe fn blit_window_rgba(
         info.bmiHeader.biHeight = -dst_h;
         info.bmiHeader.biPlanes = 1;
         info.bmiHeader.biBitCount = 32;
-        info.bmiHeader.biCompression = BI_RGB as u32;
+        info.bmiHeader.biCompression = BI_RGB;
 
         let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
         let dib = CreateDIBSection(
@@ -189,7 +189,7 @@ unsafe fn blit_window_rgba(
         let old = SelectObject(mem_dc, dib as _);
         // HALFTONE is the box filter; without it StretchBlt point-samples and
         // small text turns to noise on the way down.
-        SetStretchBltMode(mem_dc, HALFTONE as i32);
+        SetStretchBltMode(mem_dc, HALFTONE);
 
         let mut rect = RECT {
             left: 0,
@@ -333,7 +333,7 @@ impl Platform for WindowsPlatform {
                     wScan: unit,
                     dwFlags: KEYEVENTF_UNICODE | keyup,
                     time: 0,
-                    dwExtraInfo: Oracle_INPUT_TAG,
+                    dwExtraInfo: ORACLE_INPUT_TAG,
                 };
                 inputs.push(input);
             }
@@ -366,7 +366,7 @@ impl Platform for WindowsPlatform {
                 file.as_ptr(),
                 std::ptr::null(),
                 std::ptr::null(),
-                SW_SHOWNORMAL as i32,
+                SW_SHOWNORMAL,
             )
         };
         // ShellExecuteW returns a value > 32 on success (legacy HINSTANCE ABI).
@@ -525,7 +525,7 @@ fn tap_vk(vk: u16, times: u32) -> Result<(), PalError> {
                 wScan: 0,
                 dwFlags: keyup,
                 time: 0,
-                dwExtraInfo: Oracle_INPUT_TAG,
+                dwExtraInfo: ORACLE_INPUT_TAG,
             };
             inputs.push(input);
         }

@@ -193,7 +193,48 @@ async fn read_request_line(stream: &mut TcpStream) -> io::Result<String> {
             break; // guard against a runaway line
         }
     }
+    drain_headers(stream).await;
     Ok(String::from_utf8_lossy(&buf).to_string())
+}
+
+/// Consume the request headers we do not parse, so the socket has no unread
+/// data when it closes.
+///
+/// This is what makes the callback work on Windows. Closing a socket that still
+/// has unread bytes in its receive buffer makes the stack send an RST instead of
+/// a FIN, and an RST discards whatever we just wrote -- so the browser is shown
+/// a connection reset rather than the "connected" page, and the loopback test
+/// fails with WSAECONNRESET (10054). Unix drains and delivers the response
+/// anyway, which is why this only ever broke on Windows.
+///
+/// Bounded by both time and size: a client that sends a request line and then
+/// stalls must not hang the auth flow.
+async fn drain_headers(stream: &mut TcpStream) {
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        // The request line's terminating newline is already consumed, so an
+        // immediate newline means there were no headers at all.
+        let mut last_was_newline = true;
+        let mut byte = [0u8; 1];
+        let mut total = 0usize;
+        while total < 64 * 1024 {
+            match stream.read(&mut byte).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            total += 1;
+            match byte[0] {
+                b'\r' => {}
+                b'\n' => {
+                    if last_was_newline {
+                        break;
+                    }
+                    last_was_newline = true;
+                }
+                _ => last_was_newline = false,
+            }
+        }
+    })
+    .await;
 }
 
 async fn respond(stream: &mut TcpStream, message: &str) -> io::Result<()> {
@@ -206,7 +247,11 @@ async fn respond(stream: &mut TcpStream, message: &str) -> io::Result<()> {
         html
     );
     stream.write_all(resp.as_bytes()).await?;
-    stream.flush().await
+    stream.flush().await?;
+    // Send FIN explicitly rather than relying on the drop, so the client sees an
+    // orderly close after a complete response.
+    let _ = stream.shutdown().await;
+    Ok(())
 }
 
 /// Parse the query string out of a request target like `/callback?a=1&b=2`.

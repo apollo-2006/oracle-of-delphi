@@ -239,7 +239,10 @@ mod tests {
     fn tilde_expands_only_as_a_leading_component() {
         let home = home_dir().expect("a home directory");
         let got = expand("~/oracle.db", None);
-        assert_eq!(got, format!("{}/oracle.db", home.display()));
+        // Join the way expand() does rather than with a literal '/': on Windows
+        // PathBuf::push uses a backslash, so a hardcoded separator here fails
+        // against correct behaviour.
+        assert_eq!(got, home.join("oracle.db").to_string_lossy());
         // Not in the middle: Windows 8.3 names such as PROGRA~1 are real paths.
         assert_eq!(expand("/opt/PROGRA~1/x", None), "/opt/PROGRA~1/x");
     }

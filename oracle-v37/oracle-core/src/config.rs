@@ -1498,6 +1498,9 @@ mod tests {
             assert_eq!(cfg.proactive.max_per_hour, 4);
         }
 
+        // Unix only: sun_path is a AF_UNIX limit. On Windows the actd link is a
+        // named pipe with no such ceiling, so validate() accepts this by design.
+        #[cfg(unix)]
         #[test]
         fn an_actd_socket_path_that_cannot_fit_sun_path_is_refused() {
             // The failure this replaces: tokio raising "path must be shorter

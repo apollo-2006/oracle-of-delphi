@@ -361,7 +361,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[cfg(unix)]
     #[test]
     fn an_over_long_socket_path_is_refused_with_a_useful_error() {
         use super::unix;
@@ -436,6 +435,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn uds_client_server_roundtrip_with_peer_check() {
         use super::unix;

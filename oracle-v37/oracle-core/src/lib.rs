@@ -131,7 +131,13 @@ impl Shared {
 
     /// Test/demo constructor: unique temp DB so parallel tests don't collide.
     pub fn for_test() -> Self {
-        let path = format!("/tmp/oracle-core-{}.db", uuid::Uuid::new_v4());
+        // std::env::temp_dir(), not a hardcoded /tmp: on Windows there is no
+        // /tmp, and sqlite reports the miss as a bare "unable to open database
+        // file" that reads like corruption rather than a bad path.
+        let path = std::env::temp_dir()
+            .join(format!("oracle-core-{}.db", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
         Self::open(&path).expect("open test db")
     }
 }

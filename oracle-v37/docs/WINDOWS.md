@@ -31,17 +31,65 @@ winget install Kitware.CMake OpenJS.NodeJS Microsoft.VisualStudio.2022.BuildTool
 # Once per machine: piper, whisper.cpp, the whisper model, llama.cpp.
 .\scripts\setup.ps1
 
+# The HUD goes FIRST -- see the note below; this order is not cosmetic.
+cd oracle-hud; npm install; npm run build; cd ..
+
 cargo build --release                          # core + actd (named-pipe + Win32 PAL)
 cmake -B oracle-audio\build -S oracle-audio     # WASAPI is auto-enabled on Windows
 cmake --build oracle-audio\build --config Release
-cd oracle-hud; npm install; npm run build; cd ..
 ```
+
+> **Build the HUD before `cargo build`.** `oracle-core` embeds `oracle-hud\dist`
+> at compile time via `#[derive(RustEmbed)]` (`gateway/server.rs`), and `dist\`
+> is a build output that is not in a clone. Run `cargo build` first on a fresh
+> checkout and it fails with `folder '...oracle-hud/dist' does not exist`,
+> followed by three cascading `no associated function named 'get'` errors on
+> `HudAssets` -- which read like a broken dependency rather than a missing
+> directory. `scripts\build_all.sh` already sequences this correctly.
+
+If PowerShell blocks `npm` with "running scripts is disabled on this system",
+that is the execution policy stopping `npm.ps1`; `npm.cmd install` /
+`npm.cmd run build` bypass it without changing a machine-wide setting.
 
 `setup.ps1` installs into the layout the profile expects and can be re-run
 safely; `-Only piper` does a single component and `-Force` refetches one you
 suspect is broken. It is what puts `whisper\models\ggml-base.en.bin` in place —
 that file matches the repository's own `*.bin` ignore rule, so it has never been
 in a clone, and without it speech recognition and the wake word cannot work.
+
+### What setup.ps1 needs, and what it was verified against
+
+It runs on **Windows PowerShell 5.1 as well as PowerShell 7** — it uses no
+7-only syntax, and `Expand-Archive` (its one non-trivial cmdlet) ships in 5.1.
+If PowerShell refuses to run it, use the `-ExecutionPolicy Bypass -File` form in
+the script's own header comment.
+
+Beyond PowerShell it needs `git`, `cmake`, and a real `python` on PATH. Watch
+for the Microsoft Store's `python.exe` stub, which resolves on PATH but opens
+the Store instead of running: `python --version` should print a version.
+
+Verified end to end on a fresh clone (September 2026), all four components, on
+both PowerShell 5.1 and 7.6.5:
+
+| Step | Result |
+|---|---|
+| `-Only piper` | `piper-tts` wheel into `.venv`, synthesis self-check passed |
+| `-Only whisper` | `whisper-bin-x64.zip` unpacked to `whisper\windows-x64\` |
+| `-Only model` | `ggml-base.en.bin`, ~148 MB |
+| `-Only llama` | llama.cpp cloned and built to `llama-server.exe` |
+
+Two notes from that run:
+
+- The `piper-tts` wheel resolved under **Python 3.14**. Nothing pins a maximum,
+  but this is the wheel most likely to lag a brand-new Python release, so it is
+  the first thing to suspect if the piper step fails on a newer one.
+- The llama.cpp build prints `OpenSSL not found, HTTPS support disabled` and a
+  CMake `CMP0194` policy warning. Both are harmless here: the profiles load
+  models from local paths, so `llama-server` never needs HTTPS. It would only
+  matter if you reached for its `-hf` model-download flag.
+
+A clean run leaves `git status` empty — everything setup.ps1 produces is
+covered by the ignore rules.
 
 Copy `deploy\oracle.windows.toml` to `%APPDATA%\oracle\oracle.toml`. **You no
 longer need to adjust paths**: the profile addresses the checkout as

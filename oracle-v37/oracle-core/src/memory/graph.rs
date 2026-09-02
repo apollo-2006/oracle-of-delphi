@@ -256,7 +256,10 @@ mod tests {
     fn kg() -> KnowledgeGraph {
         // shared in-memory across the two connections isn't possible with plain
         // :memory:, so use a temp file path unique per test.
-        let path = format!("/tmp/oracle-kg-test-{}.db", uuid::Uuid::new_v4());
+        let path = std::env::temp_dir()
+            .join(format!("oracle-kg-test-{}.db", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
         KnowledgeGraph::open(&path, KnowledgeGraph::default_vocab()).unwrap()
     }
 

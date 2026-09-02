@@ -2628,7 +2628,8 @@ fn spawn_wake_listener(
                 .kill_on_drop(true);
             #[cfg(windows)]
             {
-                use std::os::windows::process::CommandExt;
+                // tokio's Command has an inherent creation_flags on Windows, so
+                // unlike the std::process::Command sites above, no trait import.
                 cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
             }
 
