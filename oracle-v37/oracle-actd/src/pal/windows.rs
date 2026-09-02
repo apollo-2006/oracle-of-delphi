@@ -212,7 +212,7 @@ unsafe fn blit_window_rgba(
             // screen blit is meaningless (usually 0), so force it opaque --
             // leaving it would encode a fully transparent PNG.
             let mut rgba = Vec::with_capacity(n);
-            for px in src.chunks_exact(4) {
+            for px in src.as_chunks::<4>().0 {
                 rgba.push(px[2]);
                 rgba.push(px[1]);
                 rgba.push(px[0]);
