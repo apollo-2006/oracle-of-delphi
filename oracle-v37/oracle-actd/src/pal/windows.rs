@@ -547,3 +547,73 @@ fn tap_vk(vk: u16, times: u32) -> Result<(), PalError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Win32 counterpart of `pal::linux::tests::lists_real_processes`.
+    ///
+    /// Toolhelp32 must at minimum see the process running this test. A snapshot
+    /// that fails returns `Backend`, and one that succeeds but iterates wrong
+    /// returns an empty list -- both look identical to a caller ("no processes")
+    /// and neither was covered before.
+    #[test]
+    fn lists_real_processes() {
+        let p = WindowsPlatform::new();
+        let procs = p.list_processes().unwrap();
+        let me = std::process::id();
+        assert!(procs.iter().any(|p| p.pid == me), "should see own pid");
+        // Process32FirstW/NextW fill szExeFile; an off-by-one on the NUL scan
+        // would silently produce empty names.
+        assert!(
+            procs.iter().any(|p| !p.name.is_empty()),
+            "processes must carry names"
+        );
+    }
+
+    /// The Win32 counterpart of
+    /// `pal::linux::tests::kill_missing_process_is_no_process`.
+    #[test]
+    fn kill_missing_process_is_no_process() {
+        let p = WindowsPlatform::new();
+        // u32::MAX cannot be a live pid: Windows pids are allocated as small
+        // multiples of four. OpenProcess therefore returns null, which must
+        // surface as NoProcess rather than a generic Backend error -- the
+        // confirmation UI distinguishes "already gone" from "failed to kill".
+        assert!(matches!(
+            p.kill_process(u32::MAX),
+            Err(PalError::NoProcess(_))
+        ));
+    }
+
+    /// Whatever `enum_proc` lets through must satisfy the invariants the filter
+    /// exists to enforce. Asserted over the real desktop rather than a fixture,
+    /// so this also passes (vacuously) on a session with no windows.
+    #[test]
+    fn listed_windows_satisfy_the_filters_invariants() {
+        let p = WindowsPlatform::new();
+        let windows = p.list_windows().unwrap();
+        for w in &windows {
+            // enum_proc skips len <= 0, so an empty title means the filter broke.
+            assert!(!w.title.is_empty(), "untitled window leaked: {w:?}");
+            assert_ne!(w.id, 0, "a listed window needs a usable handle");
+        }
+        // GetForegroundWindow returns a single hwnd, so at most one match.
+        assert!(
+            windows.iter().filter(|w| w.focused).count() <= 1,
+            "at most one window can be focused"
+        );
+    }
+
+    /// `wide` feeds Win32 -W entry points, which read until a NUL. A missing
+    /// terminator does not fail loudly -- it reads past the buffer.
+    #[test]
+    fn wide_strings_are_nul_terminated() {
+        assert_eq!(wide("hi"), vec![b'h' as u16, b'i' as u16, 0]);
+        assert_eq!(wide(""), vec![0]);
+        // Non-BMP input must survive as a surrogate pair plus the terminator.
+        assert_eq!(wide("\u{1F600}").len(), 3);
+        assert_eq!(*wide("\u{1F600}").last().unwrap(), 0);
+    }
+}
