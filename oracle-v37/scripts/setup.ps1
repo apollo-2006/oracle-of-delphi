@@ -48,7 +48,12 @@ function Need([string]$cmd, [string]$hint) {
 # --- 1. piper (text to speech) ------------------------------------------------
 # The wheel, not the GitHub release archive -- same reasoning as setup.sh, and
 # it keeps both platforms on one mechanism. piper-tts publishes a win_amd64
-# wheel, and it bundles its own phonemization, so no separate espeak-ng.
+# wheel, and it carries its own phonemization, so nothing here fetches espeak-ng
+# separately. Note that this relocates the GPL rather than escaping it: the wheel
+# is OHF-Voice/piper1-gpl, GPL-3.0-or-later, and is a different project from the
+# MIT-licensed rhasspy/piper whose binaries are vendored at the repository root.
+# What changes is that the user installs it instead of this repository shipping
+# it. See THIRD-PARTY-NOTICES.md.
 if (Want 'piper') {
     $venv  = Join-Path $root ".venv"
     $piper = Join-Path $venv "Scripts\piper.exe"
@@ -58,7 +63,11 @@ if (Want 'piper') {
         Need python "install Python 3 from python.org or the Microsoft Store"
         Write-Host "==> piper: installing the piper-tts wheel into .venv"
         if (-not (Test-Path $venv)) { & python -m venv $venv }
-        & (Join-Path $venv "Scripts\pip.exe") install --quiet --upgrade piper-tts
+        # >=1.7.0 is a correctness floor: the 1.6.1 arm64 macOS wheel baked its
+        # build machine's espeak-ng data path into the extension and synthesizes
+        # 0-byte WAVs (OHF-Voice/piper1-gpl#272). Pinned on both platforms so the
+        # two scripts cannot drift apart on which versions are acceptable.
+        & (Join-Path $venv "Scripts\pip.exe") install --quiet --upgrade 'piper-tts>=1.7.0'
         if (-not (Test-Path $piper)) { throw "piper-tts installed but $piper is missing" }
         Write-Host "    -> .venv\Scripts\piper.exe"
     }
@@ -66,12 +75,25 @@ if (Want 'piper') {
     # to the browser's TTS, which looks like nothing being wrong at all.
     $voice = Join-Path $root "piper\en_US-amy-medium.onnx"
     if (Test-Path $voice) {
+        # Weigh the output rather than trusting the call. A native executable
+        # exiting non-zero does not throw in PowerShell, so the catch below never
+        # fired -- and a 0-byte WAV (the piper1-gpl#272 failure) is written by a
+        # process that exits 0, so neither signal was being checked at all.
+        $check = Join-Path $env:TEMP "oracle-piper-check.wav"
+        Remove-Item $check -ErrorAction SilentlyContinue
         try {
-            "test" | & $piper --model $voice --output_file $env:TEMP\oracle-piper-check.wav *> $null
-            Write-Host "    piper: synthesis OK"
-            Remove-Item "$env:TEMP\oracle-piper-check.wav" -ErrorAction SilentlyContinue
+            "test" | & $piper --model $voice --output_file $check *> $null
+            $wrote = (Test-Path $check) -and ((Get-Item $check).Length -gt 0)
+            if ($LASTEXITCODE -eq 0 -and $wrote) {
+                Write-Host "    piper: synthesis OK"
+            } else {
+                Write-Warning "piper installed but could not synthesize with $voice"
+                Write-Warning "  (a 0-byte result usually means a piper-tts build whose espeak-ng data path is wrong -- see piper1-gpl#272)"
+            }
         } catch {
             Write-Warning "piper installed but could not synthesize with $voice"
+        } finally {
+            Remove-Item $check -ErrorAction SilentlyContinue
         }
     } else {
         Write-Warning "voice model missing at piper\en_US-amy-medium.onnx"

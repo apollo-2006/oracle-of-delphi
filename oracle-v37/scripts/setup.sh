@@ -68,8 +68,12 @@ need tar
 # mechanism serves every platform, which is what makes dropping the vendored
 # Windows binaries a one-line change later.
 #
-# It also bundles its own phonemization, so nothing here redistributes or even
-# downloads espeak-ng separately.
+# It also carries its own phonemization, so nothing here redistributes or even
+# downloads espeak-ng separately. That relocates the GPL obligation rather than
+# removing it: the wheel is OHF-Voice/piper1-gpl and is GPL-3.0-or-later -- a
+# different project from the MIT rhasspy/piper vendored at the repository root,
+# despite the shared name. The gain is that the user installs it rather than
+# this repository redistributing it. See THIRD-PARTY-NOTICES.md.
 #
 # The voice model itself (piper/en_US-amy-medium.onnx) is platform-neutral and
 # stays committed -- it is the one vendored file that works everywhere.
@@ -82,7 +86,11 @@ if want piper; then
     need python3
     echo "==> piper: installing the piper-tts wheel into .venv"
     [ -d "$VENV" ] || python3 -m venv "$VENV"
-    "$VENV/bin/pip" install --quiet --upgrade piper-tts
+    # >=1.7.0 is a correctness floor, not a preference. The 1.6.1 arm64 macOS
+    # wheel baked its build machine's espeak-ng data path into the compiled
+    # extension, so every synthesis exits 0 and writes a 0-byte WAV
+    # (OHF-Voice/piper1-gpl#272). Unpinned, --upgrade could resolve to it.
+    "$VENV/bin/pip" install --quiet --upgrade 'piper-tts>=1.7.0'
     [ -x "$PIPER_BIN" ] || { echo "piper-tts installed but $PIPER_BIN is missing" >&2; exit 1; }
     echo "    -> .venv/bin/piper"
   fi
@@ -91,11 +99,22 @@ if want piper; then
   # looks like nothing being wrong at all.
   VOICE="$ROOT/piper/en_US-amy-medium.onnx"
   if [ -f "$VOICE" ]; then
-    if echo "test" | "$PIPER_BIN" --model "$VOICE" --output_file /dev/null >/dev/null 2>&1; then
+    # Write to a real file and weigh it. /dev/null could not distinguish
+    # "spoke" from "exited 0 and produced nothing", which is exactly how the
+    # 1.6.1 arm64 failure presents.
+    # Full-path template, not `mktemp -t`: BSD mktemp (macOS) treats -t's
+    # argument as a prefix and appends its own suffix, GNU treats it as the
+    # template. Spelling the path out behaves identically on both.
+    CHECK_WAV="$(mktemp "${TMPDIR:-/tmp}/oracle-piper-check.XXXXXX")"
+    if echo "test" | "$PIPER_BIN" --model "$VOICE" --output_file "$CHECK_WAV" >/dev/null 2>&1 \
+       && [ -s "$CHECK_WAV" ]; then
       echo "    piper: synthesis OK"
     else
       echo "    WARNING: piper installed but could not synthesize with $VOICE" >&2
+      echo "             (a 0-byte result usually means a piper-tts build whose" >&2
+      echo "              espeak-ng data path is wrong -- see piper1-gpl#272)" >&2
     fi
+    rm -f "$CHECK_WAV"
   else
     echo "    WARNING: voice model missing at piper/en_US-amy-medium.onnx" >&2
   fi

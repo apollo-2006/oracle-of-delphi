@@ -45,26 +45,55 @@ files**, and that is now a safe, verified change rather than a suggestion:
   file list vendored in `whisper/`** — the setup script reproduces that
   directory exactly.
 * It installs Piper from the `piper-tts` wheel, which supersedes the vendored
-  `piper/*.exe` and needs no separate espeak-ng at all.
+  `piper/*.exe`. Note what this does and does not do: the wheel is itself
+  GPL-3.0-or-later (see below), so the obligation is **relocated, not removed**
+  — from code this repository redistributes to code the user installs on their
+  own machine. That is still the improvement worth having, because it is
+  redistribution that puts the obligation on this project.
 
 So `git rm -r --cached piper/espeak-ng-data piper/*.exe piper/*.dll whisper/*.exe
 whisper/*.dll` would delete this entire section along with ~75 MB, and a Windows
 clone would still work after one `scripts/setup.ps1`. Keep
 `piper/en_US-amy-medium.onnx`: it is platform-neutral and used on every OS.
 
-### Piper — MIT
+### Piper — two projects, one name
 
-`piper/piper.exe`, `piper/piper_phonemize.dll`, `piper/en_US-amy-medium.onnx`
+"Piper" here refers to two separately licensed projects, and an earlier version
+of this file conflated them. They must be read side by side:
 
-Neural text-to-speech. MIT-licensed itself; the vendored Windows build links
-espeak-ng above.
+| | Vendored binaries | The `piper-tts` wheel |
+|---|---|---|
+| Project | `rhasspy/piper` | `OHF-Voice/piper1-gpl` |
+| License | **MIT** | **GPL-3.0-or-later** |
+| Files | `piper/piper.exe`, `piper/piper_phonemize.dll` | installed into `.venv/` by the setup scripts |
+| Reaches this repo by | redistribution (committed to git) | the user running `pip install` |
 
-`scripts/setup.sh` and `scripts/setup.ps1` install Piper from the **`piper-tts`
-wheel** instead, which bundles its own phonemization and pulls no separate
-espeak-ng. The vendored `.exe`/`.dll` are only what a Windows clone uses before
-the setup script has been run.
+Neural text-to-speech. The vendored Windows build is MIT and links the
+espeak-ng above. The wheel is the maintained successor and is GPL-3.0-or-later
+— it carries espeak-ng inside it rather than beside it, which is why its own
+license is GPL and not MIT.
 
-- Upstream: https://github.com/rhasspy/piper
+So moving to the wheel does not make the GPL question go away; it changes who
+answers it. This repository stops shipping GPL-licensed files, and the user
+installs them instead. Invocation is unchanged either way: Piper runs as a
+separate process over stdin/stdout (`[voice] tts_program`), which is
+arm's-length invocation rather than linking, so this project's own MIT license
+is unaffected in both cases.
+
+`scripts/setup.sh` and `scripts/setup.ps1` pin `piper-tts>=1.7.0`. The floor is
+not cosmetic: the 1.6.1 arm64 macOS wheel baked its build machine's espeak-ng
+data path into the compiled extension, so every synthesis returns a 0-byte WAV
+(OHF-Voice/piper1-gpl#272, open at the time of writing; reproduced as fixed on
+1.7.0). An unpinned `pip install --upgrade` that resolved to it would leave
+`tts_program` producing silence, and the HUD would fall back to browser speech
+with nothing in the logs to say why.
+
+The vendored `.exe`/`.dll` are only what a Windows clone uses before the setup
+script has been run. `piper/en_US-amy-medium.onnx` is the voice model and is
+used on every OS.
+
+- Vendored upstream (MIT): https://github.com/rhasspy/piper
+- Wheel upstream (GPL-3.0-or-later): https://github.com/OHF-Voice/piper1-gpl
 - Wheel: https://pypi.org/project/piper-tts/
 
 ### ONNX Runtime — MIT
