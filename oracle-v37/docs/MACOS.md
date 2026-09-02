@@ -113,62 +113,75 @@ start, and on stop says so explicitly if nothing was ever delivered:
 Privacy & Security -> Microphone for this binary.
 ```
 
-## 4. Build the voice stack for arm64
+## 4. Run the setup script
 
-**The `whisper/` and `piper/` directories at the repo root are Windows builds** —
-`.exe` and `.dll` only. Nothing in them runs on a Mac, and pointing `[voice]` at
-them fails one layer below anything that reports it usefully.
-`deploy/oracle.macos.toml` therefore ships `[voice]` switched off, with the arm64
-paths already filled in; build these two, then flip the switches.
-
-Neither is optional-but-nice: with `stt_enabled = false` the HUD falls back to the
-browser's speech recognition, and with `wake_enabled = false` there is no
-always-on wake word at all.
-
-### whisper.cpp (speech in)
-
-Metal is on by default here too.
+One command fetches or builds everything that is platform-specific:
 
 ```bash
-brew install sdl2                                     # whisper-stream opens the mic itself
-git clone https://github.com/ggerganov/whisper.cpp
-cd whisper.cpp
-cmake -B build -DWHISPER_METAL=ON -DWHISPER_SDL2=ON
-cmake --build build --config Release -j
-sh ./models/download-ggml-model.sh base.en
-
-# What the config expects, next to each other:
-cp build/bin/whisper-cli build/bin/whisper-stream ../whisper/
-cp models/ggml-base.en.bin ../whisper/
+scripts/setup.sh              # piper, whisper.cpp, the whisper model, llama.cpp
+scripts/setup.sh whisper      # or just one component
+scripts/setup.sh --force      # re-fetch something you suspect is broken
 ```
 
-`whisper-stream` captures the microphone directly rather than going through the
-HUD, which is why it needs SDL2 — and why it needs its **own** Microphone grant
-for whatever binary launches it.
+It installs into the layout the shipped profiles expect, so nothing needs
+editing afterwards:
+
+| Path | What | How |
+|---|---|---|
+| `.venv/bin/piper` | Text to speech | `piper-tts` wheel |
+| `whisper/macos-arm64/` | Speech in + wake word | **built from source** |
+| `whisper/models/ggml-base.en.bin` | The ASR model, ~148 MB | downloaded |
+| `llama.cpp/build/bin/llama-server` | Inference | built with Metal |
+
+Re-running is safe: each step is skipped when its output is already there.
+
+### Why piper comes from a wheel and not the release
+
+**The published macOS archive is broken.** `piper_macos_aarch64.tar.gz` from
+release `2023.11.14-2` — the newest that exists — ships the `piper` and
+`piper_phonemize` executables but omits the `.dylib` files they link against,
+keeping only an onnxruntime `.dSYM` debug bundle. Extract it and run it and you
+get:
+
+```
+dyld: Library not loaded: @rpath/libespeak-ng.1.dylib
+```
+
+The `piper-tts` **wheel** is the maintained path, publishes a
+`macosx_11_0_arm64` build, and accepts `--model` / `--output_file` — the exact
+arguments this project already passed to the old CLI, so `[voice] tts_args`
+needed no change. It also bundles its own phonemization, so nothing separate has
+to be fetched. There is a `win_amd64` wheel too, which is what lets one
+mechanism serve both platforms.
+
+The voice model, `piper/en_US-amy-medium.onnx`, is platform-neutral and stays
+committed — it is the one vendored file that works everywhere.
+
+### Why whisper.cpp is built rather than downloaded
+
+whisper.cpp publishes release binaries for **Windows and Ubuntu only**; there is
+no macOS asset. The script therefore clones and builds it, with SDL2 because
+`whisper-stream` opens the microphone itself rather than going through the HUD:
+
+```bash
+brew install sdl2      # before scripts/setup.sh whisper
+```
+
+Without SDL2, `whisper-cli` still builds and transcription works; only the wake
+word is missing. The script says so rather than failing silently.
 
 Leave `-nt` out of `wake_args`. With timestamps on, `whisper-stream` prints one
-newline-terminated line per utterance, which core parses; `-nt` makes it redraw a
-single line with carriage returns that never split into lines, so the wake word
-is never heard.
+newline-terminated line per utterance, which core parses; `-nt` makes it redraw
+a single line with carriage returns that never split into lines, so the wake
+word is never heard.
 
-### piper (speech out)
+### The vendored Windows binaries
 
-Piper publishes macOS builds, so there is usually nothing to compile:
-
-```bash
-curl -L -o piper.tar.gz \
-  https://github.com/rhasspy/piper/releases/latest/download/piper_macos_aarch64.tar.gz
-tar xzf piper.tar.gz -C piper --strip-components=1
-xattr -dr com.apple.quarantine piper/     # or the first synthesis dies with "killed"
-```
-
-The voice model already in `piper/` (`en_US-amy-medium.onnx` and its `.json`) is
-platform-neutral and is reused as-is; only the executable and the bundled
-`onnxruntime` differ.
-
-TTS degrades gracefully: if `tts_program` is missing or fails, the HUD falls back
-to browser speech, so the Oracle always talks. That is convenient, and it also
-means a broken piper looks like nothing at all — check `oracle.log`.
+`piper/*.exe`, `piper/*.dll` and `whisper/*.exe` at the repository root are
+Windows builds and do not run here. They are still committed so a Windows clone
+works today without running anything; `scripts/setup.ps1` now reproduces them
+(the whisper set is byte-for-byte the same release archive), so they can be
+deleted whenever you want the repository smaller.
 
 ## 5. Build and run
 
@@ -194,9 +207,15 @@ headers; run `xcode-select --install` if `clang` is missing.
 ### Build
 
 ```bash
+scripts/setup.sh              # once: the platform-specific dependencies (section 4)
 scripts/build_all.sh          # HUD first, then the Rust workspace, then audio
-cargo run -p oracle-core -- run
+cargo run -p oracle-core -- run --config deploy/oracle.macos.toml
 ```
+
+The profile resolves `${ORACLE_ROOT}` from the `.oracle-root` marker at the top
+of the checkout, and `${ORACLE_PLATFORM}` to `macos-arm64` or `macos-x64`, so it
+works unedited from a fresh clone and on either Mac architecture. Set
+`ORACLE_ROOT` in the environment to override.
 
 `--alsa` is Linux-only and the script refuses it here: CMake selects the CoreAudio
 backend automatically on `APPLE`, and the audio test binary prints

@@ -133,15 +133,45 @@ pub mod unix {
     }
 
     /// Bind a UDS listener, removing any stale socket file first. The socket is
-    /// created with 0600 perms via a umask-safe path (parent dir should be user
-    /// private, e.g. `$XDG_RUNTIME_DIR/oracle/`).
+    /// created with 0600 perms via a umask-safe path, inside a parent directory
+    /// this function creates 0700 if it does not already exist.
+    ///
+    /// Creating the parent is not a convenience. `bind` on a path whose
+    /// directory is missing fails with a bare `ENOENT` — "No such file or
+    /// directory (os error 2)" — which names neither the socket nor the missing
+    /// directory, and in actd propagates straight out of `main` so the daemon
+    /// dies before it logs anything useful. Core then reports only "actd not
+    /// connected", pointing at the wrong process entirely.
+    ///
+    /// This was invisible on Linux because the socket conventionally lives
+    /// inside `$XDG_RUNTIME_DIR/oracle/`, which core already creates for its
+    /// own logs. Put the socket anywhere else — as macOS must, since sun_path's
+    /// 104-byte limit pushes it out of a long runtime dir — and nothing creates
+    /// it. actd already does exactly this for its audit journal; the socket was
+    /// simply never given the same treatment.
     pub fn bind(path: &str) -> io::Result<UnixListener> {
         check_path_len(path)?;
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!("creating socket directory {}: {e}", parent.display()),
+                    )
+                })?;
+                // Private to this user, like $XDG_RUNTIME_DIR would be. Only on
+                // a directory we just made: never widen or narrow one the user
+                // already set up deliberately.
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
+        }
         // Remove a stale socket from a previous crash.
         if std::path::Path::new(path).exists() {
             let _ = std::fs::remove_file(path);
         }
-        let listener = UnixListener::bind(path)?;
+        let listener = UnixListener::bind(path)
+            .map_err(|e| io::Error::new(e.kind(), format!("binding unix socket {path}: {e}")))?;
         // Tighten perms: only the owning user may connect. This applies to every
         // unix target, not just Linux -- macOS honours socket file permissions
         // the same way, and gating it on Linux left the socket world-accessible
@@ -344,6 +374,48 @@ mod tests {
         assert!(msg.contains("sun_path"), "{msg}");
         assert!(msg.contains(&long.len().to_string()), "{msg}");
         assert!(msg.contains(&long), "{msg}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_creates_a_missing_socket_directory() {
+        use super::unix;
+        // The exact shape that killed actd on macOS: a socket in a directory
+        // that does not exist yet. Before this, bind returned a bare ENOENT and
+        // the daemon exited before logging anything.
+        let base = unix::scratch_socket_dir("oracle-mkdir-test").unwrap();
+        let nested = base.join("run");
+        assert!(!nested.exists(), "the directory must not exist yet");
+        let sock = nested.join("actd.sock");
+        let path = sock.to_str().unwrap();
+
+        let listener = unix::bind(path).expect("bind must create the directory");
+        assert!(nested.is_dir(), "bind should have created {nested:?}");
+        assert!(sock.exists(), "the socket itself should exist");
+
+        // Private to this user, like $XDG_RUNTIME_DIR.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "socket dir should be private, got {mode:o}");
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bind_error_names_the_socket_it_failed_on() {
+        use super::unix;
+        // "No such file or directory (os error 2)" with no path in it is what
+        // made this take a debugging session rather than a glance at the log.
+        let err = unix::bind("/proc/nonexistent-oracle-test/actd.sock")
+            .or_else(|_| unix::bind("/dev/null/actd.sock"))
+            .expect_err("binding under a non-directory must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("actd.sock"),
+            "the error must name the socket path, got: {msg}"
+        );
     }
 
     #[cfg(unix)]

@@ -52,7 +52,11 @@ pub struct ChildSpec {
 #[derive(Clone)]
 pub struct ChildHandle {
     name: String,
-    desired_running: watch::Sender<bool>,
+    /// Shared with the [`Supervisor`], which holds its own reference for the
+    /// whole of its life. That is what makes dropping every caller-side handle
+    /// harmless: the watch channel stays open, so the child's loop keeps
+    /// waiting on it instead of seeing the sender disappear.
+    desired_running: std::sync::Arc<watch::Sender<bool>>,
 }
 
 impl ChildHandle {
@@ -92,6 +96,16 @@ impl ChildHandle {
 pub struct Supervisor {
     cancel: CancellationToken,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// One reference per supervised child, held for the supervisor's whole life.
+    ///
+    /// Without this the only `Sender` lived in the [`ChildHandle`] returned to
+    /// the caller — so a caller that ignored the return value (as the actd
+    /// launch does: it never needs to pause the daemon) dropped the sender
+    /// immediately. The child's loop then saw `desired.changed()` return `Err`,
+    /// took its "nothing can ever resume us" path, and killed the process it
+    /// had just spawned. No log line was emitted on that path, so the visible
+    /// symptom was a daemon that "started" and was never heard from again.
+    keepalive: Vec<std::sync::Arc<watch::Sender<bool>>>,
 }
 
 impl Supervisor {
@@ -99,6 +113,7 @@ impl Supervisor {
         Supervisor {
             cancel,
             tasks: Vec::new(),
+            keepalive: Vec::new(),
         }
     }
 
@@ -117,6 +132,9 @@ impl Supervisor {
     fn supervise_with_state(&mut self, spec: ChildSpec, running: bool) -> ChildHandle {
         let cancel = self.cancel.clone();
         let (tx, rx) = watch::channel(running);
+        let tx = std::sync::Arc::new(tx);
+        // The supervisor's own reference: the child outlives the caller's handle.
+        self.keepalive.push(tx.clone());
         let handle = ChildHandle {
             name: spec.name.clone(),
             desired_running: tx,
@@ -285,6 +303,49 @@ mod tests {
             .await
             .expect("shutdown must not hang");
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn a_child_survives_its_handle_being_dropped() {
+        // The regression this pins: `supervise()` returns a ChildHandle, and a
+        // caller with no reason to pause the child (the actd launch) discards
+        // it. That used to drop the only watch::Sender, so the child's loop saw
+        // `changed()` return Err, took its "nothing can ever resume us" path,
+        // and killed the process microseconds after spawning it -- emitting no
+        // log line at all, so actd appeared to start and was simply never
+        // there. ChildHandle's own documentation promises the opposite.
+        let marker = tmp_log("handle-drop-marker");
+        let _ = std::fs::remove_file(&marker);
+        let (program, args) = appender(&marker);
+
+        let cancel = CancellationToken::new();
+        let mut sup = Supervisor::new(cancel.clone());
+        // Deliberately discard the handle, exactly as the actd launch does.
+        let _ = sup.supervise(ChildSpec {
+            name: "handle-drop".into(),
+            program,
+            args,
+            log_path: tmp_log("handle-drop"),
+        });
+
+        // Long enough for a killed child to have been restarted several times
+        // (backoff starts at 500ms) if the bug were still present.
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+
+        let starts = std::fs::read_to_string(&marker)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        assert_eq!(
+            starts, 1,
+            "the child should have started exactly once and still be running; \
+             0 means it was killed before it got going, >1 that it was killed \
+             and restarted -- got {starts}"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), sup.shutdown())
+            .await
+            .expect("shutdown must not hang");
+        let _ = std::fs::remove_file(&marker);
     }
 
     #[tokio::test]

@@ -25,19 +25,35 @@ rustup default stable-x86_64-pc-windows-msvc
 winget install Kitware.CMake OpenJS.NodeJS Microsoft.VisualStudio.2022.BuildTools
 ```
 
-## 2. Build
+## 2. Setup and build
 
 ```powershell
+# Once per machine: piper, whisper.cpp, the whisper model, llama.cpp.
+.\scripts\setup.ps1
+
 cargo build --release                          # core + actd (named-pipe + Win32 PAL)
 cmake -B oracle-audio\build -S oracle-audio     # WASAPI is auto-enabled on Windows
 cmake --build oracle-audio\build --config Release
 cd oracle-hud; npm install; npm run build; cd ..
 ```
 
-Copy `deploy\oracle.windows.toml` to `%APPDATA%\oracle\oracle.toml` and adjust
-paths. It's already set for your rig: model dir `E:\oracle-models`, mic
-`Microphone (Razer Seiren V3 Mini)`, output `Speakers (3- Fosi Audio K5 Pro)`,
-named pipe `oracle-actd`.
+`setup.ps1` installs into the layout the profile expects and can be re-run
+safely; `-Only piper` does a single component and `-Force` refetches one you
+suspect is broken. It is what puts `whisper\models\ggml-base.en.bin` in place —
+that file matches the repository's own `*.bin` ignore rule, so it has never been
+in a clone, and without it speech recognition and the wake word cannot work.
+
+Copy `deploy\oracle.windows.toml` to `%APPDATA%\oracle\oracle.toml`. **You no
+longer need to adjust paths**: the profile addresses the checkout as
+`${ORACLE_ROOT}` (found via the `.oracle-root` marker, which is located from the
+executable as well as from the config, so it still resolves after the copy),
+this machine as `${ORACLE_PLATFORM}`, and per-user directories as
+`${LOCALAPPDATA}`. Set `ORACLE_ROOT` in the environment to override.
+
+Still rig-specific and worth checking: the mic
+`Microphone (Razer Seiren V3 Mini)`, the output
+`Speakers (3- Fosi Audio K5 Pro)`, and the named pipe `oracle-actd`. Models go
+in `oracle-models\` inside the checkout (gitignored) rather than `E:\oracle-models`.
 
 Validate it:
 
@@ -71,7 +87,7 @@ Option A — Vulkan (recommended to start):
 # Grab a prebuilt llama.cpp Vulkan release, or build:
 cmake -B build -DGGML_VULKAN=ON
 cmake --build build --config Release
-.\build\bin\llama-server.exe -m E:\oracle-models\qwen2.5-14b-instruct-q5_k_m.gguf `
+.\build\bin\llama-server.exe -m ..\oracle-models\qwen2.5-14b-instruct-q5_k_m.gguf `
   --host 127.0.0.1 --port 8080 --ctx-size 32768
 ```
 
@@ -85,19 +101,21 @@ Either way, set in your config:
 [llm]
 backend = "http://127.0.0.1:8080"
 model = "qwen2.5-14b-instruct-q5_k_m"
-model_dir = "E:\\oracle-models"
+model_dir = "${ORACLE_ROOT}/oracle-models"
 ```
 
 Sources: [Vulkan vs ROCm on RDNA4 (2026)](https://runaihome.com/blog/rdna4-vulkan-vs-rocm-local-llm-benchmark-2026/), [ROCm 7.2 on Windows, RDNA 3 & 4](https://runaihome.com/blog/amd-rocm-local-ai-2026/), [llama.cpp RDNA4 gfx1201 build](https://github.com/tlee933/llama.cpp-rdna4-gfx1201), [llamacpp-rocm prebuilts](https://github.com/lemonade-sdk/llamacpp-rocm).
 
 ## 4. Google Workspace auth
 
-Put your `credentials.json` somewhere private (NOT in the repo). Then:
+Put your `credentials.json` somewhere private (NOT in the repo) — the shipped
+profile expects `%LOCALAPPDATA%\oracle\credentials.json` for exactly this
+reason. Then:
 
 ```powershell
 .\target\release\oracle-core.exe auth `
   --config $env:APPDATA\oracle\oracle.toml `
-  --credentials C:\path\to\credentials.json `
+  --credentials $env:LOCALAPPDATA\oracle\credentials.json `
   --account you@gmail.com
 ```
 

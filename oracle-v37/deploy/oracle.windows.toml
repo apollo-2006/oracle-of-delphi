@@ -5,7 +5,7 @@
 
 [general]
 # On Windows, a writable per-user runtime dir. %LOCALAPPDATA%\oracle works well.
-runtime_dir = "C:\\Users\\apollo\\AppData\\Local\\oracle\\run"
+runtime_dir = "${LOCALAPPDATA}\\oracle\\run"
 log_level = "info"
 
 [audio]
@@ -23,7 +23,7 @@ backend = "http://127.0.0.1:8080"
 model = "qwen2.5-14b-instruct-q5_k_m"
 max_tokens = 1024
 temperature = 0.7
-model_dir = "E:\\oracle-models"
+model_dir = "${ORACLE_ROOT}/oracle-models"
 
 # --- The small/vision tier ---
 # A second, much smaller model that stays resident and does the work that
@@ -44,7 +44,7 @@ temperature = 0.2                    # this tier indexes; it does not converse
 resident = true                      # never idle-unloaded -- that is the point
 
 [memory]
-db_path = "C:\\Users\\apollo\\AppData\\Local\\oracle\\oracle.db"
+db_path = "${LOCALAPPDATA}\\oracle\\oracle.db"
 retrieve_limit = 6
 
 # Continuity: retrieve relevant memory into the prompt before planning, and write
@@ -150,10 +150,13 @@ screen_observations = 3
 observation_max_age_secs = 1800
 
 [google]
-# Path to your Google Desktop-app credentials.json. Set this and run
+# Path to your Google Desktop-app credentials.json. Deliberately OUTSIDE the
+# checkout -- docs/WINDOWS.md is explicit that this file does not belong in the
+# repository, and a gitignore rule is a weaker guarantee than never putting it
+# there. Set this and run
 # `oracle-core auth --credentials <path> --account <email>` once; run/repl then
 # load the sealed token automatically. Empty = Google disabled.
-credentials_path = "E:\\oracle-models\\credentials.json"
+credentials_path = "${LOCALAPPDATA}\\oracle\\credentials.json"
 # Must match the --account you passed to `auth` (your `auth` run used "default").
 account = "default"
 
@@ -174,6 +177,49 @@ quiet_until_hour = 8
 repeat_after_secs = 21600
 max_per_hour = 4
 
+# --- Voice ---
+# Populated by scripts/setup.ps1: it installs the piper-tts wheel into .venv and
+# unpacks whisper.cpp's published Windows binaries under whisper/windows-x64/.
+#
+# There was no [voice] section here before, so every field took its default --
+# and the defaults are empty programs, meaning server-side TTS and STT were off
+# on Windows too. The HUD fell back to browser speech, which works well enough
+# that nobody notices the local voice was never wired up.
+[voice]
+tts_enabled = true
+tts_program = "${ORACLE_ROOT}/.venv/Scripts/piper.exe"
+tts_args = [
+  "--model", "${ORACLE_ROOT}/piper/en_US-amy-medium.onnx",
+  "--output_file", "{out}",
+]
+
+stt_enabled = true
+stt_program = "${ORACLE_ROOT}/whisper/${ORACLE_PLATFORM}/whisper-cli.exe"
+stt_args = [
+  "-m", "${ORACLE_ROOT}/whisper/models/ggml-base.en.bin",
+  "-f", "{in}",
+  "-nt",
+  "-np",
+]
+
+# Always-on wake word. Off by default: it holds the microphone open for as long
+# as the assistant runs, which is a change in behaviour rather than a setting.
+#
+# Note the absence of -nt. whisper-stream WITH timestamps prints one
+# newline-terminated line per utterance, which core parses; -nt makes it redraw
+# a single line with carriage returns that never split into lines, so the wake
+# word is never heard.
+wake_enabled = false
+wake_program = "${ORACLE_ROOT}/whisper/${ORACLE_PLATFORM}/whisper-stream.exe"
+wake_args = [
+  "-m", "${ORACLE_ROOT}/whisper/models/ggml-base.en.bin",
+  "-t", "6",
+  "--step", "0",
+  "--length", "5000",
+  "-vth", "0.6",
+]
+
+
 [supervise]
 # One-click startup: `oracle-core run` launches these hidden and reaps them when
 # it exits, so you never open a terminal. Logs land in
@@ -185,9 +231,9 @@ max_per_hour = 4
 # Don't ALSO start llama-server by hand while this is true — two servers fight
 # over port 8080 and the second flaps.
 autostart_llm = true
-llm_program = "E:\\oracle-models\\llama.cpp\\build\\bin\\Release\\llama-server.exe"
+llm_program = "${ORACLE_ROOT}/llama.cpp/build/bin/Release/llama-server.exe"
 llm_args = [
-  "-m", "E:\\oracle-models\\qwen2.5-14b-instruct-q5_k_m-00001-of-00003.gguf",
+  "-m", "${ORACLE_ROOT}/oracle-models/qwen2.5-14b-instruct-q5_k_m-00001-of-00003.gguf",
   "--host", "127.0.0.1", "--port", "8080",
   "-ngl", "999",
   # --jinja uses the model's own chat template so llama-server actually injects
@@ -202,8 +248,8 @@ llm_args = [
 autostart_small_llm = false
 small_llm_program = ""
 small_llm_args = [
-  "-m", "E:\\oracle-models\\qwen3-vl-2b-instruct-q4_k_m.gguf",
-  "--mmproj", "E:\\oracle-models\\mmproj-qwen3-vl-2b-f16.gguf",
+  "-m", "${ORACLE_ROOT}/oracle-models/qwen3-vl-2b-instruct-q4_k_m.gguf",
+  "--mmproj", "${ORACLE_ROOT}/oracle-models/mmproj-qwen3-vl-2b-f16.gguf",
   "--host", "127.0.0.1", "--port", "8081",
   "-ngl", "999",
   # Qwen-VL warns at load that it wants at least 1024 image tokens. It matters
@@ -220,12 +266,20 @@ small_llm_ready_timeout_secs = 60
 
 # --- Embedding sidecar ---
 # The same llama-server binary again, serving BGE with --embedding on port 8082.
-# --pooling mean is what BGE expects; without it the vectors are subtly wrong
-# rather than absent, which is the hard kind of wrong to notice.
+#
+# --pooling mean is a DELIBERATE override, not the model default. BGE ships with
+# CLS pooling, so llama-server warns at load ("model default pooling_type is [2],
+# but [1] was specified") -- that line is expected, not a misconfiguration.
+# Mean is chosen because it separates better, which is what ranking depends on:
+# measured over related/unrelated sentence pairs, mean scores related pairs 0.68
+# and unrelated 0.34 (a +0.34 gap) where CLS scores 0.72 and 0.42 (+0.30). CLS
+# gives higher absolute similarity to everything, including things you did not
+# ask for. Dropping the flag is still a real regression -- just not the one the
+# old comment described.
 autostart_embedder = false
 embedder_program = ""
 embedder_args = [
-  "-m", "E:\\oracle-models\\bge-small-en-v1.5-q8_0.gguf",
+  "-m", "${ORACLE_ROOT}/oracle-models/bge-small-en-v1.5-q8_0.gguf",
   "--host", "127.0.0.1", "--port", "8082",
   "--embedding",
   "--pooling", "mean",

@@ -18,13 +18,19 @@
 #   4. Two TCC permissions must be granted by hand before actuation or the
 #      microphone work at all. See docs/MACOS.md §1 and §3.
 #
-# Paths below are absolute because TOML does not expand `~` or `$HOME`. If your
-# checkout is not at ~/projects/oracle-of-delphi, the paths are what you edit.
+# Paths use ${ORACLE_ROOT} (this checkout, found via the .oracle-root marker),
+# ${ORACLE_PLATFORM} (macos-arm64 or macos-x64, so one profile serves both), and
+# ~ for your home. Nothing here is specific to the machine that wrote it, so a
+# fresh clone works unedited. $ORACLE_ROOT in the environment overrides.
+#
+# Run `scripts/setup.sh` once before this profile will work: it installs piper,
+# builds whisper.cpp (no macOS binaries are published), fetches the whisper
+# model, and builds llama.cpp with Metal.
 
 [general]
 # macOS has no XDG_RUNTIME_DIR, so this is stated rather than defaulted. Logs
 # for the supervised children land here as {oracle,llm,actd}.log.
-runtime_dir = "/Users/abirdeol/Library/Application Support/oracle/run"
+runtime_dir = "~/Library/Application Support/oracle/run"
 log_level = "info"
 
 [audio]
@@ -44,7 +50,7 @@ backend = "http://127.0.0.1:8080"
 model = "qwen2.5-7b-instruct-q4_k_m"
 max_tokens = 1024
 temperature = 0.7
-model_dir = "/Users/abirdeol/projects/oracle-of-delphi/oracle-models"
+model_dir = "${ORACLE_ROOT}/oracle-models"
 
 # --- The small/vision tier ---
 # A second llama-server on a second port, holding a ~2.5 GB VLM resident so the
@@ -64,7 +70,7 @@ temperature = 0.2
 resident = true
 
 [memory]
-db_path = "/Users/abirdeol/Library/Application Support/oracle/oracle.db"
+db_path = "~/Library/Application Support/oracle/oracle.db"
 retrieve_limit = 6
 auto_recall = true
 auto_record = true
@@ -137,6 +143,8 @@ screen_observations = 3
 observation_max_age_secs = 1800
 
 [google]
+# Same reasoning as the Windows profile: outside the checkout. Empty disables
+# Google entirely; fill it in and run `oracle-core auth` once.
 credentials_path = ""
 account = "default"
 
@@ -159,17 +167,17 @@ max_per_hour = 4
 # has the two build commands. Left off until those exist, because a missing
 # program degrades to browser speech rather than erroring loudly.
 [voice]
-tts_enabled = false
-tts_program = "/Users/abirdeol/projects/oracle-of-delphi/piper/piper"
+tts_enabled = true
+tts_program = "${ORACLE_ROOT}/.venv/bin/piper"
 tts_args = [
-  "--model", "/Users/abirdeol/projects/oracle-of-delphi/piper/en_US-amy-medium.onnx",
+  "--model", "${ORACLE_ROOT}/piper/en_US-amy-medium.onnx",
   "--output_file", "{out}",
 ]
 
-stt_enabled = false
-stt_program = "/Users/abirdeol/projects/oracle-of-delphi/whisper/whisper-cli"
+stt_enabled = true
+stt_program = "${ORACLE_ROOT}/whisper/${ORACLE_PLATFORM}/whisper-cli"
 stt_args = [
-  "-m", "/Users/abirdeol/projects/oracle-of-delphi/whisper/ggml-base.en.bin",
+  "-m", "${ORACLE_ROOT}/whisper/models/ggml-base.en.bin",
   "-f", "{in}",
   "-nt",
   "-np",
@@ -179,9 +187,9 @@ stt_args = [
 # prints one newline-terminated line per utterance, which core parses; -nt makes
 # it redraw a single line with carriage returns that never split into lines.
 wake_enabled = false
-wake_program = "/Users/abirdeol/projects/oracle-of-delphi/whisper/whisper-stream"
+wake_program = "${ORACLE_ROOT}/whisper/${ORACLE_PLATFORM}/whisper-stream"
 wake_args = [
-  "-m", "/Users/abirdeol/projects/oracle-of-delphi/whisper/ggml-base.en.bin",
+  "-m", "${ORACLE_ROOT}/whisper/models/ggml-base.en.bin",
   "-t", "6",
   "--step", "0",
   "--length", "5000",
@@ -193,9 +201,9 @@ wake_args = [
 # Built with -DGGML_METAL=ON; see docs/MACOS.md §2. No .exe suffix, and the
 # binary is at build/bin/llama-server rather than build/bin/Release/.
 autostart_llm = true
-llm_program = "/Users/abirdeol/projects/oracle-of-delphi/llama.cpp/build/bin/llama-server"
+llm_program = "${ORACLE_ROOT}/llama.cpp/build/bin/llama-server"
 llm_args = [
-  "-m", "/Users/abirdeol/projects/oracle-of-delphi/oracle-models/qwen2.5-7b-instruct-q4_k_m.gguf",
+  "-m", "${ORACLE_ROOT}/oracle-models/qwen2.5-7b-instruct-q4_k_m.gguf",
   "--host", "127.0.0.1", "--port", "8080",
   # Unified memory: every layer is "on the GPU" in the sense that matters, and
   # 99 simply means "all of them".
@@ -212,8 +220,8 @@ llm_args = [
 autostart_small_llm = false
 small_llm_program = ""
 small_llm_args = [
-  "-m", "/Users/abirdeol/projects/oracle-of-delphi/oracle-models/qwen3-vl-2b-instruct-q4_k_m.gguf",
-  "--mmproj", "/Users/abirdeol/projects/oracle-of-delphi/oracle-models/mmproj-qwen3-vl-2b-f16.gguf",
+  "-m", "${ORACLE_ROOT}/oracle-models/qwen3-vl-2b-instruct-q4_k_m.gguf",
+  "--mmproj", "${ORACLE_ROOT}/oracle-models/mmproj-qwen3-vl-2b-f16.gguf",
   "--host", "127.0.0.1", "--port", "8081",
   "-ngl", "99",
   # A VLM starved of image tokens does not error; it returns small text as
@@ -225,12 +233,21 @@ small_llm_args = [
 small_llm_ready_timeout_secs = 60
 
 # --- Embedding sidecar ---
-# --pooling mean is what BGE expects. Without it the vectors are subtly wrong
-# rather than absent, so retrieval keeps working and keeps being mediocre.
+# Same binary again, serving BGE with --embedding on port 8082.
+#
+# --pooling mean is a DELIBERATE override, not the model default. BGE ships with
+# CLS pooling, so llama-server warns at load ("model default pooling_type is [2],
+# but [1] was specified") -- that line is expected, not a misconfiguration.
+# Mean is chosen because it separates better, which is what ranking depends on:
+# measured over related/unrelated sentence pairs, mean scores related pairs 0.68
+# and unrelated 0.34 (a +0.34 gap) where CLS scores 0.72 and 0.42 (+0.30). CLS
+# gives higher absolute similarity to everything, including things you did not
+# ask for. Dropping the flag is still a real regression -- just not the one the
+# old comment described.
 autostart_embedder = false
 embedder_program = ""
 embedder_args = [
-  "-m", "/Users/abirdeol/projects/oracle-of-delphi/oracle-models/bge-small-en-v1.5-q8_0.gguf",
+  "-m", "${ORACLE_ROOT}/oracle-models/bge-small-en-v1.5-q8_0.gguf",
   "--host", "127.0.0.1", "--port", "8082",
   "--embedding",
   "--pooling", "mean",

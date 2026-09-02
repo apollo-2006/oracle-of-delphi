@@ -20,6 +20,7 @@ pub mod lifecycle;
 pub mod llm;
 pub mod memory;
 pub mod observ;
+pub mod paths;
 pub mod proactive;
 pub mod screen;
 pub mod security;

@@ -6,6 +6,46 @@ credentials.json
 .cache/
 
 # =========================
+# Fetched / built by scripts/setup.{sh,ps1}
+# =========================
+# Per-platform binaries and models. These are what make a clone work on this
+# machine; they are deliberately NOT committed, because a binary per platform
+# doubles the repository and git keeps every past copy of one forever.
+#
+# The flat Windows binaries at piper/ and whisper/ are the older vendored set
+# and stay tracked until they are removed -- these patterns are anchored to the
+# <os>-<arch> directory names the setup scripts install into, so they do not
+# match those.
+piper/macos-*/
+piper/linux-*/
+piper/windows-*/
+whisper/macos-*/
+whisper/linux-*/
+whisper/windows-*/
+whisper/models/
+
+# setup.sh clones whisper.cpp here to build it; it is scratch, not source.
+.build/
+
+# A session snapshot is written next to the database, so an in-memory database
+# (`db_path = ":memory:"`, used by the container profile and the tests) leaves a
+# literal ":memory:.ses" in the working directory.
+:memory:*
+
+# =========================
+# Local build dependencies
+# =========================
+# llama.cpp is cloned and built per-platform (Metal on macOS, ROCm/Vulkan on
+# Windows), so it is a local checkout, not repository content.
+#
+# It was previously committed as a GITLINK -- mode 160000, a submodule entry --
+# with no .gitmodules to go with it. Nothing could ever populate that: a fresh
+# clone got an empty llama.cpp/ directory, and `git submodule update --init`
+# had no config to read, so it silently did nothing. That is exactly how this
+# checkout arrived with no inference backend at all.
+llama.cpp/
+
+# =========================
 # AI Models & Large Files
 # =========================
 # Catches Whisper and other raw binaries
@@ -27,6 +67,7 @@ qwen2.5*
 # Python (Virtual Env & Cache)
 # =========================
 venv/
+.venv/
 __pycache__/
 *.py[cod]
 *$py.class

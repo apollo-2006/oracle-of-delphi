@@ -63,9 +63,11 @@ fn the_windows_profile_carries_an_embedder_on_a_third_port() {
 
 #[test]
 fn the_shipped_embedder_args_ask_for_mean_pooling() {
-    // BGE without --pooling mean produces vectors that are subtly wrong rather
-    // than absent -- retrieval keeps working and keeps being mediocre, which is
-    // very hard to attribute back to a missing flag.
+    // --pooling mean is an override of BGE's CLS default, kept because it
+    // separates related from unrelated text better (+0.34 vs +0.30 measured on
+    // sentence pairs) even though CLS scores higher in absolute terms. Dropping
+    // the flag does not error: retrieval keeps working and keeps being
+    // mediocre, which is very hard to attribute back to a missing flag.
     let cfg = Config::load(&deploy("oracle.windows.toml")).expect("loads");
     let args = cfg.supervise.embedder_args.join(" ");
     assert!(args.contains("--embedding"), "got: {args}");

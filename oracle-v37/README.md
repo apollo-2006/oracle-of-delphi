@@ -19,7 +19,6 @@ against mocks or real libraries.**
 
 ## Architecture
 
-The full design document is [`oracle-architecture.md`](oracle-architecture.md).
 Five crash-isolated processes:
 
 ```
@@ -50,7 +49,17 @@ See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md).
 
 ## Quick start (offline, no GPU)
 
+Nothing below needs editing after a clone. The shipped profiles address the
+checkout as `${ORACLE_ROOT}` (found via the `.oracle-root` marker) and this
+machine as `${ORACLE_PLATFORM}`, so the same file works on any Mac or Windows
+box — and `ORACLE_ROOT` in the environment overrides it.
+
 ```bash
+# Once per machine: the platform-specific dependencies -- piper, whisper.cpp,
+# the whisper model and llama.cpp. Windows: .\scripts\setup.ps1
+# Skip it if you only want the offline demo below; it is needed for voice.
+scripts/setup.sh
+
 # Build + test everything (add --release --alsa for production build)
 scripts/build_all.sh
 # Note: the HUD must be built before the Rust workspace. oracle-core embeds
@@ -73,6 +82,10 @@ cargo run -p oracle-core -- doctor
 # Actuator daemon over a real socket + audit log
 oracle-actd --serve /tmp/actd.sock
 ```
+
+Platform profiles live in `deploy/`: `oracle.macos.toml`, `oracle.windows.toml`
+and `oracle.windows.ambient.toml`. Check one before a long build with
+`cargo run -p oracle-core -- check-config --config deploy/oracle.macos.toml`.
 
 The REPL runs the architecture's headline example end-to-end: the model emits
 four tool calls, the dispatcher runs three in parallel and gates the draft on
@@ -548,10 +561,17 @@ oracle-hud/     Three.js holographic HUD
 oracle-shell/   native window (tao + wry); outside the cargo workspace
 deploy/         systemd units, container config, Windows + macOS profiles
 docs/           DEPLOYMENT, MACOS, WINDOWS, ONE_CLICK, THREAT_MODEL, RUNBOOK
-scripts/        build_all.sh
-oracle-architecture.md   the full design document
+scripts/        build_all.sh, setup.sh, setup.ps1
 ```
 
 ## License
 
-MIT.
+MIT — see [`LICENSE`](../LICENSE).
+
+Third-party components shipped in or used by this project keep their own
+licenses; they are enumerated in
+[`THIRD-PARTY-NOTICES.md`](../THIRD-PARTY-NOTICES.md). One is copyleft: the
+`piper/espeak-ng-data/` files and `espeak-ng.dll` vendored at the repository
+root are **GPL-3.0-or-later**. That does not affect this project's own MIT
+licensing -- Piper is invoked as a separate process, not linked -- but
+redistributing those files carries espeak-ng's terms.

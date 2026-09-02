@@ -1028,12 +1028,61 @@ impl Config {
             path: path.display().to_string(),
             source,
         })?;
-        let cfg: Config = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+        let mut cfg: Config = toml::from_str(&text).map_err(|source| ConfigError::Parse {
             path: path.display().to_string(),
             source,
         })?;
+        // Turn `${ORACLE_ROOT}/...` and `~/...` into real paths BEFORE validating,
+        // so the rules that inspect paths (notably the actd socket's length limit)
+        // see what will actually be used rather than the template.
+        cfg.expand_paths(crate::paths::oracle_root(Some(path)).as_deref());
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Expand `~`, `${ORACLE_ROOT}` and environment variables in every path-like
+    /// field, in place.
+    ///
+    /// Listed explicitly rather than derived. A path field that is added later
+    /// and forgotten here simply keeps its literal text, which fails loudly at
+    /// use; a blanket "expand every String in the struct" would quietly rewrite
+    /// prompts, model names and device names that merely happen to contain a
+    /// `$` or a `~`.
+    pub fn expand_paths(&mut self, root: Option<&std::path::Path>) {
+        let ex = |s: &mut String| *s = crate::paths::expand(s, root);
+        let ex_all = |v: &mut Vec<String>| {
+            for s in v.iter_mut() {
+                *s = crate::paths::expand(s, root);
+            }
+        };
+
+        ex(&mut self.general.runtime_dir);
+        ex(&mut self.memory.db_path);
+        ex(&mut self.llm.model_dir);
+        ex(&mut self.actd.socket);
+        ex(&mut self.google.credentials_path);
+        ex(&mut self.browser.chrome_path);
+        ex(&mut self.browser.user_data_dir);
+
+        // Voice: the programs, and their args -- model paths live in the args.
+        ex(&mut self.voice.tts_program);
+        ex_all(&mut self.voice.tts_args);
+        ex(&mut self.voice.tts_server_program);
+        ex_all(&mut self.voice.tts_server_args);
+        ex(&mut self.voice.stt_program);
+        ex_all(&mut self.voice.stt_args);
+        ex(&mut self.voice.wake_program);
+        ex_all(&mut self.voice.wake_args);
+
+        // Supervised children: same reasoning -- `-m <model>` is an arg.
+        ex(&mut self.supervise.llm_program);
+        ex_all(&mut self.supervise.llm_args);
+        ex(&mut self.supervise.small_llm_program);
+        ex_all(&mut self.supervise.small_llm_args);
+        ex(&mut self.supervise.embedder_program);
+        ex_all(&mut self.supervise.embedder_args);
+        ex(&mut self.supervise.actd_program);
+        ex(&mut self.supervise.browser);
     }
 
     /// Load from `path` if it exists, else defaults.

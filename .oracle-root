@@ -1,0 +1,11 @@
+# Marks the repository root for oracle-core.
+#
+# Config files may write paths as ${ORACLE_ROOT}/... instead of hardcoding
+# /Users/you/... or C:\Users\you\... . oracle-core finds this file by walking up
+# from the config file, and from its own executable, so a profile keeps working
+# after you copy it to ~/Library/Application Support or %APPDATA%.
+#
+# A marker file rather than a heuristic: looking for .git breaks in a tarball,
+# and looking for a directory called "oracle-v37" breaks when it is renamed.
+#
+# Override with the ORACLE_ROOT environment variable. Do not delete this file.
