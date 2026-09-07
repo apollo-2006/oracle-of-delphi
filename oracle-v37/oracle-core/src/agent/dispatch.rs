@@ -104,6 +104,12 @@ impl Dispatcher {
         let mut ordered: Vec<(u32, String, ResultView)> = Vec::new();
         let mut running: JoinSet<(u32, String, ToolOutcome)> = JoinSet::new();
         let mut launched: HashSet<u32> = HashSet::new();
+        // Which call each spawned task is, so a task that PANICS can still be
+        // named. `JoinError` carries a task id and nothing of ours, and a
+        // panicked call that is never recorded is never marked complete either
+        // — so its dependents never unlock and the model silently receives a
+        // result table with holes in it where the calls it asked for used to be.
+        let mut task_calls: HashMap<tokio::task::Id, (u32, String)> = HashMap::new();
 
         // Launch helper: spawn everything currently ready & not yet launched.
         macro_rules! launch_ready {
@@ -144,7 +150,7 @@ impl Dispatcher {
                     let child = cancel.child_token();
                     let name = call.name.clone();
                     let id = call.id;
-                    running.spawn(async move {
+                    let handle = running.spawn(async move {
                         let outcome = match tool {
                             None => ToolOutcome::Err(crate::tools::ToolError {
                                 status: crate::tools::ToolErrorKind::NotFound,
@@ -171,6 +177,7 @@ impl Dispatcher {
                         };
                         (id, name, outcome)
                     });
+                    task_calls.insert(handle.id(), (call.id, call.name.clone()));
                 }
             }};
         }
@@ -181,8 +188,25 @@ impl Dispatcher {
             let (id, name, outcome) = match joined {
                 Ok(t) => t,
                 Err(e) => {
-                    warn!("tool task panicked: {e}");
-                    continue;
+                    // The workspace release profile keeps unwinding precisely so
+                    // one bad tool cannot take the assistant down. Surviving is
+                    // only half of isolating it: turn the panic into an ordinary
+                    // tool error so the call still appears in the result table
+                    // and still counts as complete, which is what lets its
+                    // dependents resolve (and fail visibly) instead of being
+                    // stranded unlaunched.
+                    let Some((id, name)) = task_calls.get(&e.id()).cloned() else {
+                        warn!("a tool task ended without a known call: {e}");
+                        continue;
+                    };
+                    warn!(tool = %name, "tool task panicked: {e}");
+                    (
+                        id,
+                        name,
+                        ToolOutcome::Err(crate::tools::ToolError::transient(
+                            "the tool panicked; nothing was done",
+                        )),
+                    )
                 }
             };
             let ok = matches!(outcome, ToolOutcome::Ok(_));
@@ -281,8 +305,68 @@ mod tests {
         }
     }
 
+    /// A tool that panics rather than returning an error, standing in for a
+    /// genuine bug (an index out of range, an `unwrap` on None) inside a tool.
+    struct Panics;
+    #[async_trait]
+    impl TypedTool for Panics {
+        type Args = FailArgs;
+        const NAME: &'static str = "panics";
+        const DESCRIPTION: &'static str = "panics";
+        async fn run(&self, _a: FailArgs, _c: &ToolCtx) -> ToolOutcome {
+            panic!("a bug inside a tool");
+        }
+    }
+
     fn shared() -> Arc<Shared> {
         Arc::new(Shared::for_test())
+    }
+
+    #[tokio::test]
+    async fn a_panicking_tool_is_reported_and_does_not_strand_its_dependents() {
+        // A panic used to vanish: the call was never recorded and never marked
+        // complete, so it disappeared from the result table AND its dependents
+        // never became ready. The model asked for three things and was told
+        // about one, with nothing saying the other two had happened at all —
+        // which is exactly the shape that makes it claim it did them.
+        let mut reg = ToolRegistry::new();
+        reg.register(Panics);
+        reg.register(Echo);
+        let d = Dispatcher::new(reg, shared());
+        let (tx, _rx) = mpsc::channel(64);
+        let calls = vec![
+            ToolCall {
+                id: 1,
+                name: "panics".into(),
+                args: serde_json::json!({}),
+            },
+            ToolCall {
+                id: 2,
+                name: "echo".into(),
+                args: serde_json::json!({"tag":"$result.1.anything"}),
+            },
+            ToolCall {
+                id: 3,
+                name: "echo".into(),
+                args: serde_json::json!({"tag":"independent"}),
+            },
+        ];
+        let res = d
+            .run(uuid::Uuid::new_v4(), calls, &tx, CancellationToken::new())
+            .await;
+        let obs = res.as_observation();
+        assert!(
+            obs.contains("\"id\":1"),
+            "the panicking call is missing: {obs}"
+        );
+        assert!(obs.contains("\"id\":2"), "its dependent is missing: {obs}");
+        assert!(obs.contains("\"id\":3"), "the free call is missing: {obs}");
+        // The panic reads as an ordinary tool failure, and the dependent fails
+        // visibly at substitution rather than silently never running.
+        let ok = res.ok_map();
+        assert!(!ok.contains_key(&1));
+        assert!(!ok.contains_key(&2));
+        assert_eq!(ok[&3]["echoed"], "independent");
     }
 
     #[tokio::test]
