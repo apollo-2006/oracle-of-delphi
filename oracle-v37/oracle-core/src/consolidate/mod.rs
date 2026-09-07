@@ -156,10 +156,14 @@ pub async fn run_pass(
 ) -> anyhow::Result<Option<PassResult>> {
     use futures::StreamExt;
 
-    let mut episodes = shared.memory.unconsolidated(cfg.batch_size)?;
-    if !cfg.from_observations {
-        episodes.retain(|e| e.kind != EpisodeKind::Observation);
-    }
+    // The exclusion happens in the query, not on its results. Observations are
+    // the high-volume source and the oldest rows, so discarding them after the
+    // fact meant every batch came back full of episodes this pass would throw
+    // away, and the conversations behind them were never read — for as long as
+    // the backlog held, which with `ambient.retain_days = 0` is forever.
+    let episodes = shared
+        .memory
+        .unconsolidated(cfg.batch_size, cfg.from_observations)?;
     if episodes.is_empty() {
         return Ok(None);
     }

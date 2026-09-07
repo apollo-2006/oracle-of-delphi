@@ -1,9 +1,14 @@
 //! Episodic + vector store over SQLite (architecture §5.2).
 
 use super::embed::Embedder;
-use super::{cosine, reciprocal_rank_fusion};
-use rusqlite::{params, Connection};
+use super::{cosine_blob, reciprocal_rank_fusion};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::Mutex;
+
+/// The text a tombstoned episode is left with. Every query that reads episodes
+/// back excludes it: "forget that" has to mean the row is gone from retrieval,
+/// from consolidation, and from the ambient recency list, not just blanked.
+const FORGOTTEN: &str = "[forgotten]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EpisodeKind {
@@ -94,56 +99,77 @@ impl MemoryStore {
     /// cosine, salience-weighted, top-`limit` returned. Dates are the caller's
     /// job to stamp into the prompt.
     pub fn retrieve(&self, query: &str, limit: usize) -> anyhow::Result<Vec<RetrievedItem>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let q_emb = self.embedder.embed(query)?;
         let active_space = self.embedder.id();
+        // Tokenize the query ONCE. This used to happen inside `keyword_overlap`,
+        // i.e. once per candidate row: a store with n episodes built and threw
+        // away n identical `Vec<String>`s per recall, and recall now runs on
+        // every turn rather than only when the model asks for it.
+        let q_toks = tokenize(query);
+        // One reusable lowercase buffer for the same reason.
+        let mut lowered = String::new();
         let conn = self.conn.lock().unwrap();
 
         // Pull candidate rows (in a real deployment this is an HNSW/FTS prefilter;
         // for the reference impl we scan, which is fine at personal scale and
         // keeps the dependency surface tiny).
+        //
+        // Tombstones are excluded here rather than filtered afterwards: SQL is
+        // where every other query in this file drops them, and a row that can
+        // never place is a row not worth decoding.
         let mut stmt = conn.prepare(
-            "SELECT id, kind, text, t_unix, salience, embedding, embed_model FROM episode",
+            "SELECT id, kind, text, t_unix, salience, embedding, embed_model FROM episode \
+             WHERE text <> ?",
         )?;
-        let rows = stmt.query_map([], |r| {
-            let blob: Vec<u8> = r.get(5)?;
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, f64>(4)? as f32,
-                bytes_to_f32(&blob),
-                r.get::<_, String>(6)?,
-            ))
-        })?;
-
-        let mut cands = Vec::new();
-        for row in rows {
-            let (id, kind, text, t_unix, salience, emb, space) = row?;
+        // Scoring happens inside the row callback so the embedding is read
+        // straight out of SQLite's own buffer. Materializing it — as bytes, let
+        // alone as a `Vec<f32>` — allocates once per episode per recall for
+        // numbers that are summed into one float and dropped.
+        let rows = stmt.query_map(params![FORGOTTEN], |r| {
+            let text: String = r.get(2)?;
             // Cosine is only meaningful inside one vector space. A row written
             // by a different embedder scores 0 here rather than a plausible-
             // looking number -- it stays reachable by keyword below, so history
             // does not vanish when the embedder changes, but it never
             // contributes noise dressed up as similarity.
-            let vscore = if space == active_space {
-                cosine(&q_emb, &emb)
+            let same_space = r.get_ref(6)?.as_str().unwrap_or_default() == active_space;
+            let vscore = if same_space {
+                cosine_blob(&q_emb, r.get_ref(5)?.as_blob().unwrap_or_default())
             } else {
                 0.0
             };
-            let kscore = keyword_overlap(query, &text);
-            cands.push((id, kind, text, t_unix, salience, vscore, kscore));
-        }
+            let kscore = keyword_overlap(&q_toks, &text, &mut lowered);
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                text,
+                r.get::<_, i64>(3)?,
+                r.get::<_, f64>(4)? as f32,
+                vscore,
+                kscore,
+            ))
+        })?;
+
+        let cands = rows.collect::<Result<Vec<_>, _>>()?;
 
         // Rank lists for RRF.
         // Foreign-space rows are excluded from the vector rank list entirely.
         // Leaving them in at 0.0 would still give them an RRF rank, letting an
         // unrelated memory place purely because the list had room.
+        //
+        // `total_cmp`, not `partial_cmp().unwrap()`: an embedder that hands back
+        // a NaN (a sidecar mid-restart has) survives l2-normalization, poisons
+        // the cosine, and would then panic the sort — inside the recall that now
+        // runs on every turn. A NaN simply sorts last instead.
         let mut by_vec: Vec<_> = cands
             .iter()
             .filter(|c| c.5 > 0.0)
             .map(|c| (c.0, c.5))
             .collect();
-        by_vec.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        by_vec.sort_by(|a, b| b.1.total_cmp(&a.1));
         let vec_ids: Vec<i64> = by_vec.iter().map(|(id, _)| *id).collect();
 
         let mut by_kw: Vec<_> = cands
@@ -151,14 +177,19 @@ impl MemoryStore {
             .filter(|c| c.6 > 0.0)
             .map(|c| (c.0, c.6))
             .collect();
-        by_kw.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        by_kw.sort_by(|a, b| b.1.total_cmp(&a.1));
         let kw_ids: Vec<i64> = by_kw.iter().map(|(id, _)| *id).collect();
 
         let fused = reciprocal_rank_fusion(&[vec_ids, kw_ids], 60.0);
 
+        // id -> row, so pulling the top-`limit` back out of `cands` is a lookup
+        // rather than a linear scan per hit.
+        let by_id: std::collections::HashMap<i64, usize> =
+            cands.iter().enumerate().map(|(i, c)| (c.0, i)).collect();
+
         let mut out = Vec::new();
         for id in fused.into_iter().take(limit) {
-            if let Some(c) = cands.iter().find(|c| c.0 == id) {
+            if let Some(c) = by_id.get(&id).map(|i| &cands[*i]) {
                 let kind = match c.1.as_str() {
                     "action" => EpisodeKind::Action,
                     "observation" => EpisodeKind::Observation,
@@ -178,8 +209,27 @@ impl MemoryStore {
                 });
             }
         }
-        out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        out.sort_by(|a, b| b.score.total_cmp(&a.score));
         Ok(out)
+    }
+
+    /// The id of the episode whose text is exactly `text`, if there is one.
+    ///
+    /// The dedup check the agent runs on every turn is an *exact string* test,
+    /// and it used to be answered by `retrieve(text, 1)` — an embedding call
+    /// (a round trip to the sidecar) plus a scan of every row's vector, twice a
+    /// turn, to compare two strings. This asks SQLite the question that was
+    /// actually being asked, and answers it better: an exact duplicate is found
+    /// even when something else happens to out-rank it.
+    pub fn find_exact(&self, text: &str) -> anyhow::Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT id FROM episode WHERE text = ? AND text <> ? LIMIT 1",
+                params![text, FORGOTTEN],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// Reinforce an episode's salience when it gets retrieved-and-used (§5.2
@@ -199,9 +249,9 @@ impl MemoryStore {
         let zero = f32_to_bytes(&vec![0.0; self.embedder.dim()]);
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE episode SET text='[forgotten]', salience=0.0, embedding=?, embed_model=? \
+            "UPDATE episode SET text=?, salience=0.0, embedding=?, embed_model=? \
              WHERE id=?",
-            params![zero, self.embedder.id(), id],
+            params![FORGOTTEN, zero, self.embedder.id(), id],
         )?;
         Ok(())
     }
@@ -212,26 +262,43 @@ impl MemoryStore {
     /// Oldest first because observations expire on a timer: the ones closest to
     /// deletion are the ones whose durable facts are about to be lost, so they
     /// are the ones worth reading now.
-    pub fn unconsolidated(&self, limit: usize) -> anyhow::Result<Vec<Episode>> {
+    ///
+    /// `include_observations` is a *filter on the query*, not on its results,
+    /// and that distinction is the whole point. With screen observations
+    /// excluded by config they are still the bulk of the pending rows and still
+    /// the oldest, so filtering afterwards left every batch full of rows the
+    /// pass would discard — and the conversations queued behind them were never
+    /// reached at all, for as long as the backlog held. Skipping them in SQL
+    /// leaves them pending (so turning the setting back on still finds them)
+    /// while giving the batch window to episodes the pass can actually use.
+    pub fn unconsolidated(
+        &self,
+        limit: usize,
+        include_observations: bool,
+    ) -> anyhow::Result<Vec<Episode>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, kind, text, t_unix, salience FROM episode \
-             WHERE consolidated_at IS NULL AND text <> '[forgotten]' \
+             WHERE consolidated_at IS NULL AND text <> ? \
+               AND (? OR kind <> 'observation') \
              ORDER BY t_unix ASC LIMIT ?",
         )?;
-        let rows = stmt.query_map(params![limit as i64], |r| {
-            Ok(Episode {
-                id: r.get(0)?,
-                kind: match r.get::<_, String>(1)?.as_str() {
-                    "action" => EpisodeKind::Action,
-                    "observation" => EpisodeKind::Observation,
-                    _ => EpisodeKind::Conversation,
-                },
-                text: r.get(2)?,
-                t_unix: r.get(3)?,
-                salience: r.get::<_, f64>(4)? as f32,
-            })
-        })?;
+        let rows = stmt.query_map(
+            params![FORGOTTEN, include_observations, limit as i64],
+            |r| {
+                Ok(Episode {
+                    id: r.get(0)?,
+                    kind: match r.get::<_, String>(1)?.as_str() {
+                        "action" => EpisodeKind::Action,
+                        "observation" => EpisodeKind::Observation,
+                        _ => EpisodeKind::Conversation,
+                    },
+                    text: r.get(2)?,
+                    t_unix: r.get(3)?,
+                    salience: r.get::<_, f64>(4)? as f32,
+                })
+            },
+        )?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -279,10 +346,10 @@ impl MemoryStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, kind, text, t_unix, salience FROM episode \
-             WHERE kind = 'observation' AND t_unix >= ? AND text <> '[forgotten]' \
+             WHERE kind = 'observation' AND t_unix >= ? AND text <> ? \
              ORDER BY t_unix DESC LIMIT ?",
         )?;
-        let rows = stmt.query_map(params![since, limit as i64], |r| {
+        let rows = stmt.query_map(params![since, FORGOTTEN, limit as i64], |r| {
             Ok(Episode {
                 id: r.get(0)?,
                 kind: EpisodeKind::Observation,
@@ -436,29 +503,49 @@ fn f32_to_bytes(v: &[f32]) -> Vec<u8> {
     out
 }
 
-fn bytes_to_f32(b: &[u8]) -> Vec<f32> {
-    // `as_chunks::<4>()` over `chunks_exact(4)`: the chunk size is a constant,
-    // so this yields `&[u8; 4]` and `from_le_bytes` takes it directly, with no
-    // per-element indexing and no bounds checks. Clippy's
-    // `chunks_exact_to_as_chunks` (new in 1.98) flags the old form, and CI runs
-    // with `-D warnings`.
-    let (chunks, _remainder) = b.as_chunks::<4>();
-    chunks.iter().copied().map(f32::from_le_bytes).collect()
-}
-
-/// Cheap keyword overlap: fraction of query tokens present in the text.
-fn keyword_overlap(query: &str, text: &str) -> f32 {
-    let toks: Vec<String> = query
+/// Split a query into the lowercased tokens keyword scoring matches on.
+///
+/// Hoisted out of [`keyword_overlap`], which is called once per candidate row:
+/// the tokens depend only on the query, so doing this inside meant rebuilding
+/// the same vector for every episode in the store on every recall.
+fn tokenize(query: &str) -> Vec<String> {
+    query
         .split(|c: char| !c.is_alphanumeric())
         .filter(|s| s.len() > 2)
         .map(|s| s.to_lowercase())
-        .collect();
-    if toks.is_empty() {
+        .collect()
+}
+
+/// Cheap keyword overlap: fraction of query tokens present in the text.
+///
+/// `scratch` is a caller-owned lowercase buffer, reused across rows. `text` has
+/// to be case-folded to match and `str::to_lowercase` allocates a fresh String
+/// every time it is asked, which at one call per episode per recall is the
+/// single largest source of garbage in retrieval.
+///
+/// The ASCII path — effectively every row — folds in place into the reused
+/// buffer. Anything else falls back to `str::to_lowercase` rather than
+/// `char::to_lowercase`, which is not the same function: the two disagree on
+/// Greek word-final sigma (Σ → ς vs σ), and a silent locale-shaped difference
+/// is not a trade worth one allocation on the rows that are not ASCII anyway.
+fn keyword_overlap(q_toks: &[String], text: &str, scratch: &mut String) -> f32 {
+    if q_toks.is_empty() {
         return 0.0;
     }
-    let lower = text.to_lowercase();
-    let hits = toks.iter().filter(|t| lower.contains(*t)).count();
-    hits as f32 / toks.len() as f32
+    scratch.clear();
+    if text.is_ascii() {
+        scratch.push_str(text);
+        // Safe on ASCII: lowercasing an ASCII byte yields an ASCII byte, so the
+        // UTF-8 encoding is unchanged in length and validity.
+        scratch.make_ascii_lowercase();
+    } else {
+        scratch.push_str(&text.to_lowercase());
+    }
+    let hits = q_toks
+        .iter()
+        .filter(|t| scratch.contains(t.as_str()))
+        .count();
+    hits as f32 / q_toks.len() as f32
 }
 
 #[cfg(test)]
@@ -603,7 +690,7 @@ mod tests {
         s.insert(EpisodeKind::Observation, "a screenshot", 0.2)
             .unwrap();
         assert_eq!(s.unconsolidated_count().unwrap(), 1);
-        assert_eq!(s.unconsolidated(10).unwrap().len(), 1);
+        assert_eq!(s.unconsolidated(10, true).unwrap().len(), 1);
     }
 
     #[test]
@@ -614,7 +701,7 @@ mod tests {
             .unwrap();
         s.mark_consolidated(&[id], 1_000).unwrap();
         assert_eq!(s.unconsolidated_count().unwrap(), 0);
-        assert!(s.unconsolidated(10).unwrap().is_empty());
+        assert!(s.unconsolidated(10, true).unwrap().is_empty());
     }
 
     #[test]
@@ -631,9 +718,36 @@ mod tests {
             conn.execute("UPDATE episode SET t_unix = 200 WHERE id = ?", params![b])
                 .unwrap();
         }
-        let pending = s.unconsolidated(10).unwrap();
+        let pending = s.unconsolidated(10, true).unwrap();
         assert_eq!(pending[0].id, a);
         assert_eq!(pending[1].id, b);
+    }
+
+    #[test]
+    fn excluding_observations_gives_the_batch_to_the_rows_behind_them() {
+        // Filtering after the query meant a backlog of observations filled every
+        // batch with rows the pass would discard, and the conversation behind
+        // them was never reached. Excluding them in SQL leaves them pending --
+        // turning the setting back on must still find them -- while the batch
+        // goes to episodes that can actually be used.
+        let s = store();
+        for i in 0..5 {
+            s.insert(EpisodeKind::Observation, &format!("on screen {i}"), 0.2)
+                .unwrap();
+        }
+        let convo = s
+            .insert(EpisodeKind::Conversation, "my advisor is Dr Chen", 0.8)
+            .unwrap();
+
+        let batch = s.unconsolidated(5, false).unwrap();
+        assert_eq!(
+            batch.len(),
+            1,
+            "the batch should hold only the conversation"
+        );
+        assert_eq!(batch[0].id, convo);
+        // The observations are skipped, not consumed.
+        assert_eq!(s.unconsolidated(10, true).unwrap().len(), 6);
     }
 
     #[test]
@@ -645,7 +759,7 @@ mod tests {
             .insert(EpisodeKind::Conversation, "something private", 0.9)
             .unwrap();
         s.tombstone(id).unwrap();
-        assert!(s.unconsolidated(10).unwrap().is_empty());
+        assert!(s.unconsolidated(10, true).unwrap().is_empty());
     }
 
     #[test]
@@ -800,6 +914,75 @@ mod tests {
         s.tombstone(id).unwrap();
         let hits = s.retrieve("passphrase", 5).unwrap();
         assert!(hits.iter().all(|h| !h.episode.text.contains("hunter2")));
+        // Not merely blanked: absent. The row's text still keyword-matches a
+        // query that mentions forgetting, and a `[forgotten]` placeholder that
+        // places takes one of the caller's `limit` slots away from a real
+        // memory -- and `memory.recall` hands it to the model as a result.
+        assert!(
+            hits.iter().all(|h| h.episode.id != id),
+            "a forgotten episode must not place at all: {hits:?}"
+        );
+        assert!(s
+            .retrieve("what have I forgotten about lately", 5)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn keyword_matching_is_case_insensitive_on_both_paths() {
+        // The reused scratch buffer has an ASCII fast path and a Unicode
+        // fallback; both must fold the same way `str::to_lowercase` does, and
+        // the buffer must not leak the previous row into the next.
+        let toks = tokenize("Bedroom LIGHTS straße");
+        let mut scratch = String::new();
+        assert_eq!(
+            keyword_overlap(&toks, "the bedroom lights are on", &mut scratch),
+            2.0 / 3.0
+        );
+        assert_eq!(
+            keyword_overlap(&toks, "die STRASSE", &mut scratch),
+            0.0,
+            "uppercase ß folds to SS, not back to ß -- neither form should match"
+        );
+        assert_eq!(
+            keyword_overlap(&toks, "Auf der Straße", &mut scratch),
+            1.0 / 3.0
+        );
+        // A row with no hits must not inherit the last row's buffer.
+        assert_eq!(keyword_overlap(&toks, "nothing here", &mut scratch), 0.0);
+    }
+
+    #[test]
+    fn an_exact_repeat_is_found_even_when_something_else_outranks_it() {
+        // The dedup check the agent runs every turn. Via `retrieve(text, 1)` it
+        // only saw the top hit, so a duplicate that ranked second was missed and
+        // a near-copy was appended instead.
+        let s = store();
+        let dup = s
+            .insert(EpisodeKind::Conversation, "I lift on Tuesdays", 0.5)
+            .unwrap();
+        for i in 0..5 {
+            s.insert(
+                EpisodeKind::Conversation,
+                &format!("I lift on Tuesdays and Thursdays, week {i}"),
+                0.9,
+            )
+            .unwrap();
+        }
+        assert_eq!(s.find_exact("I lift on Tuesdays").unwrap(), Some(dup));
+        assert_eq!(s.find_exact("I lift on Wednesdays").unwrap(), None);
+    }
+
+    #[test]
+    fn a_forgotten_episode_is_not_an_exact_match_for_its_own_marker() {
+        // `find_exact` is fed arbitrary user text; the tombstone marker is text
+        // a user could say. Reinforcing a tombstone would resurrect its salience.
+        let s = store();
+        let id = s
+            .insert(EpisodeKind::Conversation, "something private", 0.9)
+            .unwrap();
+        s.tombstone(id).unwrap();
+        assert_eq!(s.find_exact(FORGOTTEN).unwrap(), None);
     }
 
     #[test]

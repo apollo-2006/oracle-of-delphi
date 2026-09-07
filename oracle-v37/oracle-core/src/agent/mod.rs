@@ -455,17 +455,20 @@ impl Agent {
         // Repetition should deepen an existing memory rather than accumulate
         // near-duplicates that later crowd the recall block. An exact repeat is
         // reinforced; anything else is a new episode.
-        match self.shared.memory.retrieve(text, 1) {
-            Ok(hits) => {
-                if let Some(hit) = hits.first() {
-                    if hit.episode.text.trim() == text {
-                        if let Err(e) = self.shared.memory.reinforce(hit.episode.id, 0.1) {
-                            warn!("memory reinforce failed: {e}");
-                        }
-                        return;
-                    }
+        //
+        // Asked of SQLite directly rather than via `retrieve(text, 1)`. This is
+        // an exact string test, and routing it through retrieval embedded the
+        // text — a round trip to the sidecar — and scored every row in the store
+        // against it, twice per turn, to end in `==`. It was also weaker: a
+        // duplicate that did not happen to rank first was missed.
+        match self.shared.memory.find_exact(text) {
+            Ok(Some(id)) => {
+                if let Err(e) = self.shared.memory.reinforce(id, 0.1) {
+                    warn!("memory reinforce failed: {e}");
                 }
+                return;
             }
+            Ok(None) => {}
             Err(e) => warn!("memory dedup lookup failed: {e}"),
         }
         if let Err(e) =

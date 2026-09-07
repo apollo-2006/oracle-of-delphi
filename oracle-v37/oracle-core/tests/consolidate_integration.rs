@@ -264,8 +264,44 @@ async fn observations_can_be_excluded_from_the_source() {
             .is_none(),
         "with observations excluded there was nothing left to read"
     );
-    // And the observation stays pending rather than being marked read.
+    // And the observation stays pending rather than being marked read, so
+    // turning the setting back on later still finds it.
     assert_eq!(shared.memory.unconsolidated_count().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn excluded_observations_do_not_starve_what_is_queued_behind_them() {
+    // The pending queue is oldest-first and, with the ambient index on,
+    // overwhelmingly observations. Discarding them *after* the query meant
+    // every batch came back full of rows the pass would throw away and the
+    // conversation behind them was never read -- for as long as the backlog
+    // held, which with `ambient.retain_days = 0` is forever. The user turned
+    // off screen-derived facts and silently lost spoken ones too.
+    let shared = Arc::new(Shared::for_test());
+    let mut c = cfg();
+    c.from_observations = false;
+    for i in 0..c.batch_size {
+        shared
+            .memory
+            .insert(
+                EpisodeKind::Observation,
+                &format!("On screen: window {i}"),
+                0.2,
+            )
+            .unwrap();
+    }
+    shared
+        .memory
+        .insert(EpisodeKind::Conversation, "my advisor is Dr Chen", 0.8)
+        .unwrap();
+
+    let llm: Arc<dyn Llm> = Canned::new(r#"[{"subj":"user","rel":"advisor","obj":"Dr Chen"}]"#);
+    let r = run_pass(&c, &llm, &shared, CancellationToken::new())
+        .await
+        .unwrap()
+        .expect("the conversation behind the backlog must be reached");
+    assert_eq!(r.episodes_read, 1);
+    assert_eq!(r.facts_asserted, 1);
 }
 
 #[tokio::test]
