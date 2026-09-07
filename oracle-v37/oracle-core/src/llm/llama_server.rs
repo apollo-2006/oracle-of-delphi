@@ -9,7 +9,10 @@
 //! HTTP request; llama-server treats that as a client disconnect and stops).
 //!
 //! Network access is not available in unit tests, so this module is validated by
-//! its pure helpers rather than a live round-trip.
+//! its pure helpers and by driving [`sse_deltas`] over a hand-made byte stream
+//! rather than by a live round-trip. The hand-made stream is the more useful of
+//! the two: what breaks an SSE reader is *where the chunk boundaries fall*, and
+//! a real round-trip is precisely what cannot pin that down.
 
 use super::*;
 use futures::stream::{self, StreamExt};
@@ -111,6 +114,96 @@ pub(crate) fn parse_sse_chunk(json: &str) -> (Option<String>, Option<StopReason>
     (text, stop)
 }
 
+/// What one complete SSE line means to the stream: nothing (a keepalive or a
+/// non-`data:` field), a text delta, or the end.
+fn parse_sse_line(line: &str) -> Option<LlmDelta> {
+    let data = line.strip_prefix("data:")?.trim();
+    if data == "[DONE]" {
+        return Some(LlmDelta::Done {
+            stop_reason: StopReason::Stop,
+        });
+    }
+    let (text, stop) = parse_sse_chunk(data);
+    if let Some(t) = text {
+        return Some(LlmDelta::Text(t));
+    }
+    stop.map(|stop_reason| LlmDelta::Done { stop_reason })
+}
+
+/// Line-buffer a raw SSE byte stream into [`LlmDelta`]s.
+///
+/// Generic over the byte stream so it can be driven from a hand-made one in
+/// tests: the interesting behaviour here is entirely about where the chunk
+/// boundaries fall, which is exactly what a live round-trip cannot pin down.
+pub(crate) fn sse_deltas<B, E, S>(
+    bytes: S,
+    cancel: CancellationToken,
+) -> BoxStream<'static, LlmDelta>
+where
+    B: AsRef<[u8]>,
+    S: futures::Stream<Item = Result<B, E>> + Send + Unpin + 'static,
+{
+    // Line-buffer the SSE stream into text deltas. `done` guards a single
+    // terminal `Done`.
+    //
+    // The buffer holds BYTES, not a String. Chunk boundaries fall wherever
+    // TCP puts them, which is routinely mid-character: decoding each chunk
+    // as it arrives turns the two halves of a split `é` into two U+FFFDs,
+    // which corrupts the JSON around it, which makes `parse_sse_chunk`
+    // fail — so the token is not merely garbled, it is dropped. Accumulate
+    // raw and decode only at a `\n`, which can never fall inside a
+    // multi-byte sequence.
+    let state = (bytes, Vec::<u8>::new(), cancel, false);
+    let s = stream::unfold(
+        state,
+        move |(mut bytes, mut buf, cancel, mut done)| async move {
+            loop {
+                if done {
+                    return None;
+                }
+                if cancel.is_cancelled() {
+                    done = true;
+                    return Some((
+                        LlmDelta::Done {
+                            stop_reason: StopReason::Cancelled,
+                        },
+                        (bytes, buf, cancel, done),
+                    ));
+                }
+                // Consume one complete SSE line if present.
+                if let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+                    // Scoped so the borrow ends before the drain below.
+                    let emitted = {
+                        let line = std::str::from_utf8(&buf[..pos]).unwrap_or_default();
+                        parse_sse_line(line.trim())
+                    };
+                    buf.drain(..=pos);
+                    if let Some(delta) = emitted {
+                        done = matches!(delta, LlmDelta::Done { .. });
+                        return Some((delta, (bytes, buf, cancel, done)));
+                    }
+                    continue;
+                }
+                // Need more bytes.
+                match bytes.next().await {
+                    Some(Ok(chunk)) => buf.extend_from_slice(chunk.as_ref()),
+                    Some(Err(_)) | None => {
+                        done = true;
+                        return Some((
+                            LlmDelta::Done {
+                                stop_reason: StopReason::Stop,
+                            },
+                            (bytes, buf, cancel, done),
+                        ));
+                    }
+                }
+            }
+        },
+    )
+    .boxed();
+    s
+}
+
 #[async_trait]
 impl Llm for LlamaServer {
     async fn generate(
@@ -128,75 +221,7 @@ impl Llm for LlamaServer {
             .await?
             .error_for_status()?;
 
-        let byte_stream = Box::pin(resp.bytes_stream());
-        // Line-buffer the SSE stream into text deltas. `done` guards a single
-        // terminal `Done`.
-        let state = (byte_stream, String::new(), cancel, false);
-        let s = stream::unfold(
-            state,
-            move |(mut bytes, mut buf, cancel, mut done)| async move {
-                loop {
-                    if done {
-                        return None;
-                    }
-                    if cancel.is_cancelled() {
-                        done = true;
-                        return Some((
-                            LlmDelta::Done {
-                                stop_reason: StopReason::Cancelled,
-                            },
-                            (bytes, buf, cancel, done),
-                        ));
-                    }
-                    // Consume one complete SSE line if present.
-                    if let Some(pos) = buf.find('\n') {
-                        let line = buf[..pos].trim().to_string();
-                        buf.drain(..=pos);
-                        if let Some(data) = line.strip_prefix("data:") {
-                            let data = data.trim();
-                            if data == "[DONE]" {
-                                done = true;
-                                return Some((
-                                    LlmDelta::Done {
-                                        stop_reason: StopReason::Stop,
-                                    },
-                                    (bytes, buf, cancel, done),
-                                ));
-                            }
-                            let (text, stop) = parse_sse_chunk(data);
-                            if let Some(t) = text {
-                                return Some((LlmDelta::Text(t), (bytes, buf, cancel, done)));
-                            }
-                            if let Some(reason) = stop {
-                                done = true;
-                                return Some((
-                                    LlmDelta::Done {
-                                        stop_reason: reason,
-                                    },
-                                    (bytes, buf, cancel, done),
-                                ));
-                            }
-                        }
-                        continue;
-                    }
-                    // Need more bytes.
-                    match bytes.next().await {
-                        Some(Ok(chunk)) => buf.push_str(&String::from_utf8_lossy(&chunk)),
-                        Some(Err(_)) | None => {
-                            done = true;
-                            return Some((
-                                LlmDelta::Done {
-                                    stop_reason: StopReason::Stop,
-                                },
-                                (bytes, buf, cancel, done),
-                            ));
-                        }
-                    }
-                }
-            },
-        )
-        .boxed();
-        Ok(s)
+        Ok(sse_deltas(Box::pin(resp.bytes_stream()), cancel))
     }
 }
 
@@ -260,6 +285,89 @@ mod tests {
             parts.len(),
             1,
             "an empty text part would confuse the template"
+        );
+    }
+
+    /// Drive `sse_deltas` over a hand-made chunking of one SSE body and collect
+    /// the text it yields.
+    fn deltas_from_chunks(chunks: Vec<Vec<u8>>) -> Vec<LlmDelta> {
+        let s = stream::iter(
+            chunks
+                .into_iter()
+                .map(Ok::<Vec<u8>, std::convert::Infallible>),
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            sse_deltas(Box::pin(s), CancellationToken::new())
+                .collect::<Vec<_>>()
+                .await
+        })
+    }
+
+    #[test]
+    fn a_multibyte_character_split_across_chunks_survives() {
+        // The bug this pins: decoding each network chunk with
+        // `from_utf8_lossy` turns the two halves of a split `é` into two
+        // U+FFFDs. That corrupts the surrounding JSON too, so `parse_sse_chunk`
+        // fails and the delta is dropped outright — the word is not garbled,
+        // it never arrives. TCP splits wherever it likes, so this is not exotic.
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"café\"}}]}\n\
+                    data: [DONE]\n";
+        let bytes = body.as_bytes();
+        // Cut between the two bytes of 'é'.
+        let cut = bytes.iter().position(|b| *b == 0xC3).unwrap() + 1;
+        let deltas = deltas_from_chunks(vec![bytes[..cut].to_vec(), bytes[cut..].to_vec()]);
+        assert_eq!(
+            deltas,
+            vec![
+                LlmDelta::Text("café".into()),
+                LlmDelta::Done {
+                    stop_reason: StopReason::Stop
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn a_line_split_across_chunks_is_reassembled() {
+        // The other half of the same contract: one SSE event delivered in
+        // several pieces is one delta, and several events in one piece are
+        // several deltas.
+        let deltas = deltas_from_chunks(vec![
+            b"data: {\"choi".to_vec(),
+            b"ces\":[{\"delta\":{\"content\":\"one\"}}]}\ndata: {\"choices\":[{\"delta\":{\"content\":\"two\"}}]}\n"
+                .to_vec(),
+            b"data: [DONE]\n".to_vec(),
+        ]);
+        assert_eq!(
+            deltas,
+            vec![
+                LlmDelta::Text("one".into()),
+                LlmDelta::Text("two".into()),
+                LlmDelta::Done {
+                    stop_reason: StopReason::Stop
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn a_body_that_just_ends_still_terminates_the_stream() {
+        // llama-server closing the connection without `[DONE]` must not leave
+        // the agent loop waiting on a stream that will never yield.
+        let deltas = deltas_from_chunks(vec![
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n".to_vec(),
+        ]);
+        assert_eq!(
+            deltas,
+            vec![
+                LlmDelta::Text("hi".into()),
+                LlmDelta::Done {
+                    stop_reason: StopReason::Stop
+                }
+            ]
         );
     }
 
