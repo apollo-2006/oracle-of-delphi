@@ -2126,17 +2126,29 @@ async fn ensure_tts_server(voice: oracle_core::config::VoiceConfig, log_path: st
     );
 }
 
+/// The process-wide HTTP client for the speech path.
+///
+/// A `reqwest::Client` owns its connection pool, so building one per call — as
+/// the TTS synth and its liveness probe each did — throws that pool away every
+/// time and pays a fresh TCP handshake for every utterance, on precisely the
+/// path this assistant's latency budget is spent. It also rebuilds the rustls
+/// config each time (~120µs measured here) for nothing. Clones are cheap and
+/// share the pool; hold one and reuse it.
+fn speech_http() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
 /// Liveness probe for the TTS endpoint: any HTTP reply (even 4xx/405) means the
 /// server is listening; only a connection-level error means it's down.
 async fn tts_endpoint_alive(url: &str) -> bool {
     if url.trim().is_empty() {
         return false;
     }
-    let client = reqwest::Client::new();
     // GET the speech endpoint's origin. A POST-only route answers a GET with 405,
     // which is still proof the port is open — exactly what we want to detect.
     let probe = tts_origin(url);
-    client
+    speech_http()
         .get(&probe)
         .timeout(std::time::Duration::from_secs(2))
         .send()
@@ -2166,8 +2178,7 @@ async fn synth_http(voice: &oracle_core::config::VoiceConfig, text: &str) -> Opt
         "voice": voice.tts_voice,
         "response_format": "wav",
     });
-    let client = reqwest::Client::new();
-    let resp = match client
+    let resp = match speech_http()
         .post(&voice.tts_http_url)
         .json(&body)
         .timeout(std::time::Duration::from_secs(30))
