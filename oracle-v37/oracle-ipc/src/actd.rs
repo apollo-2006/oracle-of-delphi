@@ -138,9 +138,15 @@ pub enum ActRequest {
 }
 
 impl ActRequest {
-    /// The capability this request *demands*. The daemon checks its granted
-    /// set against this; a caller cannot under-declare to sneak past policy
-    /// because the daemon recomputes it from the op, ignoring any client hint.
+    /// The capability this request *demands*, from the shape of the op alone.
+    ///
+    /// For every op but one this is the whole answer, and it cannot be
+    /// under-declared because nothing here is read from the caller. The
+    /// exception is [`ActRequest::ShellExec`], whose tier arrives *inside the
+    /// request* — so this returns what the caller claimed, and the daemon's
+    /// policy layer overrides it with what the command actually is. See
+    /// `oracle_actd::policy`: an untrusted planner must not be able to label
+    /// `rm -rf ~` read-only and have that believed.
     pub fn required_capability(&self) -> Capability {
         match self {
             ActRequest::ListWindows
@@ -153,11 +159,7 @@ impl ActRequest {
             | ActRequest::MediaKey { .. }
             | ActRequest::WindowOp { .. }
             | ActRequest::LockScreen => Capability::BenignAct,
-            ActRequest::ShellExec { tier, .. } => match tier {
-                ShellTier::ReadOnly => Capability::Observe,
-                ShellTier::WorkspaceWrite => Capability::BenignAct,
-                ShellTier::FullUser => Capability::Sensitive,
-            },
+            ActRequest::ShellExec { tier, .. } => tier.capability(),
             ActRequest::KillProcess { .. }
             | ActRequest::TypeText { .. }
             | ActRequest::InvokeElement { .. } => Capability::Sensitive,
@@ -180,12 +182,28 @@ impl ActRequest {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Privilege tiers for shell execution, ordered least → most privileged.
+///
+/// The `Ord` derive follows declaration order, which is the escalation order,
+/// so `a.max(b)` is "the stricter of the two" — how the daemon reconciles a
+/// caller's declared tier with what its own classifier reads out of the command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShellTier {
     ReadOnly,
     WorkspaceWrite,
     FullUser,
+}
+
+impl ShellTier {
+    /// The capability running at this tier demands.
+    pub fn capability(self) -> Capability {
+        match self {
+            ShellTier::ReadOnly => Capability::Observe,
+            ShellTier::WorkspaceWrite => Capability::BenignAct,
+            ShellTier::FullUser => Capability::Sensitive,
+        }
+    }
 }
 
 /// Envelope: every RPC carries a turn id (audit correlation) and a monotonic

@@ -34,6 +34,13 @@ policy self-modification) is not in the model's tool list at all. Tested in
 `oracle-actd/src/policy.rs` and over a real socket in
 `tests/socket_integration.rs`.
 
+`shell_exec` is the one op whose privilege tier does not follow from its shape —
+the tier travels *inside* the request, written by the planner. So the daemon
+does not read it: `policy::effective_shell_tier` runs `sandbox::classify` over
+the command text and takes the **stricter** of the two. A request labelled
+`read_only` carrying `rm -rf ~` is confirmed as full-user, not waved through on
+the `observe` capability that is granted by default.
+
 ### Process + privilege isolation (A3)
 
 Actuation lives in a separate daemon behind an authenticated socket. Even a full

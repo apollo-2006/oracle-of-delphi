@@ -5,8 +5,23 @@
 //! by under-declaring a capability, because the required capability is
 //! *recomputed from the op here*, never taken from the caller.
 
-use oracle_ipc::actd::{ActRequest, Capability};
+use oracle_ipc::actd::{ActRequest, Capability, ShellTier};
 use std::collections::HashSet;
+
+/// The tier a shell command actually warrants: the stricter of what the caller
+/// declared and what [`crate::sandbox::classify`] reads out of the command text.
+///
+/// Every other op's capability follows from its shape, so a caller cannot
+/// under-declare it. `ShellExec` is the exception — its tier travels *inside
+/// the request*, written by the planner, which this daemon treats as untrusted
+/// by design. Taken at face value, `ShellExec { cmd: "rm -rf ~", tier:
+/// ReadOnly }` demanded only `Observe`, which is granted by default: allowed
+/// outright, no confirmation. The classifier that catches exactly this ran
+/// afterwards, at execution, where its verdict was reported rather than
+/// enforced. Recomputing here is what makes the daemon's promise true.
+fn effective_shell_tier(cmd: &str, declared: ShellTier) -> ShellTier {
+    declared.max(crate::sandbox::classify(cmd).tier)
+}
 
 /// A standing grant: the set of capabilities the user has authorized for the
 /// session, plus a lockdown flag that hard-disables actuation.
@@ -74,7 +89,18 @@ impl PolicyState {
             return Decision::Deny("system is in lockdown; say 'unlock' to re-arm".into());
         }
 
-        let required = req.required_capability();
+        // Classified once, and used for both checks below: a shell command
+        // under-declared as read-only must not slip past the capability gate
+        // *or* the irreversibility gate.
+        let shell_tier = match req {
+            ActRequest::ShellExec { cmd, tier, .. } => Some(effective_shell_tier(cmd, *tier)),
+            _ => None,
+        };
+
+        let required = match shell_tier {
+            Some(t) => t.capability(),
+            None => req.required_capability(),
+        };
         if !self.granted.contains(&required) {
             // Sensitive ops that aren't standing-granted still get a path via
             // confirmation rather than a flat deny.
@@ -85,7 +111,11 @@ impl PolicyState {
         }
 
         // Even a granted sensitive op confirms when irreversible.
-        if req.is_irreversible() {
+        let irreversible = match shell_tier {
+            Some(t) => t == ShellTier::FullUser,
+            None => req.is_irreversible(),
+        };
+        if irreversible {
             return Decision::NeedsConfirmation;
         }
         Decision::Allow
@@ -183,6 +213,62 @@ mod tests {
                 cmd: "rm -rf build".into(),
                 tier: ShellTier::FullUser,
                 timeout_ms: 1000
+            }),
+            Decision::NeedsConfirmation
+        );
+    }
+
+    #[test]
+    fn an_under_declared_shell_command_is_classified_not_believed() {
+        // The planner is untrusted, and the tier travels inside its request.
+        // Labelling a destructive command read-only used to map it to
+        // `Capability::Observe` -- granted by default -- and clear it outright.
+        let p = PolicyState::default();
+        for cmd in [
+            "rm -rf ~",
+            "sudo systemctl stop firewalld",
+            "mkfs.ext4 /dev/sda1",
+        ] {
+            assert_eq!(
+                p.evaluate(&ActRequest::ShellExec {
+                    cmd: cmd.into(),
+                    tier: ShellTier::ReadOnly,
+                    timeout_ms: 1000,
+                }),
+                Decision::NeedsConfirmation,
+                "`{cmd}` declared read-only"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_command_declared_readonly_still_needs_benign_act() {
+        // Not every escalation is dramatic: the classifier's default for an
+        // unrecognized command is workspace-write, and that has to hold too.
+        let mut p = PolicyState::default();
+        p.revoke(Capability::BenignAct);
+        assert!(matches!(
+            p.evaluate(&ActRequest::ShellExec {
+                cmd: "make install".into(),
+                tier: ShellTier::ReadOnly,
+                timeout_ms: 1000,
+            }),
+            Decision::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn an_over_declared_command_keeps_the_stricter_tier() {
+        // The reconciliation is `max`, not "trust the classifier": a caller
+        // that voluntarily asks for a higher tier than `ls` needs is taken at
+        // its word rather than quietly downgraded.
+        let mut p = PolicyState::default();
+        p.grant(Capability::Sensitive);
+        assert_eq!(
+            p.evaluate(&ActRequest::ShellExec {
+                cmd: "ls -la".into(),
+                tier: ShellTier::FullUser,
+                timeout_ms: 1000,
             }),
             Decision::NeedsConfirmation
         );
