@@ -45,7 +45,7 @@ See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md).
 | `oracle-core` | Rust | ReAct agent loop; **parallel dependency-DAG dispatcher**; **two LLM tiers** (on-demand planner + resident VLM); LLM backends (mock + llama-server SSE, text and multimodal); SQLite episodic+vector+KG memory with **tagged vector spaces**; **BGE embedding sidecar**; **ambient screen index**; **knowledge-graph consolidation**; **idle work window** with GPU-pressure gating; **live WebSocket HUD gateway**; **OAuth2 PKCE loopback + AES-GCM vault**; **Home Assistant WS + MQTT clients**; config; observability + `doctor`; lifecycle/shutdown; prompt-injection hardening | 281 |
 | `oracle-actd` | Rust | Capability policy; **real UDS server**; anti-replay; confirmation flow; PAL (mock + `/proc` Linux + Windows + macOS); **window capture** (GDI / `screencapture`); shell risk classifier; audit journal | 68 |
 | `oracle-audio` | C++20 | Lock-free SPSC ring; VAD/barge-in state machine; TTS flow control + heard-upto mapping; FIR decimator; **real ALSA / WASAPI / CoreAudio capture backends** | 933 checks |
-| `oracle-hud` | TS/Three.js | Instanced audio-reactive core; EffectComposer post chain; binary WS protocol; glass panels | tsc + vite |
+| `oracle-hud` | TS/Three.js | Instanced audio-reactive core; EffectComposer post chain; binary WS protocol; glass panels; a `build:demo` mode with a scripted gateway, [live on GitHub Pages](https://apollo-2006.github.io/oracle-of-delphi/) | tsc + vite |
 
 ## Quick start (offline, no GPU)
 

@@ -3,11 +3,12 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Holographic WebGL HUD for Oracle of Delphi (architecture §6)",
+  "description": "Holographic WebGL HUD for Oracle of Delphi (architecture \u00a76)",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "vite build",
-    "dev": "vite"
+    "dev": "vite",
+    "build:demo": "vite build --mode demo"
   },
   "dependencies": {
     "three": "^0.169.0"
