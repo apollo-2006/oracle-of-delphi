@@ -33,7 +33,7 @@ tokio-tungstenite = "0.24"
 toml = "0.8"
 notify = "6"
 hdrhistogram = "7"
-rumqttc = "0.24"
+rumqttc = { version = "0.24", default-features = false }  # plain TCP; see mqtt_client.rs
 # Embed the built HUD (oracle-hud/dist) into the binary so `oracle-core` serves
 # its own frontend — no separate web server, no Tauri. Debug builds read the
 # folder from disk (hot reload); release builds bake it into the .exe.

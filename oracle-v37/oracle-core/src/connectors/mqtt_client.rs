@@ -1,11 +1,16 @@
 //! MQTT client for raw devices / ESPHome sensors not fronted by Home Assistant
-//! (architecture §4.4). Uses rumqttc (TLS-capable, QoS 1). Subscribes device
+//! (architecture §4.4). Uses rumqttc over plain TCP, QoS 1. Subscribes device
 //! state topics into the same [`EntityMirror`] and publishes idempotent-keyed
 //! commands.
 //!
 //! The topic/payload mapping and mirror integration are unit-tested; the live
 //! broker connection (`run`) needs an actual MQTT broker, which is the
 //! deployment-time wiring.
+//!
+//! rumqttc is built without its `use-rustls` feature, because nothing here sets a
+//! TLS transport and that feature pulled in rustls-webpki 0.102, which has open
+//! advisories. A broker reached over TLS needs the feature back and
+//! `MqttOptions::set_transport`.
 
 use super::homeassistant::EntityMirror;
 use rumqttc::{AsyncClient, MqttOptions, QoS};
