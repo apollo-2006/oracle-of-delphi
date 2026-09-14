@@ -146,7 +146,7 @@ export class ScriptedGateway {
     if (/\b(remember|note|don't forget)\b/.test(t)) {
       const fact = text.replace(/^.*?\b(remember|note)( that)?\b/i, "").trim() || text;
       return [this.tool(turn, "memory.remember", 500, "stored, episodic + vector"),
-        this.reply(`I'll remember that ${fact.replace(/[.?!]+$/, "")}.`, turn)];
+        this.reply(`I'll remember that ${secondPerson(fact.replace(/[.?!]+$/, ""))}.`, turn)];
     }
     if (/\b(what did|recall|remind me|what do you know)\b/.test(t)) {
       return [this.tool(turn, "memory.recall", 700, "3 memories, best match 0.82"),
@@ -279,6 +279,12 @@ export class ScriptedGateway {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// "my exam is friday" -> "your exam is friday", for echoing a fact back.
+function secondPerson(s: string): string {
+  const swaps: Record<string, string> = { i: "you", "i'm": "you're", me: "you", my: "your", mine: "yours", myself: "yourself", am: "are" };
+  return s.replace(/\b(i'm|i|me|my|mine|myself|am)\b/gi, (w) => swaps[w.toLowerCase()] ?? w);
 }
 
 function cap(s: string): string {
