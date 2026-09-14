@@ -19,11 +19,6 @@
 # Shell scripts must stay LF or bash fails with "\r: command not found".
 *.sh   text eol=lf
 
-# Third-party data that git must never translate. espeak-ng's voice files were
-# the source of 31 phantom "modified" entries on the Windows checkout: identical
-# content, CRLF instead of LF. Marking them binary freezes them as committed.
-piper/espeak-ng-data/** -text
-
 # Models and other binaries.
 *.bin    -text
 *.gguf   -text

@@ -11,13 +11,14 @@
 # oracle.toml serves both platforms via ${ORACLE_ROOT} and ${ORACLE_PLATFORM}:
 #
 #   .venv\Scripts\piper.exe                  piper-tts wheel
+#   piper\en_US-amy-medium.onnx (+ .json)    the voice, checked against a pinned SHA-256
 #   whisper\windows-x64\whisper-cli.exe      whisper.cpp release binaries
 #   whisper\models\ggml-base.en.bin          the model (gitignored, never committed)
 #   llama.cpp\build\bin\Release\             built locally
 #
-# Once this runs cleanly, the piper\ and whisper\ binaries committed at the
-# repository root are redundant and can be deleted -- which also removes the
-# GPL-3.0 espeak-ng files this repository currently redistributes.
+# Nothing under piper\ or whisper\ is committed any more. What this script installs
+# replaces the Windows binaries that used to be vendored there, and removing those
+# also removed the GPL-3.0 espeak-ng files the repository was redistributing.
 param(
     [switch]$Force,
     [ValidateSet('piper','whisper','model','llama')]
@@ -28,9 +29,15 @@ $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = (Resolve-Path (Join-Path $here "..\..")).Path   # scripts\ -> oracle-v37\ -> repo root
 
-$PiperTag    = "2023.11.14-2"
 $WhisperTag  = "b4938"
 $WhisperModel = "ggml-base.en.bin"
+
+# The Piper voice, from rhasspy/piper-voices at a pinned revision. The hashes are
+# those of the copy this project was developed against; a download that does not
+# match is refused rather than installed.
+$VoiceUrl      = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/amy/medium/en_US-amy-medium"
+$VoiceOnnxHash = "b3a6e47b57b8c7fbe6a0ce2518161a50f59a9cdd8a50835c02cb02bdd6206c18"
+$VoiceJsonHash = "95a23eb4d42909d38df73bb9ac7f45f597dbfcde2d1bf9526fdeaf5466977d77"
 
 # Windows on ARM exists, but whisper.cpp publishes no arm64 build, so x64 (under
 # emulation) is the only option that actually works today.
@@ -43,6 +50,24 @@ function Need([string]$cmd, [string]$hint) {
     if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
         throw "missing required tool: $cmd$(if ($hint) { "  ($hint)" })"
     }
+}
+
+# Nothing to do if a file with this hash is already in place; otherwise download
+# beside it and move it in only once the hash matches.
+function FetchVerified([string]$url, [string]$dest, [string]$sha256) {
+    if ((-not $Force) -and (Test-Path $dest) -and ((Get-FileHash -Algorithm SHA256 $dest).Hash -eq $sha256)) {
+        return
+    }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dest) | Out-Null
+    $prev = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+    try   { Invoke-WebRequest -Uri $url -OutFile "$dest.part" -UseBasicParsing }
+    finally { $ProgressPreference = $prev }
+    $got = (Get-FileHash -Algorithm SHA256 "$dest.part").Hash
+    if ($got -ne $sha256) {
+        Remove-Item "$dest.part" -ErrorAction SilentlyContinue
+        throw "checksum mismatch for ${url}: expected $sha256, got $got"
+    }
+    Move-Item "$dest.part" $dest -Force
 }
 
 # --- 1. piper (text to speech) ------------------------------------------------
@@ -71,6 +96,9 @@ if (Want 'piper') {
         if (-not (Test-Path $piper)) { throw "piper-tts installed but $piper is missing" }
         Write-Host "    -> .venv\Scripts\piper.exe"
     }
+    Write-Host "==> voice: en_US-amy-medium (about 60 MB the first time)"
+    FetchVerified "$VoiceUrl.onnx" (Join-Path $root "piper\en_US-amy-medium.onnx") $VoiceOnnxHash
+    FetchVerified "$VoiceUrl.onnx.json" (Join-Path $root "piper\en_US-amy-medium.onnx.json") $VoiceJsonHash
     # Prove it can synthesize. A voice that fails at run time degrades silently
     # to the browser's TTS, which looks like nothing being wrong at all.
     $voice = Join-Path $root "piper\en_US-amy-medium.onnx"

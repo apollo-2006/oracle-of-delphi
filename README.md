@@ -28,7 +28,7 @@ oracle-v37/oracle-shell   native window, hotkey and tray (tao + wry)
 oracle-v37/oracle-audio   C++ capture, voice activity detection, barge-in
 oracle-v37/oracle-hud     Three.js heads-up display, plus the scripted demo build
 oracle-v37/oracle-ipc     shared wire types
-piper/, whisper/          third-party speech binaries and models; see THIRD-PARTY-NOTICES.md
+piper/, whisper/          speech binaries and models, installed by oracle-v37/scripts/setup.*
 ```
 
 The design premise is that the model is an untrusted planner. Every OS-touching action

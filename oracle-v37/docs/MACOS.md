@@ -4,8 +4,8 @@ macOS is a first-class target alongside Linux and Windows. The Rust workspace,
 the C++ audio engine, the HUD and the native shell all build and test clean on
 Apple Silicon. What follows is only the parts that genuinely differ from the
 other two targets: the permissions the actuator needs, the inference backend,
-the length limit on the actd socket, and the fact that the voice binaries
-vendored in this repo are Windows-only and must be rebuilt.
+the length limit on the actd socket, and the voice stack, which
+`scripts/setup.sh` builds for the Mac.
 
 ## 1. Grant the two TCC permissions
 
@@ -154,8 +154,9 @@ needed no change. It also bundles its own phonemization, so nothing separate has
 to be fetched. There is a `win_amd64` wheel too, which is what lets one
 mechanism serve both platforms.
 
-The voice model, `piper/en_US-amy-medium.onnx`, is platform-neutral and stays
-committed — it is the one vendored file that works everywhere.
+The voice model, `piper/en_US-amy-medium.onnx`, is platform-neutral. The same
+step downloads it from the Piper voices repository at a pinned revision and
+refuses a download whose SHA-256 does not match.
 
 ### Why whisper.cpp is built rather than downloaded
 
@@ -175,13 +176,12 @@ newline-terminated line per utterance, which core parses; `-nt` makes it redraw
 a single line with carriage returns that never split into lines, so the wake
 word is never heard.
 
-### The vendored Windows binaries
+### Nothing speech-related is committed
 
-`piper/*.exe`, `piper/*.dll` and `whisper/*.exe` at the repository root are
-Windows builds and do not run here. They are still committed so a Windows clone
-works today without running anything; `scripts/setup.ps1` now reproduces them
-(the whisper set is byte-for-byte the same release archive), so they can be
-deleted whenever you want the repository smaller.
+`piper/` and `whisper/` hold only what the setup scripts install, and both are
+ignored. The Windows builds that used to be committed there were removed once
+`scripts/setup.ps1` could reproduce them; its 38 whisper.cpp binaries were the
+same release archive, byte for byte.
 
 ## 5. Build and run
 
@@ -249,7 +249,7 @@ is the manual equivalent.
 | Play / pause / next / previous | ⚠️ | Drives Spotify or Music directly. AppleScript cannot post the system-defined events the physical media keys use, so if neither app is running this reports an error rather than doing nothing |
 | Read UI tree / click by name | ⚠️ | Implemented via Accessibility, but the least battle-tested path — see below |
 | Microphone capture | ✅ | CoreAudio (AUHAL). Needs the Microphone permission — see below |
-| Speech in / out / wake word | ⚠️ | Works, but the vendored `whisper/` and `piper/` are Windows binaries. Rebuild for arm64 — see §4 |
+| Speech in / out / wake word | ⚠️ | Needs `scripts/setup.sh` first, which builds whisper.cpp and installs Piper for arm64; see §4 |
 | Native window (`oracle-shell`) | ✅ | tao + wry build and run; only `build-app.ps1` is Windows-only |
 
 ### Performance

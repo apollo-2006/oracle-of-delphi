@@ -18,9 +18,15 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."          # scripts/ -> oracle-v37/ -> repo root
 ROOT="$(pwd)"
 
-PIPER_TAG="2023.11.14-2"
 WHISPER_TAG="b4938"
 WHISPER_MODEL="ggml-base.en.bin"
+
+# The Piper voice, from rhasspy/piper-voices at a pinned revision. The hashes are
+# those of the copy this project was developed against; a download that does not
+# match is refused rather than installed.
+VOICE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/amy/medium/en_US-amy-medium"
+VOICE_ONNX_SHA256="b3a6e47b57b8c7fbe6a0ce2518161a50f59a9cdd8a50835c02cb02bdd6206c18"
+VOICE_JSON_SHA256="95a23eb4d42909d38df73bb9ac7f45f597dbfcde2d1bf9526fdeaf5466977d77"
 
 FORCE=0
 ONLY=""
@@ -53,6 +59,29 @@ need() { command -v "$1" >/dev/null || { echo "missing required tool: $1${2:+  (
 need curl
 need tar
 
+sha256() {
+  if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1
+  else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
+# fetch <url> <dest> <sha256>: nothing to do if a file with that hash is already in
+# place; otherwise download beside it and move it in only once the hash matches.
+fetch() {
+  local url="$1" dest="$2" want="$3" got
+  if [ "$FORCE" -eq 0 ] && [ -f "$dest" ] && [ "$(sha256 "$dest")" = "$want" ]; then
+    return 0
+  fi
+  mkdir -p "$(dirname "$dest")"
+  curl -fL --progress-bar "$url" -o "$dest.part"
+  got="$(sha256 "$dest.part")"
+  if [ "$got" != "$want" ]; then
+    rm -f "$dest.part"
+    echo "checksum mismatch for $url: expected $want, got $got" >&2
+    exit 1
+  fi
+  mv "$dest.part" "$dest"
+}
+
 # --- 1. piper (text to speech) ------------------------------------------------
 # Installed as a Python wheel, NOT from the GitHub release archive.
 #
@@ -75,8 +104,10 @@ need tar
 # despite the shared name. The gain is that the user installs it rather than
 # this repository redistributing it. See THIRD-PARTY-NOTICES.md.
 #
-# The voice model itself (piper/en_US-amy-medium.onnx) is platform-neutral and
-# stays committed -- it is the one vendored file that works everywhere.
+# The voice model (piper/en_US-amy-medium.onnx and its .json) is platform-neutral
+# and fetched here too, checked against a pinned SHA-256. It used to be committed;
+# its terms come from the dataset it was trained on, so the repository no longer
+# redistributes it.
 if want piper; then
   VENV="$ROOT/.venv"
   PIPER_BIN="$VENV/bin/piper"
@@ -94,6 +125,9 @@ if want piper; then
     [ -x "$PIPER_BIN" ] || { echo "piper-tts installed but $PIPER_BIN is missing" >&2; exit 1; }
     echo "    -> .venv/bin/piper"
   fi
+  echo "==> voice: en_US-amy-medium (about 60 MB the first time)"
+  fetch "$VOICE_URL.onnx" "$ROOT/piper/en_US-amy-medium.onnx" "$VOICE_ONNX_SHA256"
+  fetch "$VOICE_URL.onnx.json" "$ROOT/piper/en_US-amy-medium.onnx.json" "$VOICE_JSON_SHA256"
   # Prove it can actually speak, rather than only that a file exists. A voice
   # that fails at synthesis time degrades silently to the browser's TTS, which
   # looks like nothing being wrong at all.

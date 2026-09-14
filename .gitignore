@@ -8,21 +8,14 @@ credentials.json
 # =========================
 # Fetched / built by scripts/setup.{sh,ps1}
 # =========================
-# Per-platform binaries and models. These are what make a clone work on this
-# machine; they are deliberately NOT committed, because a binary per platform
-# doubles the repository and git keeps every past copy of one forever.
-#
-# The flat Windows binaries at piper/ and whisper/ are the older vendored set
-# and stay tracked until they are removed -- these patterns are anchored to the
-# <os>-<arch> directory names the setup scripts install into, so they do not
-# match those.
-piper/macos-*/
-piper/linux-*/
-piper/windows-*/
-whisper/macos-*/
-whisper/linux-*/
-whisper/windows-*/
-whisper/models/
+# Per-platform binaries and the models they load. These are what make a clone
+# work on this machine; they are deliberately NOT committed, because a binary per
+# platform doubles the repository, git keeps every past copy of one forever, and
+# committing them redistributes other projects' code and data under their terms.
+# Everything under piper/ and whisper/ comes from the setup scripts, including
+# the voice model, which is fetched and checked against a pinned SHA-256.
+/piper/
+/whisper/
 
 # setup.sh clones whisper.cpp here to build it; it is scratch, not source.
 .build/

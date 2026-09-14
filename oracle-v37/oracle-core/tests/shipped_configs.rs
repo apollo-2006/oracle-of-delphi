@@ -360,9 +360,8 @@ fn enabling_the_macos_stack_still_validates() {
 
 #[test]
 fn the_macos_voice_stack_does_not_point_at_windows_binaries() {
-    // The whisper/ and piper/ directories vendored at the repo root hold .exe
-    // and .dll files. Pointing macOS at those produces "not executable" from a
-    // child process, one layer below anything that reports it usefully.
+    // A Windows .exe path left in the macOS profile produces "not executable"
+    // from a child process, one layer below anything that reports it usefully.
     let cfg = Config::load(&deploy("oracle.macos.toml")).expect("loads");
     for (label, program) in [
         ("tts_program", &cfg.voice.tts_program),

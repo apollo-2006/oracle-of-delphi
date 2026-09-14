@@ -512,9 +512,9 @@ Everything offline swaps to real backends behind a trait; nothing is stubbed
 - **Real OS control:** the actd `Platform` trait. Windows is complete (Win32 +
   UI Automation + GDI capture). macOS is complete bar the caveats in
   [`docs/MACOS.md`](docs/MACOS.md) (Accessibility API via `osascript`; capture
-  additionally needs the Screen Recording grant; the `whisper/` and `piper/`
-  binaries vendored here are Windows-only and must be rebuilt for arm64 before
-  the voice stack works). On Linux the `/proc` process
+  additionally needs the Screen Recording grant; the voice stack needs
+  `scripts/setup.sh` first, which builds whisper.cpp and installs Piper for the
+  Mac). On Linux the `/proc` process
   lister works, the window/input backends (x11rb, `/dev/uinput`) still slot in,
   and `capture_window` returns `Unsupported` until an X11 or Wayland backend
   exists.
@@ -568,10 +568,9 @@ scripts/        build_all.sh, setup.sh, setup.ps1
 
 MIT. See [`LICENSE`](../LICENSE).
 
-Third-party components shipped in or used by this project keep their own
-licenses; they are enumerated in
-[`THIRD-PARTY-NOTICES.md`](../THIRD-PARTY-NOTICES.md). One is copyleft: the
-`piper/espeak-ng-data/` files and `espeak-ng.dll` vendored at the repository
-root are **GPL-3.0-or-later**. That does not affect this project's own MIT
-licensing (Piper is invoked as a separate process, not linked), but
-redistributing those files carries espeak-ng's terms.
+Third-party components used by this project keep their own licenses; they are
+enumerated in [`THIRD-PARTY-NOTICES.md`](../THIRD-PARTY-NOTICES.md). None of them
+is committed here: the setup scripts install them. One is copyleft: the
+`piper-tts` wheel, which bundles espeak-ng, is **GPL-3.0-or-later**. That does
+not affect this project's own MIT licensing, because Piper runs as a separate
+process rather than being linked.
