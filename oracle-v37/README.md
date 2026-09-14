@@ -7,12 +7,12 @@ holographic HUD. Targets **Linux, macOS and Windows** from one codebase (a
 Platform Abstraction Layer covers the OS-specific bits); GPU inference runs on
 **AMD ROCm/HIP**, **Apple Metal**, or any OpenAI-compatible llama.cpp server.
 
-This repository is a **working, buildable, tested system** — not a sketch.
+This repository is a **working, buildable, tested system**, not a sketch.
 Every component builds, runs, and passes tests; the whole thing boots offline
 (mock LLM, hashing embedder, Null audio) so you can run it with no GPU, no model
 download, and no credentials, then swap in real backends behind traits.
 
-**Status: 409 Rust tests + 933 C++ checks passing. Clippy-clean, rustfmt-clean.
+**Status: 481 Rust tests + 933 C++ checks passing. Clippy-clean, rustfmt-clean.
 Two processes talk over a real authenticated socket; the HUD streams over a real
 WebSocket; OAuth, Home Assistant, and the audio ring are exercised end-to-end
 against mocks or real libraries.**
@@ -41,9 +41,9 @@ See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md).
 
 | Component | Language | Highlights | Tests |
 |---|---|---|---|
-| `oracle-ipc` | Rust | Wire types; **length-framed async transport** (UDS + peer-cred auth); binary HUD frames | 10 |
-| `oracle-core` | Rust | ReAct agent loop; **parallel dependency-DAG dispatcher**; **two LLM tiers** (on-demand planner + resident VLM); LLM backends (mock + llama-server SSE, text and multimodal); SQLite episodic+vector+KG memory with **tagged vector spaces**; **BGE embedding sidecar**; **ambient screen index**; **knowledge-graph consolidation**; **idle work window** with GPU-pressure gating; **live WebSocket HUD gateway**; **OAuth2 PKCE loopback + AES-GCM vault**; **Home Assistant WS + MQTT clients**; config; observability + `doctor`; lifecycle/shutdown; prompt-injection hardening | 281 |
-| `oracle-actd` | Rust | Capability policy; **real UDS server**; anti-replay; confirmation flow; PAL (mock + `/proc` Linux + Windows + macOS); **window capture** (GDI / `screencapture`); shell risk classifier; audit journal | 68 |
+| `oracle-ipc` | Rust | Wire types; **length-framed async transport** (UDS + peer-cred auth); binary HUD frames | 17 |
+| `oracle-core` | Rust | ReAct agent loop; **parallel dependency-DAG dispatcher**; **two LLM tiers** (on-demand planner + resident VLM); LLM backends (mock + llama-server SSE, text and multimodal); SQLite episodic+vector+KG memory with **tagged vector spaces**; **BGE embedding sidecar**; **ambient screen index**; **knowledge-graph consolidation**; **idle work window** with GPU-pressure gating; **live WebSocket HUD gateway**; **OAuth2 PKCE loopback + AES-GCM vault**; **Home Assistant WS + MQTT clients**; config; observability + `doctor`; lifecycle/shutdown; prompt-injection hardening | 392 |
+| `oracle-actd` | Rust | Capability policy; **real UDS server**; anti-replay; confirmation flow; PAL (mock + `/proc` Linux + Windows + macOS); **window capture** (GDI / `screencapture`); shell risk classifier; audit journal | 72 |
 | `oracle-audio` | C++20 | Lock-free SPSC ring; VAD/barge-in state machine; TTS flow control + heard-upto mapping; FIR decimator; **real ALSA / WASAPI / CoreAudio capture backends** | 933 checks |
 | `oracle-hud` | TS/Three.js | Instanced audio-reactive core; EffectComposer post chain; binary WS protocol; glass panels; a `build:demo` mode with a scripted gateway, [live on GitHub Pages](https://apollo-2006.github.io/oracle-of-delphi/) | tsc + vite |
 
@@ -52,7 +52,7 @@ See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md).
 Nothing below needs editing after a clone. The shipped profiles address the
 checkout as `${ORACLE_ROOT}` (found via the `.oracle-root` marker) and this
 machine as `${ORACLE_PLATFORM}`, so the same file works on any Mac or Windows
-box — and `ORACLE_ROOT` in the environment overrides it.
+box, and `ORACLE_ROOT` in the environment overrides it.
 
 ```bash
 # Once per machine: the platform-specific dependencies -- piper, whisper.cpp,
@@ -90,12 +90,12 @@ and `oracle.windows.ambient.toml`. Check one before a long build with
 The REPL runs the architecture's headline example end-to-end: the model emits
 four tool calls, the dispatcher runs three in parallel and gates the draft on
 the email + calendar results via `$result.N` dependency edges, then speaks a
-summary — all real code paths, zero external dependencies.
+summary: all real code paths, zero external dependencies.
 
 ## Continuity
 
 Memory used to be reachable only through the `memory.remember` and
-`memory.recall` tools — that is, only when the *model chose* to call them. A 14B
+`memory.recall` tools, meaning only when the *model chose* to call them. A 14B
 planner almost never does either unprompted, so nothing was written and nothing
 was read back: the store stayed empty and the assistant met you fresh every
 session. The infrastructure was all there; nothing was driving it.
@@ -107,14 +107,14 @@ It is now automatic on both sides of every turn:
   with a human-readable age ("3 days ago"). No tool call required.
 * **After the turn resolves**, the user's words and the reply are written back as
   episodes, so the next turn has something to find. The user's half carries
-  higher salience — durable facts come from them, not from Pythia's restatement.
+  higher salience: durable facts come from them, not from Pythia's restatement.
 * **An exact repeat reinforces** the existing episode instead of appending a
   near-duplicate, so saying the same thing twice deepens a memory rather than
   crowding the recall block with copies.
 
 Recalled text is framed in the prompt as **data, not instructions**. A memory can
 quote an email or a web page, so an injected instruction could otherwise reach
-the planner a session after it was first seen — the standing `DATA_RULE` has to
+the planner a session after it was first seen. The standing `DATA_RULE` has to
 cover memory, not just freshly fetched content.
 
 Tunable under `[memory]`; set `auto_recall`/`auto_record` false to return to the
@@ -130,11 +130,11 @@ recall_min_score = 0.15
 
 Retrieval quality is bounded by whichever `Embedder` is configured. The offline
 `HashEmbedder` matches on tokens rather than meaning, which is why
-`[memory.embedder]` exists — see [Semantic recall](#semantic-recall).
+`[memory.embedder]` exists; see [Semantic recall](#semantic-recall).
 
 A correction worth stating plainly, because an earlier version of this document
 had it wrong: swapping embedders is **not** a free migration. Both produce 384-d
-unit vectors, so old and new rows are indistinguishable as data — but the cosine
+unit vectors, so old and new rows are indistinguishable as data, but the cosine
 between a hashed vector and a BGE vector is noise that happens to land in
 [-1, 1]. Retrieval would keep working, keep returning results, and keep being
 wrong. Rows are therefore tagged with the vector space that produced them.
@@ -147,7 +147,7 @@ model at all, so there is no reason for the planner to be resident between
 conversations.
 
 After ten minutes of silence the supervised `llama-server` is **killed**, not
-just ignored — releasing the VRAM is the whole point. Saying "Delphi" starts the
+just ignored: releasing the VRAM is the whole point. Saying "Delphi" starts the
 reload immediately, while you are still talking, so the load overlaps with the
 rest of your sentence instead of being dead air after it. The turn then waits on
 `/health` before its request goes out, so the first ask after a lull is slow
@@ -162,21 +162,21 @@ llm_ready_timeout_secs = 90
 ### Two tiers, because one model was the wrong shape
 
 That policy was correct and it was also a trap. With only a 14B, continuous
-background work was impossible — you will not hold 11 GB all day to summarize a
-window — so there *was* no continuous background work, so the model had nothing
+background work was impossible (you will not hold 11 GB all day to summarize a
+window), so there *was* no continuous background work, so the model had nothing
 to do between turns, so unloading it was the only sane answer. An assistant whose
 model is usually unloaded is one that does nothing when you are not looking at
 it, which is a strange thing to run locally at all.
 
 Splitting the tier breaks the cycle:
 
-* **Big** (`[llm]`) — the 14B planner. On demand for a turn or the away briefing,
+* **Big** (`[llm]`): the 14B planner. On demand for a turn or the away briefing,
   unloaded when idle. Nothing about its lifecycle changed.
-* **Small** (`[llm.small]`) — a 2B-class VLM, ~2.5 GB, **resident**. Cheap enough
+* **Small** (`[llm.small]`): a 2B-class VLM, ~2.5 GB, **resident**. Cheap enough
   to leave running, which is what lets it do work that arrives continuously:
   reading the screen, folding episodes into the graph.
 
-Two `llama-server` processes on two ports, not two modes of one server —
+Two `llama-server` processes on two ports, not two modes of one server:
 llama.cpp holds one model per server, and the whole point is that one can die
 while the other lives. Sharing a port is rejected at config load, because the
 failure is otherwise silent: the second server never binds, the supervisor
@@ -188,7 +188,7 @@ the 14B. That looks exactly like the feature working, at 11 GB resident.
 enabled = true
 backend = "http://127.0.0.1:8081"   # its own port
 model = "qwen3-vl-2b-instruct-q4_k_m"
-resident = true                     # never idle-unloaded — that is the point
+resident = true                     # never idle-unloaded; that is the point
 ```
 
 ## The work window
@@ -199,11 +199,11 @@ becomes the window in which the backlog runs.
 
 Background work is gated on three things, and the third is the one that matters:
 
-- **the user is idle** — not because the work is expensive, but because it is not
+- **the user is idle**, not because the work is expensive, but because it is not
   urgent; anything that can wait should
-- **no turn is in flight** — idle-by-clock and busy-by-turn overlap, since a
+- **no turn is in flight**: idle-by-clock and busy-by-turn overlap, since a
   routine or a briefing runs unattended
-- **nothing else wants the GPU** — polled from `nvidia-smi` / `rocm-smi`, minus
+- **nothing else wants the GPU**, polled from `nvidia-smi` / `rocm-smi`, minus
   our own footprint
 
 An **unknown** GPU answer closes the window. Wrongly idling costs a late
@@ -229,7 +229,7 @@ ONNX Runtime: the supervision, restart and logging already exist, and
 Every row records the vector space that wrote it. Cosine is only ever taken
 within one space; a row from another scores nothing and is excluded from the
 vector rank list entirely. **Keyword retrieval stays space-independent**, so
-switching embedders does not make history vanish — it makes it findable by words
+switching embedders does not make history vanish; it makes it findable by words
 but not by meaning, and startup prints how many rows are in that state. A switch
 is something you are told about, rather than something you experience as "she
 forgot everything".
@@ -245,7 +245,7 @@ dim = 384                           # a mismatch is refused, not stored
 ## The ambient index
 
 Everything else in this codebase reacts. You ask, it answers; a trigger fires, it
-speaks. That shape is why a local model was hard to justify — a reactive
+speaks. That shape is why a local model was hard to justify: a reactive
 assistant uses its GPU for seconds a day, on small inputs, competing with a cloud
 model that is better at exactly that.
 
@@ -257,7 +257,7 @@ question the assistant cannot answer.
 
 **Capture and interpretation are separate tasks with a bounded queue between
 them**, because they want opposite conditions. Capture must happen while you are
-*working* — that is when the screen has anything on it — and is nearly free: a
+*working*, since that is when the screen has anything on it, and is nearly free: a
 `StretchBlt` and a PNG encode, no GPU. Interpretation is the expensive half and
 can happen whenever; if the GPU is busy, the queue waits. Fusing them forces one
 condition to win and either choice is bad: tie interpretation to capture and it
@@ -267,7 +267,7 @@ desktop.
 Frames are **never written to disk**. They live in a bounded in-memory queue, go
 to the model, and are dropped. What persists is text.
 
-The screen is now the most attacker-controlled input in the system — a web page
+The screen is now the most attacker-controlled input in the system. A web page
 renders whatever text it likes, and that reaches the VLM, whose summary reaches
 the planner via recall a session later. Three things contain it: the VLM has **no
 tools** (the same boundary as [Proactive nudges](#proactive-nudges)), its prompt
@@ -275,8 +275,8 @@ states that screen text is data being described rather than instructions, and
 observations land in the memory store whose recall block already carries the
 standing `DATA_RULE`.
 
-Capture is `Capability::Observe` in actd, alongside `ReadUiTree` — both read
-window contents without touching anything — and lockdown denies it with
+Capture is `Capability::Observe` in actd, alongside `ReadUiTree` (both read
+window contents without touching anything), and lockdown denies it with
 everything else. Enabling it without `[llm.small]` is a **load-time error**:
 capturing the screen every 45 seconds for a model that does not exist is all of
 the privacy cost and none of the benefit.
@@ -292,7 +292,7 @@ retain_days = 21
 
 Platform support is honest: **Windows** is complete (GDI `StretchBlt`, scaling
 during the blit so a 4K window never materializes as 32 MB). **macOS** captures
-the window rectangle via `screencapture -R` — a region grab wearing a window
+the window rectangle via `screencapture -R`, a region grab wearing a window
 grab's name, so an overlapping window is included; it needs the Screen Recording
 grant. **Linux** returns `Unsupported`: X11 and Wayland are different enough that
 one working is not the other working.
@@ -306,8 +306,8 @@ stayed empty and every fact lived or died with its episode.
 The consolidation pass populates it: pending episodes go to the small tier, which
 returns the durable relations they establish, and those are asserted into the
 graph. Output is GBNF-constrained to a well-formed fact array whose relation is
-drawn from the graph's own vocabulary — the same trick that makes tool calls
-reliable — so malformed output stops being a failure mode.
+drawn from the graph's own vocabulary (the same trick that makes tool calls
+reliable), so malformed output stops being a failure mode.
 
 This is what makes `ambient.retain_days` a **promotion deadline** rather than a
 plain delete. Observations are mined and then swept; the knowledge persists.
@@ -343,7 +343,7 @@ on Tuesday".
 
 The assistant used to be blind unless the model chose to call a screen tool
 first, which made "close this" and "what does this error mean" unanswerable. The
-focused window — and a few other open ones — now go into the system prompt every
+focused window, and a few other open ones, now go into the system prompt every
 turn, the same way recalled memory does.
 
 The subtlety: when you talk through the HUD, **Oracle is the foreground window**.
@@ -351,7 +351,7 @@ Reading that back is how a model starts describing Pythia's own UI as if it were
 your screen. Windows arrive in z-order, so the first real one behind us is what
 you were actually looking at.
 
-Window titles are attacker-controllable — a web page picks its own — so the block
+Window titles are attacker-controllable (a web page picks its own), so the block
 carries the same DATA-not-instructions framing as memory.
 
 ```toml
@@ -388,13 +388,13 @@ cannot quietly send mail on your behalf.
 
 Come back after a couple of hours, say "Delphi", and instead of "Yes?" you get:
 
-> *"Your build failed — borrow checker in dispatch.rs. Three emails, the one from
+> *"Your build failed: borrow checker in dispatch.rs. Three emails, the one from
 > your advisor wants a reply by Friday. Your 3pm moved to 4."*
 
 This is the one proactive path where the model earns its keep, and the split is
 the point:
 
-* **Detection stays deterministic.** What happened is gathered by ordinary Rust —
+* **Detection stays deterministic.** What happened is gathered by ordinary Rust:
   processes that exited, mail that arrived, events on the calendar. No judgment,
   nothing to get wrong.
 * **Interpretation is the model's job.** Turning three facts into the two that
@@ -404,7 +404,7 @@ the point:
 Every other nudge in this codebase would run identically with the LLM
 uninstalled. This one would not exist.
 
-The model gets **no tools** here — it receives facts and returns prose, so the
+The model gets **no tools** here. It receives facts and returns prose, so the
 boundary from [Proactive nudges](#proactive-nudges) holds: it cannot act, and the
 worst case is an awkward sentence.
 
@@ -412,7 +412,7 @@ Machine events are recorded into a bounded in-memory log *before* the nudge
 policy sees them, so something that happened during quiet hours is still in the
 briefing even though it was never announced at the time.
 
-Nothing to report means silence, and the check happens **before** the model call —
+Nothing to report means silence, and the check happens **before** the model call:
 waking an 11 GB model to be told there is nothing to say is the opposite of the
 point.
 
@@ -432,7 +432,7 @@ miss?"), and a routine can schedule one.
 ## Proactive nudges
 
 Pythia can speak first: a calendar event about to start, or mail worth knowing
-about. Off by default — an assistant that begins talking on its own is something
+about. Off by default: an assistant that begins talking on its own is something
 you opt into, not something you discover.
 
 ```toml
@@ -454,7 +454,7 @@ max_per_hour = 4
 
 Every other path runs with the user present: they asked, they hear the answer,
 and an irreversible act stops for their sanction. A proactive turn breaks all
-three assumptions — it fires with nobody watching, possibly with nobody in the
+three assumptions: it fires with nobody watching, possibly with nobody in the
 room.
 
 So there is no `Agent` and no tool registry in `oracle-core/src/proactive/`. A
@@ -464,7 +464,7 @@ saying something silly at the wrong moment, never taking an unattended action.**
 That is a boundary, not a default to relax.
 
 Phrasing through the LLM would sound better and could be done safely with an
-empty tool registry. It is not done yet — today's nudges are templated.
+empty tool registry. It is not done yet; today's nudges are templated.
 
 ### The local triggers are the ones that justify running this at all
 
@@ -479,7 +479,7 @@ An assistant that interrupts badly is worse than one that never speaks. The
 triggers are trivial; `NudgePolicy` is where the work is:
 
 - **quiet hours**, wrapping midnight correctly (22 → 08 is not a range test)
-- **a per-nudge cooldown** keyed on the *event id*, never the time — the loop
+- **a per-nudge cooldown** keyed on the *event id*, never the time, because the loop
   re-polls every 60s and rediscovers the same meeting each cycle
 - **a rolling hourly ceiling**, so a misbehaving trigger cannot become a stream
 - **suppression while a real turn is in flight**, released through a `Drop` so a
@@ -490,14 +490,14 @@ A suppressed nudge does not consume the hourly budget, or a trigger firing at
 
 ## Going to production
 
-Everything offline swaps to real backends behind a trait — nothing is stubbed
+Everything offline swaps to real backends behind a trait; nothing is stubbed
 *structurally*. Full instructions in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md):
 
 - **Real LLM:** point `llm.backend` at a llama.cpp server built with the HIP
   backend (`-DGGML_HIP=ON`). The SSE + tool-call protocol is already spoken.
 - **Real embeddings:** set `[memory.embedder]` and point it at a llama.cpp
   sidecar serving BGE-small with `--embedding --pooling mean` on its own port.
-  See [Semantic recall](#semantic-recall) — the schema matches, but existing rows
+  See [Semantic recall](#semantic-recall): the schema matches, but existing rows
   are in the old vector space and are reported as such at startup.
 - **The vision tier:** set `[llm.small]` and point it at a second llama.cpp
   server with a VLM and its `--mmproj`. This is what powers
@@ -519,7 +519,7 @@ Everything offline swaps to real backends behind a trait — nothing is stubbed
   and `capture_window` returns `Unsupported` until an X11 or Wayland backend
   exists.
 - **Real Google/HA:** the OAuth PKCE loopback, AES-GCM vault, HA WebSocket, and
-  MQTT clients are complete and tested against mocks — add your client id and
+  MQTT clients are complete and tested against mocks; add your client id and
   tokens.
 
 Deploy with the provided `Dockerfile`, systemd user units
@@ -566,12 +566,12 @@ scripts/        build_all.sh, setup.sh, setup.ps1
 
 ## License
 
-MIT — see [`LICENSE`](../LICENSE).
+MIT. See [`LICENSE`](../LICENSE).
 
 Third-party components shipped in or used by this project keep their own
 licenses; they are enumerated in
 [`THIRD-PARTY-NOTICES.md`](../THIRD-PARTY-NOTICES.md). One is copyleft: the
 `piper/espeak-ng-data/` files and `espeak-ng.dll` vendored at the repository
 root are **GPL-3.0-or-later**. That does not affect this project's own MIT
-licensing -- Piper is invoked as a separate process, not linked -- but
+licensing (Piper is invoked as a separate process, not linked), but
 redistributing those files carries espeak-ng's terms.
