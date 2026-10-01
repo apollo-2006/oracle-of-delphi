@@ -28,6 +28,12 @@ chrono.workspace = true
 png = "0.17"
 base64 = "0.22"
 
+# Linux-only: window listing and capture go through KWin's D-Bus interfaces.
+# Pure Rust (no libdbus), blocking API with zbus's own executor thread, so the
+# synchronous Platform trait can use it without touching the daemon's runtime.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5"
+
 # Windows-only: raw Win32 bindings for the actuator PAL (windows/process/input).
 # Not built on Linux/CI; compiled on the Windows target.
 [target.'cfg(windows)'.dependencies]

@@ -212,6 +212,20 @@ pub fn render_observation(title: &str, summary: &str) -> String {
     }
 }
 
+/// Split a stored observation back into `(title, summary)`, the inverse of
+/// [`render_observation`], for display. `None` when `text` is not one.
+///
+/// A title that itself contains `"): "` splits early. That only misplaces a
+/// few words between the two halves on screen; nothing is lost or rewritten.
+pub fn parse_observation(text: &str) -> Option<(Option<&str>, &str)> {
+    if let Some(summary) = text.strip_prefix("On screen: ") {
+        return Some((None, summary));
+    }
+    let rest = text.strip_prefix("On screen (")?;
+    let (title, summary) = rest.split_once("): ")?;
+    Some((Some(title), summary))
+}
+
 /// The capture half: sample the focused window on a timer.
 ///
 /// Runs while the user is *present*; an idle machine shows an empty desktop and
@@ -459,6 +473,18 @@ mod tests {
         let t = render_observation("main.rs — oracle", "Rust source for the agent loop");
         assert!(t.contains("main.rs — oracle"));
         assert!(t.contains("Rust source"));
+    }
+
+    #[test]
+    fn a_rendered_observation_parses_back() {
+        let t = render_observation("(432) YouTube - Chrome", "a concert video");
+        assert_eq!(
+            parse_observation(&t),
+            Some((Some("(432) YouTube - Chrome"), "a concert video"))
+        );
+        let t = render_observation("", "a terminal");
+        assert_eq!(parse_observation(&t), Some((None, "a terminal")));
+        assert_eq!(parse_observation("dim the lights"), None);
     }
 
     #[test]

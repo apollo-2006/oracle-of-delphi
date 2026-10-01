@@ -40,6 +40,11 @@ pub struct Episode {
 pub struct RetrievedItem {
     pub episode: Episode,
     pub score: f32,
+    /// Fraction of the query's words (3+ letters, substring match) found in
+    /// the text. Lets a caller tell a literal match from a row that placed only
+    /// on embedding similarity, which with a small embedder is never zero, even
+    /// for unrelated text. Weak on its own: "the" counts as a word.
+    pub keyword: f32,
 }
 
 /// Owns the SQLite connection. Single-writer by construction (core is the only
@@ -102,7 +107,16 @@ impl MemoryStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let q_emb = self.embedder.embed(query)?;
+        // An embedder that is down (restarting, or not yet loaded) degrades
+        // retrieval to keywords instead of failing it: the planner's recall and
+        // the HUD's search both still find literal matches.
+        let q_emb = match self.embedder.embed(query) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(error = %e, "[memory] embedder unavailable; keyword-only retrieval");
+                None
+            }
+        };
         let active_space = self.embedder.id();
         // Tokenize the query ONCE. This used to happen inside `keyword_overlap`,
         // i.e. once per candidate row: a store with n episodes built and threw
@@ -136,10 +150,11 @@ impl MemoryStore {
             // does not vanish when the embedder changes, but it never
             // contributes noise dressed up as similarity.
             let same_space = r.get_ref(6)?.as_str().unwrap_or_default() == active_space;
-            let vscore = if same_space {
-                cosine_blob(&q_emb, r.get_ref(5)?.as_blob().unwrap_or_default())
-            } else {
-                0.0
+            let vscore = match &q_emb {
+                Some(q) if same_space => {
+                    cosine_blob(q, r.get_ref(5)?.as_blob().unwrap_or_default())
+                }
+                _ => 0.0,
             };
             let kscore = keyword_overlap(&q_toks, &text, &mut lowered);
             Ok((
@@ -206,6 +221,7 @@ impl MemoryStore {
                         salience: c.4,
                     },
                     score,
+                    keyword: c.6,
                 });
             }
         }

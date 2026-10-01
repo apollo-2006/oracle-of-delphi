@@ -1,31 +1,33 @@
 //! Linux Platform backend.
 //!
 //! Process enumeration is implemented for real against `/proc` (dependency-free
-//! and genuinely functional). Window management and input injection require
-//! x11rb/EWMH and `/dev/uinput` respectively; those need extra crates and a
-//! live session, so here they return an honest `Backend` error describing what
-//! the production build wires in. This mirrors the architecture's insistence on
-//! *reporting degraded capabilities honestly* (§3.1) rather than pretending.
+//! and genuinely functional). Window listing and capture work on KDE Plasma
+//! through KWin's D-Bus interfaces (see [`kwin`]); other compositors report
+//! `Unsupported`. Window control and input injection still need a backend
+//! (KWin scripting and `/dev/uinput` respectively), so they return an honest
+//! `Backend` error. This mirrors the architecture's insistence on *reporting
+//! degraded capabilities honestly* (§3.1) rather than pretending.
 
 use super::{PalError, Platform};
 use oracle_ipc::actd::{CapturedImage, ProcInfo, UiElement, WindowInfo};
 use std::fs;
 
+mod kwin;
+
 #[derive(Default)]
-pub struct LinuxPlatform;
+pub struct LinuxPlatform {
+    kwin: kwin::Kwin,
+}
 
 impl LinuxPlatform {
     pub fn new() -> Self {
-        LinuxPlatform
+        Self::default()
     }
 }
 
 impl Platform for LinuxPlatform {
     fn list_windows(&self) -> Result<Vec<WindowInfo>, PalError> {
-        // Production: x11rb EWMH (_NET_CLIENT_LIST) / wlr-foreign-toplevel.
-        Err(PalError::Backend(
-            "window enumeration requires the X11/Wayland backend (x11rb / wlr protocols)".into(),
-        ))
+        self.kwin.list_windows()
     }
 
     fn list_processes(&self) -> Result<Vec<ProcInfo>, PalError> {
@@ -114,18 +116,15 @@ impl Platform for LinuxPlatform {
 
     fn capture_window(
         &self,
-        _window_id: Option<u64>,
-        _max_width: u32,
+        window_id: Option<u64>,
+        max_width: u32,
     ) -> Result<CapturedImage, PalError> {
-        // X11 (XGetImage / XComposite) and Wayland (wlr-screencopy, or the
-        // xdg-desktop-portal ScreenCast interface) are both real options, but
-        // they are different enough that one of them being written is not the
-        // other working. Unsupported is the honest answer until one exists:
-        // ambient capture then reports itself off on Linux instead of silently
+        // KWin only. X11 (XGetImage / XComposite) and the other Wayland
+        // compositors (wlr-screencopy, Mutter) are each their own backend, and
+        // one of them working is not the others working: elsewhere this is
+        // Unsupported, so ambient capture reports itself off instead of
         // indexing blank frames.
-        Err(PalError::Unsupported(
-            "window capture on Linux (X11/Wayland backend not implemented)",
-        ))
+        self.kwin.capture_window(window_id, max_width)
     }
 
     fn read_ui_tree(

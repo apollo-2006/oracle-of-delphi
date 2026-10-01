@@ -100,6 +100,9 @@ export class ScriptedGateway {
       case "set_wake":
         this.emit({ type: "config", stt: true, tts: false, wake: false });
         break;
+      case "search":
+        this.emit(searchSample(Number(msg.id ?? 0), String(msg.query ?? "")));
+        break;
     }
   }
 
@@ -275,6 +278,39 @@ export class ScriptedGateway {
     if (this.readyState !== ScriptedGateway.OPEN) return;
     this.onmessage?.(new MessageEvent("message", { data: JSON.stringify(event) }));
   }
+}
+
+// Recall (Ctrl+K) in the demo: a fixed sample of what a day of ambient memory
+// looks like, filtered by plain word match. The real search is hybrid keyword
+// and vector retrieval over the local store.
+const SAMPLE_MEMORY: { kind: string; title?: string; text: string; minsAgo: number }[] = [
+  { kind: "observation", title: "tokio::select - Rust (docs.rs)", text: "Reading the tokio select! macro docs, the section on cancellation safety of branches.", minsAgo: 14 },
+  { kind: "observation", title: "dispatch.rs - oracle-core - VS Code", text: "A borrow checker error in dispatch.rs: a value moved into a closure is used again after the loop.", minsAgo: 52 },
+  { kind: "conversation", text: "Remind me to reply to the advisor about the Friday deadline.", minsAgo: 95 },
+  { kind: "observation", title: "Pull request #42 · GitHub", text: "Review comments on a pull request asking for a test around the reconnect backoff.", minsAgo: 180 },
+  { kind: "observation", title: "llama.cpp server README", text: "The llama-server flags for KV cache quantization: -ctk and -ctv with q8_0.", minsAgo: 60 * 26 },
+  { kind: "action", text: "Opened https://docs.rs/tokio in the browser.", minsAgo: 60 * 27 },
+  { kind: "observation", title: "Wayland screencopy protocols", text: "Notes comparing wlr-screencopy with the xdg-desktop-portal screenshot interface.", minsAgo: 60 * 50 },
+];
+
+function searchSample(id: number, query: string): Json {
+  const now = Date.now() / 1000;
+  const words = query.toLowerCase().split(/\W+/).filter((w) => w.length > 1);
+  const rows = SAMPLE_MEMORY.filter((m) => {
+    if (!words.length) return m.kind === "observation";
+    const hay = `${m.title ?? ""} ${m.text}`.toLowerCase();
+    return words.some((w) => hay.includes(w));
+  }).map((m) => ({
+    kind: m.kind,
+    title: m.title ?? null,
+    text: m.text,
+    t_unix: Math.round(now - m.minsAgo * 60),
+    score: 0,
+  }));
+  const note = rows.length
+    ? null
+    : `Nothing in this demo's sample memory matches \u201c${query.trim()}\u201d. Try "tokio" or "borrow".`;
+  return { type: "search_results", id, query, items: rows, note };
 }
 
 function sleep(ms: number): Promise<void> {

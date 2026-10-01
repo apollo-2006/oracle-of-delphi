@@ -23,6 +23,7 @@ pub mod observ;
 pub mod paths;
 pub mod proactive;
 pub mod screen;
+pub mod search;
 pub mod security;
 pub mod supervisor;
 pub mod tiers;

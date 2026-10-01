@@ -703,6 +703,8 @@ fn browser_candidates(browser: &str) -> Vec<String> {
     match browser {
         "chrome" => vec![
             "google-chrome".into(),
+            // Arch's google-chrome package installs only this name.
+            "google-chrome-stable".into(),
             "chromium".into(),
             "chromium-browser".into(),
         ],
@@ -1444,6 +1446,22 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
                         // The user clicked "Compact" in the full window.
                         info!("retract requested (full → compact)");
                         raise_retract_flag();
+                    }
+                    Some(HudCommand::Search { id, query }) => {
+                        // Off the select loop: retrieval embeds the query, which
+                        // is a blocking HTTP call to the embedder sidecar, and
+                        // the loop also carries interrupts.
+                        let shared = agent_shared.clone();
+                        let publisher = publisher.clone();
+                        let ambient_on = cfg.ambient.enabled;
+                        tokio::task::spawn_blocking(move || {
+                            let (items, note) =
+                                match oracle_core::search::search(&shared.memory, &query, ambient_on) {
+                                    Ok(r) => r,
+                                    Err(e) => (Vec::new(), Some(format!("search failed: {e}"))),
+                                };
+                            publisher.send_event(HudEvent::SearchResults { id, query, items, note });
+                        });
                     }
                     Some(_) => {}
                     None => {}

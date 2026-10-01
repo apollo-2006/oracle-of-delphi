@@ -14,6 +14,7 @@ import { AgentEvent, stateFromString } from "./protocol.js";
 import { VoiceLoop } from "./voice.js";
 import { ApolloModal } from "./apolloModal.js";
 import { Recorder } from "./recorder.js";
+import { SearchPanel } from "./searchPanel.js";
 
 // --- Combined post FX: chromatic aberration + scanlines + vignette in ONE pass
 const CombinedFXShader = {
@@ -67,6 +68,7 @@ class Hud {
   private frameTimes: number[] = [];
   private voice: VoiceLoop;
   private apollo: ApolloModal;
+  private search: SearchPanel;
   // The currently-playing neural-voice clip, tracked so barge-in / mute can cut
   // it off mid-sentence.
   private currentAudio: HTMLAudioElement | null = null;
@@ -150,6 +152,11 @@ class Hud {
       this.conn.send({ type: "confirm", request_id: requestId, allow });
     });
 
+    // Recall (Ctrl+K): search memory directly, no turn and no planner.
+    this.search = new SearchPanel((query, id) => {
+      this.conn.send({ type: "search", id, query });
+    });
+
     window.addEventListener("resize", () => this.onResize());
     this.wireControls();
   }
@@ -172,6 +179,8 @@ class Hud {
     retract?.addEventListener("click", () => {
       this.conn.send({ type: "retract" });
     });
+
+    document.getElementById("recallBtn")?.addEventListener("click", () => this.search.open());
 
     const input = document.getElementById("userInput") as HTMLInputElement | null;
     input?.addEventListener("keydown", (e: KeyboardEvent) => {
@@ -334,7 +343,13 @@ class Hud {
         // actd · throughput).
         setText("sys", ev.text);
         break;
+      case "search_results":
+        this.search.receive(ev.id, ev.items, ev.note);
+        break;
       case "confirm":
+        // The decree answers to Y/N anywhere on the page. Close Recall first so
+        // a "y" typed into a search can never sanction an irreversible act.
+        if (this.search.isOpen) this.search.close();
         this.apollo.show({
           requestId: ev.request_id,
           prompt: ev.prompt,

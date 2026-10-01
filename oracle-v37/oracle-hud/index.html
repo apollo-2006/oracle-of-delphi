@@ -307,6 +307,74 @@
         #apolloSig { display: none; }
       }
 
+      /* ================= Recall (Ctrl+K memory search) ======================= */
+      #recall {
+        position: fixed; inset: 0; z-index: 90;
+        display: flex; align-items: flex-start; justify-content: center;
+        padding-top: 12vh;
+        background: radial-gradient(ellipse at 50% 20%, rgba(4, 14, 26, 0.55), rgba(2, 3, 6, 0.82));
+        backdrop-filter: blur(4px);
+        opacity: 0; pointer-events: none; transition: opacity 0.18s ease;
+      }
+      #recall.visible { opacity: 1; pointer-events: auto; }
+      .recall-card {
+        width: min(680px, calc(100vw - 32px));
+        display: flex; flex-direction: column; max-height: 70vh;
+        background: var(--glass); border: 1px solid var(--hair-lit);
+        border-radius: 16px; overflow: hidden;
+        -webkit-backdrop-filter: blur(22px) saturate(150%);
+        backdrop-filter: blur(22px) saturate(150%);
+        box-shadow: var(--panel-shadow), 0 0 50px rgba(53, 201, 255, 0.08);
+        transform: translateY(-8px); transition: transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
+      }
+      #recall.visible .recall-card { transform: translateY(0); }
+      .recall-bar {
+        display: flex; align-items: center; gap: 10px;
+        padding: 6px 16px; border-bottom: 1px solid var(--hair);
+      }
+      .recall-glyph { color: var(--accent); font-size: 20px; text-shadow: 0 0 12px rgba(53, 201, 255, 0.5); }
+      .recall-input {
+        flex: 1; min-width: 0; background: transparent; border: none; outline: none;
+        color: var(--ink); font: inherit; font-size: 16px; padding: 12px 0;
+      }
+      .recall-input::placeholder { color: var(--ink-faint); }
+      .recall-status { font-size: 11px; color: var(--ink-faint); letter-spacing: 0.5px; white-space: nowrap; }
+      .recall-list { overflow-y: auto; padding: 6px; }
+      .recall-row {
+        display: grid; grid-template-columns: 44px 1fr auto; gap: 12px; align-items: start;
+        padding: 10px 12px; border-radius: 10px; cursor: pointer;
+        border: 1px solid transparent;
+      }
+      .recall-row.selected { background: var(--accent-soft); border-color: rgba(53, 201, 255, 0.22); }
+      .recall-kind {
+        font-size: 9.5px; letter-spacing: 1.5px; text-transform: uppercase; font-weight: 700;
+        color: var(--accent); padding-top: 3px;
+      }
+      .recall-row[data-kind="conversation"] .recall-kind { color: var(--apollo); }
+      .recall-row[data-kind="action"] .recall-kind { color: #c9a6ff; }
+      .recall-body { min-width: 0; }
+      .recall-title {
+        font-family: var(--font-mono); font-size: 11.5px; color: var(--ink-dim);
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 3px;
+      }
+      .recall-text { font-size: 14px; line-height: 1.45; color: var(--ink); overflow-wrap: anywhere; }
+      .recall-when { font-size: 11px; color: var(--ink-faint); white-space: nowrap; padding-top: 3px; }
+      .recall-empty { padding: 28px 18px; text-align: center; color: var(--ink-dim); font-size: 13.5px; line-height: 1.6; }
+      .recall-foot {
+        display: flex; gap: 18px; justify-content: flex-end;
+        padding: 8px 16px; border-top: 1px solid var(--hair);
+        font-size: 11px; color: var(--ink-faint);
+      }
+      .recall-foot kbd {
+        font-family: var(--font-mono); font-size: 10px; color: var(--ink-dim);
+        border: 1px solid var(--hair-lit); border-radius: 4px; padding: 1px 5px; margin-right: 3px;
+      }
+      @media (max-width: 560px) {
+        #recall { padding-top: 56px; }
+        .recall-row { grid-template-columns: 1fr; gap: 4px; }
+        .recall-foot { display: none; }
+      }
+
       /* ================= Apollo Decree modal (unchanged contract) ============ */
       #apolloModal {
         position: fixed; inset: 0; z-index: 100;
@@ -448,6 +516,7 @@
           autocomplete="off"
         />
         <div id="controls">
+          <button id="recallBtn" title="Search what you've seen and said (Ctrl+K)">⌕ Recall</button>
           <button id="mic">🎙 Voice</button>
           <button id="speak">🔊 Reply</button>
           <button id="interrupt">◼ Stop</button>

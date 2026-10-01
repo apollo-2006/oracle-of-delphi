@@ -160,7 +160,7 @@ impl WorkWindow {
     }
 }
 
-/// Read foreign VRAM from `rocm-smi` / `nvidia-smi`.
+/// Read foreign VRAM from `nvidia-smi`, `rocm-smi`, or the amdgpu driver.
 ///
 /// Deliberately crude: shelling out to a vendor tool once every few minutes is
 /// not a hot path, and linking a GPU management library into the assistant to
@@ -169,6 +169,13 @@ pub struct SmiGpuProbe {
     /// Our own VRAM is not foreign pressure. The planner alone is ~11 GB, so
     /// without this subtraction the window would never open on any machine
     /// where Oracle is doing its job.
+    ///
+    /// This is the fallback. Where the kernel reports per-process GPU memory
+    /// (see [`own_vram_mb_measured`]) the real figure is used instead, because
+    /// a fixed estimate is wrong in exactly the case that matters: it covers
+    /// the resident tiers, so for the ten minutes the planner stays loaded
+    /// after every conversation, its ~9 GB read as someone else's game and the
+    /// vision tier stopped reading the screen.
     own_vram_mb: u64,
 }
 
@@ -187,16 +194,122 @@ impl SmiGpuProbe {
             return Some(mb);
         }
         // ROCm: --showmeminfo vram prints bytes; take the first "used" figure.
-        run_rocm_smi()
+        if let Some(mb) = run_rocm_smi() {
+            return Some(mb);
+        }
+        // The amdgpu kernel driver reports the same figure in sysfs, so an AMD
+        // card on a desktop distro answers without ROCm installed. Before this,
+        // such a machine always read "unknown", which keeps the window shut
+        // forever: background work silently never ran.
+        sysfs_vram_used_mb(std::path::Path::new("/sys/class/drm"))
     }
 }
 
 impl GpuProbe for SmiGpuProbe {
     fn foreign_vram_mb(&self) -> Option<u64> {
-        // Saturating: our own estimate can exceed the reading (the planner is
-        // unloaded, say), and that means zero foreign pressure, not underflow.
-        Self::total_used_mb().map(|total| total.saturating_sub(self.own_vram_mb))
+        let total = Self::total_used_mb()?;
+        let own = own_vram_mb_measured(std::process::id()).unwrap_or(self.own_vram_mb);
+        // Saturating: our own figure can exceed the reading (an estimate with
+        // the planner unloaded, say), and that means zero foreign pressure,
+        // not underflow.
+        Some(total.saturating_sub(own))
     }
+}
+
+/// VRAM held by this process and its descendants (the llama-server children),
+/// in MiB, from the kernel's per-client DRM accounting in `/proc/*/fdinfo`.
+///
+/// `None` when nothing in our tree reports any (no such accounting, as with
+/// NVIDIA's proprietary driver, or nothing loaded yet); the caller then falls
+/// back to the configured estimate.
+#[cfg(target_os = "linux")]
+fn own_vram_mb_measured(root: u32) -> Option<u64> {
+    use std::collections::{HashMap, HashSet};
+    let proc = std::path::Path::new("/proc");
+
+    // Parent links for every process, then everything descended from `root`.
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for entry in std::fs::read_dir(proc).ok()?.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if let Some(ppid) = std::fs::read_to_string(entry.path().join("stat"))
+            .ok()
+            .and_then(|s| parse_ppid(&s))
+        {
+            children.entry(ppid).or_default().push(pid);
+        }
+    }
+    let mut tree = vec![root];
+    let mut i = 0;
+    while i < tree.len() {
+        if let Some(kids) = children.get(&tree[i]) {
+            tree.extend(kids);
+        }
+        i += 1;
+    }
+
+    // One process can hold several fds on the same DRM client; count each
+    // client once.
+    let mut seen = HashSet::new();
+    let mut kib = 0u64;
+    for pid in tree {
+        let Ok(fds) = std::fs::read_dir(proc.join(pid.to_string()).join("fdinfo")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            let Ok(text) = std::fs::read_to_string(fd.path()) else {
+                continue;
+            };
+            if let Some((client, k)) = parse_drm_fdinfo(&text) {
+                if seen.insert(client) {
+                    kib += k;
+                }
+            }
+        }
+    }
+    (!seen.is_empty()).then_some(kib / 1024)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn own_vram_mb_measured(_root: u32) -> Option<u64> {
+    None
+}
+
+/// The parent pid from `/proc/<pid>/stat`. The command name sits in parens and
+/// may itself contain spaces or parens, so fields are counted from the last `)`.
+fn parse_ppid(stat: &str) -> Option<u32> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// `(drm-client-id, VRAM in KiB)` from one fdinfo file, if it is a DRM client
+/// that reports VRAM. amdgpu writes `drm-memory-vram`; the generic key newer
+/// kernels use is `drm-resident-vram0`.
+fn parse_drm_fdinfo(text: &str) -> Option<(u64, u64)> {
+    let mut client = None;
+    let mut vram = None;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "drm-client-id" => client = value.parse::<u64>().ok(),
+            "drm-memory-vram" | "drm-resident-vram0" if vram.is_none() => {
+                let mut parts = value.split_whitespace();
+                let n: u64 = parts.next()?.parse().ok()?;
+                vram = Some(match parts.next() {
+                    Some("KiB") => n,
+                    Some("MiB") => n * 1024,
+                    Some("GiB") => n * 1024 * 1024,
+                    _ => n / 1024, // bare number: bytes
+                });
+            }
+            _ => {}
+        }
+    }
+    Some((client?, vram?))
 }
 
 fn run_smi(program: &str, args: &[&str]) -> Option<u64> {
@@ -233,9 +346,99 @@ fn run_rocm_smi() -> Option<u64> {
     None
 }
 
+/// VRAM in use on the card with the most VRAM, from amdgpu's sysfs counters.
+///
+/// The biggest card rather than a sum: on a machine with an iGPU beside the
+/// discrete card, the iGPU's "VRAM" is carved-out system memory the desktop is
+/// using, not pressure on the card the models run on.
+fn sysfs_vram_used_mb(drm: &std::path::Path) -> Option<u64> {
+    let read = |p: std::path::PathBuf| -> Option<u64> {
+        std::fs::read_to_string(p).ok()?.trim().parse().ok()
+    };
+    std::fs::read_dir(drm)
+        .ok()?
+        .flatten()
+        .filter(|e| {
+            // card0, card1 -- not connectors (card1-DP-1) or render nodes.
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.strip_prefix("card")
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .filter_map(|e| {
+            let dev = e.path().join("device");
+            let total = read(dev.join("mem_info_vram_total"))?;
+            let used = read(dev.join("mem_info_vram_used"))?;
+            Some((total, used))
+        })
+        .max_by_key(|&(total, _)| total)
+        .map(|(_, used)| used / (1024 * 1024))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fake_card(drm: &std::path::Path, name: &str, total: u64, used: u64) {
+        let dev = drm.join(name).join("device");
+        std::fs::create_dir_all(&dev).unwrap();
+        std::fs::write(dev.join("mem_info_vram_total"), format!("{total}\n")).unwrap();
+        std::fs::write(dev.join("mem_info_vram_used"), format!("{used}\n")).unwrap();
+    }
+
+    #[test]
+    fn drm_fdinfo_yields_the_client_and_its_vram() {
+        let amdgpu = "pos:\t0\nflags:\t02100002\ndrm-driver:\tamdgpu\n\
+                      drm-client-id:\t19129\ndrm-memory-vram:\t9305428 KiB\n\
+                      drm-memory-gtt: \t2048 KiB\n";
+        assert_eq!(parse_drm_fdinfo(amdgpu), Some((19129, 9_305_428)));
+        let generic = "drm-client-id: 4\ndrm-resident-vram0: 2 MiB\n";
+        assert_eq!(parse_drm_fdinfo(generic), Some((4, 2048)));
+        // An ordinary file descriptor, or a DRM client with no VRAM line.
+        assert_eq!(parse_drm_fdinfo("pos:\t0\nflags:\t0100000\n"), None);
+        assert_eq!(parse_drm_fdinfo("drm-client-id: 4\n"), None);
+    }
+
+    #[test]
+    fn ppid_survives_a_command_name_with_spaces_and_parens() {
+        assert_eq!(
+            parse_ppid("1234 (llama-server) S 999 1234 1234 0"),
+            Some(999)
+        );
+        assert_eq!(parse_ppid("77 (a (weird) name) R 42 77 77 0"), Some(42));
+        assert_eq!(parse_ppid("garbage"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn measuring_our_own_tree_does_not_panic_and_finds_no_gpu_in_a_test() {
+        // A test process holds no DRM client, so this is None (fall back),
+        // never Some(0) dressed up as a measurement.
+        assert_eq!(own_vram_mb_measured(std::process::id()), None);
+    }
+
+    #[test]
+    fn sysfs_reads_the_largest_card_and_ignores_connectors() {
+        let dir = std::env::temp_dir().join(format!("oracle-drm-{}", uuid::Uuid::new_v4()));
+        const MIB: u64 = 1024 * 1024;
+        fake_card(&dir, "card0", 512 * MIB, 400 * MIB); // iGPU carve-out
+        fake_card(&dir, "card1", 16_304 * MIB, 1_982 * MIB); // the discrete card
+        fake_card(&dir, "card1-DP-1", 99_999 * MIB, 99_999 * MIB); // a connector
+        assert_eq!(sysfs_vram_used_mb(&dir), Some(1_982));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn no_amdgpu_card_is_unknown_not_zero() {
+        let dir = std::env::temp_dir().join(format!("oracle-drm-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("card0/device")).unwrap(); // e.g. i915: no counters
+        assert_eq!(sysfs_vram_used_mb(&dir), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            sysfs_vram_used_mb(std::path::Path::new("/definitely/not/here")),
+            None
+        );
+    }
 
     fn window(idle_secs: i64, busy: bool, gpu: Option<u64>, enabled: bool) -> (WorkWindow, i64) {
         let now = 10_000;

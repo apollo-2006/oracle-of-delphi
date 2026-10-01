@@ -66,7 +66,18 @@ export type AgentEvent =
   | { type: "config"; stt: boolean; tts: boolean; wake?: boolean }
   | { type: "interim"; text: string }
   | { type: "stop_audio" }
-  | { type: "confirm"; request_id: string; prompt: string; severity: string };
+  | { type: "confirm"; request_id: string; prompt: string; severity: string }
+  | { type: "search_results"; id: number; query: string; items: SearchHit[]; note?: string | null };
+
+/** One memory row from a Recall search (mirrors oracle_ipc::SearchHit). */
+export interface SearchHit {
+  kind: "observation" | "conversation" | "action" | string;
+  /** The window an observation was read from. Untrusted text. */
+  title?: string | null;
+  text: string;
+  t_unix: number;
+  score: number;
+}
 
 export type ToolStatus = "started" | "progress" | "done" | "error";
 

@@ -2,6 +2,9 @@
 //!
 //! Modes:
 //!   oracle-actd --serve <socket>   bind the UDS and service core's RPCs
+//!   oracle-actd --check-capture [out.png]
+//!                                  capture the window the ambient index would,
+//!                                  on the real platform, and report what happened
 //!   oracle-actd                    run the offline self-check (no socket)
 //!
 //! In production the systemd unit runs `--serve $XDG_RUNTIME_DIR/oracle/actd.sock`.
@@ -38,7 +41,65 @@ async fn main() -> anyhow::Result<()> {
         let log_dir = arg_after(&args, "--log-dir");
         return serve_mode(&args[2], grant_sensitive, log_dir.as_deref()).await;
     }
+    if args.get(1).map(String::as_str) == Some("--check-capture") {
+        return check_capture(args.get(2).map(String::as_str));
+    }
     self_check();
+    Ok(())
+}
+
+/// The real platform for this OS, for diagnostics outside the daemon.
+fn native_platform() -> Box<dyn oracle_actd::pal::Platform> {
+    #[cfg(target_os = "linux")]
+    return Box::new(oracle_actd::pal::linux::LinuxPlatform::new());
+    #[cfg(target_os = "macos")]
+    return Box::new(oracle_actd::pal::macos::MacosPlatform::new());
+    #[cfg(windows)]
+    return Box::new(oracle_actd::pal::windows::WindowsPlatform::new());
+    #[allow(unreachable_code)]
+    Box::new(MockPlatform::new())
+}
+
+/// `--check-capture`: does ambient capture work on this machine, as this binary?
+///
+/// Capture permission is per executable on two platforms (KWin matches the
+/// binary's path, macOS grants Screen Recording per app), so this has to run
+/// as the installed actd, not a test build, to answer the question. The
+/// window choice mirrors `oracle_core::screen::pick_target`: topmost, visible,
+/// titled, and not our own HUD.
+fn check_capture(out: Option<&str>) -> anyhow::Result<()> {
+    let platform = native_platform();
+    let t = std::time::Instant::now();
+    let windows = platform
+        .list_windows()
+        .map_err(|e| anyhow::anyhow!("listing windows failed: {e}"))?;
+    println!("listed {} windows in {:?}", windows.len(), t.elapsed());
+    let target = windows
+        .iter()
+        .find(|w| {
+            let title = w.title.trim();
+            !w.minimized && !title.is_empty() && !title.to_lowercase().contains("oracle of delphi")
+        })
+        .ok_or_else(|| anyhow::anyhow!("no visible window to capture"))?;
+    println!("target: {:?}", target.title);
+
+    let t = std::time::Instant::now();
+    let img = platform
+        .capture_window(Some(target.id), 1024)
+        .map_err(|e| anyhow::anyhow!("capture failed: {e}"))?;
+    println!(
+        "captured {}x{} in {:?} ({} KB of PNG)",
+        img.width,
+        img.height,
+        t.elapsed(),
+        img.png_b64.len() * 3 / 4 / 1024
+    );
+    if let Some(path) = out {
+        use base64::Engine;
+        let png = base64::engine::general_purpose::STANDARD.decode(&img.png_b64)?;
+        std::fs::write(path, png)?;
+        println!("wrote {path} (this is a picture of your screen; delete it when done)");
+    }
     Ok(())
 }
 

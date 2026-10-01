@@ -1,0 +1,231 @@
+# Oracle of Delphi — Linux profile, KDE Plasma, with the ambient stack ON.
+#
+# This is the "search everything I have seen" setup: the focused window is
+# sampled, a resident vision model reads it, and what it saw becomes memory you
+# can search from the HUD (Ctrl+K) or ask about out loud. Frames never touch
+# disk; only the text descriptions persist, for retain_days.
+#
+# ── FROM A FRESH CLONE ───────────────────────────────────────────────────────
+#   scripts/setup.sh                 llama.cpp (Vulkan), whisper.cpp, piper
+#   scripts/setup.sh models          the three GGUFs below (~10 GB, hash-pinned)
+#   scripts/build_all.sh --release
+#   scripts/setup.sh kwin            let oracle-actd capture windows (see below)
+#   target/release/oracle-actd --check-capture
+#   target/release/oracle-core check-config --config deploy/oracle.linux.toml
+#   target/release/oracle-core run --config deploy/oracle.linux.toml
+#
+# ── WINDOW CAPTURE NEEDS KDE PLASMA ──────────────────────────────────────────
+# Wayland gives no standard way to see other apps' windows, so actd asks KWin
+# directly (window list via a KWin script, pixels via ScreenShot2). KWin only
+# answers executables it has been told about, and matches them by exact path:
+# `setup.sh kwin` installs that grant for the actd core will launch. Move or
+# reinstall actd somewhere else and capture is refused until you re-run it.
+# On GNOME, wlroots or bare X11, listing and capture report Unsupported and the
+# ambient index simply produces nothing; everything else still works.
+#
+# ── VRAM (sized for a 16 GB card) ────────────────────────────────────────────
+#   planner   Qwen2.5-14B Q4_K_M + 8k context, q8 KV  ~10 GB   unloaded when idle
+#   vision    Qwen3-VL-2B Q4_K_M + projector           ~3 GB   resident
+#   embedder  bge-small                                ~0.2 GB  resident
+# The desktop itself holds 1-2 GB. All three fit together, without much spare;
+# the planner is the one that leaves after ten idle minutes.
+#
+# ── TESTING IN STAGES ────────────────────────────────────────────────────────
+# To bisect a problem, flip these to false and re-enable one at a time:
+#   [llm.small] + autostart_small_llm  →  [memory.embedder] + autostart_embedder
+#   →  [ambient]  →  [consolidate]
+# Config validation refuses ambient or consolidate without [llm.small].
+
+[general]
+runtime_dir = "${XDG_RUNTIME_DIR}/oracle"
+log_level = "info"
+
+[audio]
+sample_rate = 48000
+vad_onset_fast = 0.85
+vad_release = 0.35
+hangover_ms = 200
+tts_voice = "kokoro"
+input_device = ""                    # empty = the PipeWire/Pulse default
+output_device = ""
+
+[llm]
+backend = "http://127.0.0.1:8080"
+model = "qwen2.5-14b-instruct-q4_k_m"
+max_tokens = 1024
+temperature = 0.7
+model_dir = "${ORACLE_ROOT}/oracle-models"
+
+# The small/vision tier: resident, cheap, and the thing that reads the screen.
+# A second llama-server on a second port; sharing 8080 is rejected at load.
+[llm.small]
+enabled = true
+backend = "http://127.0.0.1:8081"
+model = "qwen3-vl-2b-instruct-q4_k_m"
+max_tokens = 512
+temperature = 0.2
+resident = true
+
+[memory]
+db_path = "~/.local/share/oracle/oracle.db"
+retrieve_limit = 6
+auto_recall = true
+auto_record = true
+recall_limit = 5
+recall_min_score = 0.15
+
+# Semantic recall. Without it, search matches words, not meaning: "the crate
+# for parsing TOML" would not find an observation that only says "serde docs".
+[memory.embedder]
+enabled = true
+backend = "http://127.0.0.1:8082"
+model = "bge-small-en-v1.5"
+dim = 384
+
+[ambient]
+enabled = true                # you switch this on; you do not discover it
+sample_secs = 45              # capture is cheap; the change filter drops most
+interpret_poll_secs = 5
+max_width = 1024              # what the VLM sees; smaller loses small text
+change_threshold = 6          # Hamming distance (0-64) that counts as a new screen
+queue_len = 24
+interpret_while_active = true # frames exist because you are working; keep up
+max_tokens = 120
+salience = 0.25               # below a conversation: what you said outranks this
+retain_days = 21              # observations are mined into the graph, then swept
+
+# Background work waits for an idle user, no turn in flight, and a GPU nobody
+# else wants. On AMD the reading comes from the amdgpu driver's sysfs counters,
+# so ROCm does not need to be installed.
+[workwindow]
+after_secs = 900
+foreign_vram_budget_mb = 3072 # a Plasma desktop with a browser open holds ~2 GB
+own_vram_mb = 3200            # fallback only: on amdgpu, our own use is measured
+                              # from /proc/*/fdinfo, so a loaded planner never
+                              # reads as somebody else's game
+
+[consolidate]
+enabled = true
+poll_secs = 300
+batch_size = 12
+max_tokens = 400
+# Screen text is chosen by whoever wrote the page. False = the graph learns
+# only from what you said and did.
+from_observations = true
+
+[actd]
+socket = "${XDG_RUNTIME_DIR}/oracle/actd.sock"
+grant_sensitive = false
+
+[hud]
+bind = "127.0.0.1:8770"
+token = ""
+enabled = true
+
+[agent]
+step_budget = 12
+screen_context = true
+screen_other_windows = 6
+screen_observations = 3
+observation_max_age_secs = 1800
+
+[google]
+credentials_path = ""         # e.g. ~/.config/oracle/credentials.json; empty = off
+account = "default"
+
+[proactive]
+enabled = false
+poll_secs = 60
+calendar = true
+lead_minutes = 10
+mail = false
+mail_query = "is:unread is:starred"
+watch_processes = []
+quiet_from_hour = 22
+quiet_until_hour = 8
+repeat_after_secs = 21600
+max_per_hour = 4
+
+[voice]
+tts_enabled = true
+tts_program = "${ORACLE_ROOT}/.venv/bin/piper"
+tts_args = [
+  "--model", "${ORACLE_ROOT}/piper/en_US-amy-medium.onnx",
+  "--output_file", "{out}",
+]
+
+stt_enabled = true
+stt_program = "${ORACLE_ROOT}/whisper/${ORACLE_PLATFORM}/whisper-cli"
+stt_args = [
+  "-m", "${ORACLE_ROOT}/whisper/models/ggml-base.en.bin",
+  "-f", "{in}",
+  "-nt",
+  "-np",
+]
+
+# Always-on wake word ("Delphi"). Off: it holds the microphone open for as long
+# as the assistant runs. No -nt here, deliberately; see oracle.windows.toml.
+wake_enabled = false
+wake_program = "${ORACLE_ROOT}/whisper/${ORACLE_PLATFORM}/whisper-stream"
+wake_args = [
+  "-m", "${ORACLE_ROOT}/whisper/models/ggml-base.en.bin",
+  "-t", "6",
+  "--step", "0",
+  "--length", "5000",
+  "-vth", "0.6",
+]
+
+[supervise]
+autostart_llm = true
+llm_program = "${ORACLE_ROOT}/llama.cpp/build/bin/llama-server"
+llm_args = [
+  "-m", "${ORACLE_ROOT}/oracle-models/Qwen2.5-14B-Instruct-Q4_K_M.gguf",
+  "--host", "127.0.0.1", "--port", "8080",
+  "-ngl", "999",
+  # The model's own chat template, which is what injects the tool definitions.
+  # Without it the planner never sees its tools.
+  "--jinja",
+  "-c", "8192",
+  # q8 KV cache halves the context's VRAM (~1.5 GB -> ~0.8 GB) for no
+  # measurable quality loss at this size; it is what makes all three tiers fit.
+  "-fa", "on",
+  "-ctk", "q8_0", "-ctv", "q8_0",
+]
+
+autostart_small_llm = true
+small_llm_program = ""                # reuse llm_program
+small_llm_args = [
+  "-m", "${ORACLE_ROOT}/oracle-models/Qwen3VL-2B-Instruct-Q4_K_M.gguf",
+  # A VLM without its projector loads fine and is blind.
+  "--mmproj", "${ORACLE_ROOT}/oracle-models/mmproj-Qwen3VL-2B-Instruct-F16.gguf",
+  "--host", "127.0.0.1", "--port", "8081",
+  "-ngl", "999",
+  # Starve Qwen-VL of image tokens and small text comes back wrong, which looks
+  # like the index being broken rather than under-resolved.
+  "--image-min-tokens", "1024",
+  "-c", "8192",
+]
+small_llm_ready_timeout_secs = 60
+
+autostart_embedder = true
+embedder_program = ""
+embedder_args = [
+  "-m", "${ORACLE_ROOT}/oracle-models/bge-small-en-v1.5-q8_0.gguf",
+  "--host", "127.0.0.1", "--port", "8082",
+  "--embedding",
+  # Mean, not the model's CLS default: it separates related from unrelated
+  # text better, which is what ranking depends on. The load-time warning about
+  # it is expected.
+  "--pooling", "mean",
+  "-ngl", "999",
+  "-c", "512",
+]
+
+autostart_actd = true
+actd_program = ""                     # the oracle-actd next to oracle-core
+
+open_window = true
+browser = "chrome"                    # google-chrome(-stable), else chromium
+
+idle_unload_secs = 600
+llm_ready_timeout_secs = 180

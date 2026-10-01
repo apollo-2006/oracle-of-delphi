@@ -222,7 +222,16 @@ impl HttpEmbedder {
                         return;
                     }
                 };
-                let client = reqwest::Client::new();
+                // Pooled connections must expire before the sidecar's own
+                // keep-alive timeout (llama-server: 5 s). This runtime only
+                // runs inside `block_on`, so between requests nothing polls an
+                // idle connection and its close goes unnoticed; reusing it then
+                // fails with "error sending request". Expiry is checked when a
+                // connection is taken from the pool, so it works here anyway.
+                let client = reqwest::Client::builder()
+                    .pool_idle_timeout(std::time::Duration::from_secs(2))
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new());
                 // Ends when every sender is dropped, i.e. the embedder is gone.
                 while let Ok(job) = rx.recv() {
                     let result = rt.block_on(fetch(&client, &url, &model_for_worker, &job.texts));
@@ -274,7 +283,17 @@ async fn fetch(
     texts: &[String],
 ) -> anyhow::Result<Vec<Vec<f32>>> {
     let body = serde_json::json!({ "model": model, "input": texts });
-    let resp = client.post(url).json(&body).send().await?;
+    // One retry on a transport error. Embedding is idempotent, and a socket
+    // closed under us (the sidecar restarting, or a keep-alive race the pool
+    // expiry did not catch) should cost a retry, not a lost observation.
+    let resp = match client.post(url).json(&body).send().await {
+        Ok(r) => r,
+        Err(e) if e.is_connect() || e.is_request() => {
+            tracing::debug!(error = %e, "[embed] retrying once");
+            client.post(url).json(&body).send().await?
+        }
+        Err(e) => return Err(e.into()),
+    };
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -369,6 +388,64 @@ impl Embedder for HttpEmbedder {
 mod tests {
     use super::*;
     use crate::memory::cosine;
+
+    /// A fake sidecar that, like llama-server, keeps the connection alive after
+    /// a response and then closes it on its own a moment later.
+    fn closing_keepalive_server(dim: usize) -> String {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut len = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                            len = v.trim().parse().unwrap();
+                        }
+                        if line == "\r\n" {
+                            break;
+                        }
+                    }
+                    let mut body = vec![0; len];
+                    reader.read_exact(&mut body).unwrap();
+                    let vec = vec!["0.5"; dim].join(",");
+                    let json = format!(r#"{{"data":[{{"index":0,"embedding":[{vec}]}}]}}"#);
+                    let mut s = stream;
+                    let _ = write!(
+                        s,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: keep-alive\r\n\r\n{json}",
+                        json.len()
+                    );
+                    // The server-side keep-alive timeout, compressed.
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    let _ = s.shutdown(std::net::Shutdown::Both);
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn a_connection_the_sidecar_closed_while_idle_is_not_reused() {
+        // The ambient index embeds every ~45 s; llama-server drops idle
+        // keep-alive connections after 5. The worker's runtime only runs while
+        // a request is in flight, so nothing noticed the close and the next
+        // request went out on a dead socket: observations were dropped and
+        // searches failed with "error sending request".
+        let e = HttpEmbedder::new(closing_keepalive_server(4), "fake", 4);
+        e.embed("first").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        e.embed("second, after the server hung up").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        e.embed("third").unwrap();
+    }
 
     #[test]
     fn deterministic_and_normalized() {

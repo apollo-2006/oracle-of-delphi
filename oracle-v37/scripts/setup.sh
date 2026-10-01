@@ -4,6 +4,9 @@
 #   scripts/setup.sh              everything missing
 #   scripts/setup.sh --force      re-fetch even if present
 #   scripts/setup.sh piper        just one component (piper|whisper|model|llama)
+#   scripts/setup.sh models       the GGUFs for the planner, vision tier and embedder
+#                                 (~10 GB; not part of "everything", ask for it)
+#   scripts/setup.sh kwin         Linux/KDE: let oracle-actd take window captures
 #
 # Everything lands under <repo root>/{piper,whisper,llama.cpp}/<platform>/, which
 # is what `${ORACLE_ROOT}` in the shipped profiles points at. Re-running is safe:
@@ -15,6 +18,7 @@
 # reclaimed. Fetching also means this repository does not redistribute anyone
 # else's code -- notably espeak-ng, which piper bundles and which is GPL-3.0.
 set -euo pipefail
+CALLER_PWD="$PWD"                    # for resolving relative paths the caller passes
 cd "$(dirname "$0")/../.."          # scripts/ -> oracle-v37/ -> repo root
 ROOT="$(pwd)"
 
@@ -33,12 +37,14 @@ ONLY=""
 for a in "$@"; do
   case "$a" in
     --force) FORCE=1 ;;
-    piper|whisper|model|llama) ONLY="$a" ;;
-    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    piper|whisper|model|llama|models|kwin) ONLY="$a" ;;
+    -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $a (try --help)" >&2; exit 2 ;;
   esac
 done
 want() { [ -z "$ONLY" ] || [ "$ONLY" = "$1" ]; }
+# Steps that download gigabytes or touch the desktop run only when named.
+asked() { [ "$ONLY" = "$1" ]; }
 have() { [ "$FORCE" -eq 0 ] && [ -e "$1" ]; }
 
 # --- Platform ---------------------------------------------------------------
@@ -212,8 +218,11 @@ if want model; then
 fi
 
 # --- 4. llama.cpp (inference) -----------------------------------------------
-# Built, not downloaded: the backend is chosen at compile time (Metal here,
-# ROCm/Vulkan on Windows) and no published binary matches every machine.
+# Built, not downloaded: the backend is chosen at compile time and no published
+# binary matches every machine. Metal on macOS; Vulkan on Linux when its shader
+# compiler is present, because it covers AMD, NVIDIA and Intel with one build and
+# no ROCm install. Without a GPU flag llama.cpp builds CPU-only, which runs, and
+# runs a 14B at a few tokens a second -- a slow assistant rather than an error.
 if want llama; then
   if have "$ROOT/llama.cpp/build/bin/llama-server"; then
     echo "==> llama.cpp: already built"
@@ -223,16 +232,95 @@ if want llama; then
     echo "==> llama.cpp: cloning and building"
     [ -d "$ROOT/llama.cpp/.git" ] || git clone --depth 1 https://github.com/ggml-org/llama.cpp "$ROOT/llama.cpp"
     ( cd "$ROOT/llama.cpp"
-      METAL=""
-      [ "$OS" = macos ] && METAL="-DGGML_METAL=ON"
-      cmake -B build -DCMAKE_BUILD_TYPE=Release $METAL >/dev/null
+      GPU=""
+      [ "$OS" = macos ] && GPU="-DGGML_METAL=ON"
+      if [ "$OS" = linux ]; then
+        if command -v glslc >/dev/null && pkg-config --exists vulkan 2>/dev/null; then
+          GPU="-DGGML_VULKAN=ON"
+        else
+          echo "    WARNING: no Vulkan SDK (glslc + vulkan headers); building CPU-only." >&2
+          echo "             Arch: pacman -S vulkan-headers shaderc; Debian: libvulkan-dev glslc" >&2
+        fi
+      fi
+      cmake -B build -DCMAKE_BUILD_TYPE=Release $GPU >/dev/null
       cmake --build build --config Release -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)" >/dev/null )
     echo "    -> llama.cpp/build/bin/llama-server"
   fi
+fi
+
+# --- 5. GGUF models (on request) ---------------------------------------------
+# The three models deploy/oracle.linux.toml names, from their publishers, pinned
+# by hash like the voice. ~10 GB in all, so only on `setup.sh models`.
+fetch_gguf() { # repo file sha256
+  local dest="$ROOT/oracle-models/$2"
+  if have "$dest"; then echo "    $2: already present"; return; fi
+  echo "    $2"
+  mkdir -p "$ROOT/oracle-models"
+  curl -fL -C - --progress-bar "https://huggingface.co/$1/resolve/main/$2" -o "$dest.part"
+  local got
+  got="$( (sha256sum "$dest.part" 2>/dev/null || shasum -a 256 "$dest.part") | cut -d' ' -f1)"
+  if [ "$got" != "$3" ]; then
+    echo "    $2: sha256 mismatch (got $got); kept as $dest.part, not installed" >&2
+    exit 1
+  fi
+  mv "$dest.part" "$dest"
+}
+if asked models; then
+  echo "==> models: fetching into oracle-models/"
+  fetch_gguf bartowski/Qwen2.5-14B-Instruct-GGUF Qwen2.5-14B-Instruct-Q4_K_M.gguf \
+    e47ad95dad6ff848b431053b375adb5d39321290ea2c638682577dafca87c008
+  # A vision model is blind without its projector; both, always.
+  fetch_gguf Qwen/Qwen3-VL-2B-Instruct-GGUF Qwen3VL-2B-Instruct-Q4_K_M.gguf \
+    089d75c52f4b7ffc56ba998ffc50aae89fcafc755f9e7208aacca281dca6c2ae
+  fetch_gguf Qwen/Qwen3-VL-2B-Instruct-GGUF mmproj-Qwen3VL-2B-Instruct-F16.gguf \
+    c3d5afbef5287953acd57b4043d2269456e5761a4eaccb3b71b062996970aea5
+  fetch_gguf CompendiumLabs/bge-small-en-v1.5-gguf bge-small-en-v1.5-q8_0.gguf \
+    ec38e8da142596baa913124ae50550de284b6916bf59577ef2f0cb9660c2f514
+fi
+
+# --- 6. KWin screenshot permission (Linux/KDE, on request) -------------------
+# KWin's ScreenShot2 interface is restricted: it answers only executables named
+# by an installed .desktop file that lists the interface, matched against
+# /proc/<pid>/exe. This is the same grant Spectacle has. Without it the ambient
+# index gets "KWin refused the screenshot" every cycle and indexes nothing.
+#
+#   scripts/setup.sh kwin                      authorizes the actd core will run:
+#                                              ~/.local/bin/oracle-actd if installed
+#                                              (systemd), else the checkout's release build
+#   ORACLE_ACTD=/path/to/oracle-actd scripts/setup.sh kwin
+if asked kwin; then
+  [ "$OS" = linux ] || { echo "kwin: Linux only" >&2; exit 2; }
+  if [ -n "${ORACLE_ACTD:-}" ]; then
+    ACTD="$ORACLE_ACTD"
+  elif [ -x "$HOME/.local/bin/oracle-actd" ]; then
+    ACTD="$HOME/.local/bin/oracle-actd"
+  else
+    # `oracle-core run` launches the actd sitting next to its own binary.
+    ACTD="$ROOT/oracle-v37/target/release/oracle-actd"
+  fi
+  case "$ACTD" in /*) ;; *) ACTD="$CALLER_PWD/$ACTD" ;; esac
+  ACTD="$(readlink -f "$ACTD" 2>/dev/null || echo "$ACTD")"
+  [ -x "$ACTD" ] || echo "    NOTE: $ACTD does not exist yet; the grant applies once it does" >&2
+  APPS="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+  mkdir -p "$APPS"
+  cat > "$APPS/oracle-actd.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Oracle of Delphi actuator
+Comment=Lets oracle-actd capture windows for the ambient index
+Exec=$ACTD
+NoDisplay=true
+X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
+DESKTOP
+  command -v kbuildsycoca6 >/dev/null && kbuildsycoca6 >/dev/null 2>&1 || true
+  echo "==> kwin: $APPS/oracle-actd.desktop authorizes $ACTD"
+  echo "    The path must be exact: re-run this if oracle-actd moves. KWin notices the"
+  echo "    new entry within a few seconds; then check it with: $ACTD --check-capture"
 fi
 
 echo
 echo "==> setup complete for $PLATFORM"
 echo
 echo "Still yours to choose: the GGUF models under oracle-models/ (the planner,"
-echo "and optionally the vision tier and embedder). See docs/MACOS.md section 2."
+echo "and optionally the vision tier and embedder). \`scripts/setup.sh models\` fetches"
+echo "the set deploy/oracle.linux.toml expects; see docs/MACOS.md section 2 to pick others."

@@ -83,8 +83,8 @@ cargo run -p oracle-core -- doctor
 oracle-actd --serve /tmp/actd.sock
 ```
 
-Platform profiles live in `deploy/`: `oracle.macos.toml`, `oracle.windows.toml`
-and `oracle.windows.ambient.toml`. Check one before a long build with
+Platform profiles live in `deploy/`: `oracle.linux.toml`, `oracle.macos.toml`,
+`oracle.windows.toml` and `oracle.windows.ambient.toml`. Check one before a long build with
 `cargo run -p oracle-core -- check-config --config deploy/oracle.macos.toml`.
 
 The REPL runs the architecture's headline example end-to-end: the model emits
@@ -203,8 +203,16 @@ Background work is gated on three things, and the third is the one that matters:
   urgent; anything that can wait should
 - **no turn is in flight**: idle-by-clock and busy-by-turn overlap, since a
   routine or a briefing runs unattended
-- **nothing else wants the GPU**, polled from `nvidia-smi` / `rocm-smi`, minus
-  our own footprint
+- **nothing else wants the GPU**, polled from `nvidia-smi` / `rocm-smi`, or the
+  amdgpu driver's sysfs counters when neither is installed, minus our own footprint
+
+"Our own footprint" is measured where the kernel allows it: Linux reports each
+process's GPU memory in `/proc/<pid>/fdinfo`, so core sums what it and its
+llama-server children actually hold. `own_vram_mb` is the fallback estimate. An
+estimate covers the resident tiers, which makes it wrong in exactly the case
+that matters: for the ten minutes the planner stays loaded after a
+conversation, its ~9 GB read as someone else's game and the vision tier stopped
+reading the screen.
 
 An **unknown** GPU answer closes the window. Wrongly idling costs a late
 summary; wrongly running costs you the frame rate in whatever you just launched.
@@ -294,8 +302,24 @@ Platform support is honest: **Windows** is complete (GDI `StretchBlt`, scaling
 during the blit so a 4K window never materializes as 32 MB). **macOS** captures
 the window rectangle via `screencapture -R`, a region grab wearing a window
 grab's name, so an overlapping window is included; it needs the Screen Recording
-grant. **Linux** returns `Unsupported`: X11 and Wayland are different enough that
-one working is not the other working.
+grant. **Linux** works on **KDE Plasma** through KWin (tested on Plasma 6, Wayland): a KWin
+script reports the stacking order over D-Bus, and `ScreenShot2.CaptureWindow`
+grabs a window by handle even when another is on top, so the HUD stays out of
+the frame as it does on Windows. KWin only answers executables named by an
+installed `.desktop` entry, matched by exact path; `scripts/setup.sh kwin`
+installs that grant and `oracle-actd --check-capture` confirms it. GNOME,
+wlroots and bare X11 still return `Unsupported`: one compositor working is not
+the others working.
+
+### Recall: searching it yourself
+
+Asking "what was I reading on Tuesday" costs a planner turn. **Ctrl+K** in the
+HUD (or the Recall button) searches memory directly instead: the same hybrid
+keyword-and-vector retrieval the planner's recall block uses, returned as rows
+rather than as a sentence. It answers in milliseconds with the planner unloaded,
+and shows every candidate rather than the one the model chose to mention. An
+empty box lists what has been on screen most recently. Window titles and
+summaries are rendered as text only, never markup, since other people wrote them.
 
 ## Consolidation
 

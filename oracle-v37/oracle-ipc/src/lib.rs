@@ -147,6 +147,31 @@ pub enum HudEvent {
         /// Short risk label ("irreversible", "sensitive") for emphasis.
         severity: String,
     },
+    /// Answer to `HudCommand::Search`. Events are broadcast to every connected
+    /// HUD, so `id` is what lets the asking window ignore other windows'
+    /// results and its own stale ones.
+    SearchResults {
+        id: u32,
+        query: String,
+        items: Vec<SearchHit>,
+        /// Why the list is empty or partial, when that is worth saying
+        /// ("the ambient index is off"), for the HUD to show in place of results.
+        #[serde(default)]
+        note: Option<String>,
+    },
+}
+
+/// One memory, as the HUD's search shows it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SearchHit {
+    /// "observation", "conversation" or "action".
+    pub kind: String,
+    /// The window an observation was read from. Untrusted: a page picks it.
+    #[serde(default)]
+    pub title: Option<String>,
+    pub text: String,
+    pub t_unix: i64,
+    pub score: f32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -197,11 +222,43 @@ pub enum HudCommand {
     /// The reverse of `Expand`: shrink the full window back into the compact
     /// corner panel (e.g. after a mis-click on Expand).
     Retract,
+    /// Search memory directly: no planner, no turn, no speech. An empty query
+    /// asks for the most recent screen observations instead.
+    Search {
+        id: u32,
+        query: String,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_speaks_the_json_the_hud_sends_and_reads() {
+        // The HUD is TypeScript; these literals are what oracle-hud/src sends
+        // and switches on, so a rename here must break this test first.
+        let cmd: HudCommand =
+            serde_json::from_str(r#"{"type":"search","id":3,"query":"tokio"}"#).unwrap();
+        assert!(matches!(cmd, HudCommand::Search { id: 3, ref query } if query == "tokio"));
+
+        let ev = HudEvent::SearchResults {
+            id: 3,
+            query: "tokio".into(),
+            items: vec![SearchHit {
+                kind: "observation".into(),
+                title: Some("docs.rs".into()),
+                text: "tokio::select! docs".into(),
+                t_unix: 1,
+                score: 0.5,
+            }],
+            note: None,
+        };
+        let v: serde_json::Value = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["type"], "search_results");
+        assert_eq!(v["items"][0]["title"], "docs.rs");
+        assert_eq!(v["items"][0]["t_unix"], 1);
+    }
 
     #[test]
     fn audio_event_roundtrips() {
