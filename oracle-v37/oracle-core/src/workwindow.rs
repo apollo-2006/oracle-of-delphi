@@ -278,6 +278,8 @@ fn own_vram_mb_measured(_root: u32) -> Option<u64> {
 
 /// The parent pid from `/proc/<pid>/stat`. The command name sits in parens and
 /// may itself contain spaces or parens, so fields are counted from the last `)`.
+// Linux-only callers, but pure string parsing, so the tests run everywhere.
+#[cfg(any(target_os = "linux", test))]
 fn parse_ppid(stat: &str) -> Option<u32> {
     let rest = &stat[stat.rfind(')')? + 1..];
     rest.split_whitespace().nth(1)?.parse().ok()
@@ -286,6 +288,7 @@ fn parse_ppid(stat: &str) -> Option<u32> {
 /// `(drm-client-id, VRAM in KiB)` from one fdinfo file, if it is a DRM client
 /// that reports VRAM. amdgpu writes `drm-memory-vram`; the generic key newer
 /// kernels use is `drm-resident-vram0`.
+#[cfg(any(target_os = "linux", test))]
 fn parse_drm_fdinfo(text: &str) -> Option<(u64, u64)> {
     let mut client = None;
     let mut vram = None;
